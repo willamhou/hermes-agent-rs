@@ -5,7 +5,11 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use hermes_agent::loop_runner::{Agent, AgentConfig};
 use hermes_config::config::{AppConfig, hermes_home};
-use hermes_core::{message::Message, stream::StreamDelta};
+use hermes_core::{
+    message::Message,
+    stream::StreamDelta,
+    tool::{ApprovalDecision, ApprovalRequest},
+};
 use hermes_provider::create_provider;
 use hermes_tools::registry::ToolRegistry;
 use secrecy::SecretString;
@@ -34,6 +38,17 @@ pub async fn run_repl() -> Result<()> {
     // ── Agent ────────────────────────────────────────────────────────────────
     let session_id = Uuid::new_v4().to_string();
     let working_dir = std::env::current_dir().context("failed to get current directory")?;
+
+    let tool_config = Arc::new(config.tool_config(working_dir.clone()));
+
+    let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
+    tokio::spawn(async move {
+        while let Some(req) = approval_rx.recv().await {
+            tracing::warn!(tool = %req.tool_name, command = %req.command, "auto-allowing tool (no approval UI)");
+            let _ = req.response_tx.send(ApprovalDecision::Allow);
+        }
+    });
+
     let agent_config = AgentConfig {
         provider,
         registry,
@@ -41,6 +56,8 @@ pub async fn run_repl() -> Result<()> {
         system_prompt: "You are Hermes, a helpful AI assistant.".to_string(),
         session_id,
         working_dir,
+        approval_tx,
+        tool_config,
     };
     let mut agent = Agent::new(agent_config);
     let mut history: Vec<Message> = Vec::new();

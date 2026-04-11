@@ -7,7 +7,7 @@ use hermes_core::{
     message::{Content, Message, Role},
     provider::{ChatRequest, Provider},
     stream::StreamDelta,
-    tool::{ApprovalDecision, ApprovalRequest, ToolConfig, ToolContext, ToolSchema},
+    tool::{ApprovalRequest, ToolConfig, ToolContext, ToolSchema},
 };
 use hermes_tools::registry::ToolRegistry;
 use tokio::sync::mpsc;
@@ -25,6 +25,8 @@ pub struct AgentConfig {
     pub system_prompt: String,
     pub session_id: String,
     pub working_dir: PathBuf,
+    pub approval_tx: mpsc::Sender<ApprovalRequest>,
+    pub tool_config: Arc<ToolConfig>,
 }
 
 /// Stateful agent that drives a conversation loop.
@@ -36,24 +38,12 @@ pub struct Agent {
     session_id: String,
     working_dir: PathBuf,
     approval_tx: mpsc::Sender<ApprovalRequest>,
-    _approval_task: tokio::task::JoinHandle<()>,
+    tool_config: Arc<ToolConfig>,
 }
 
 impl Agent {
     /// Construct an agent from `AgentConfig`.
     pub fn new(config: AgentConfig) -> Self {
-        let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
-        let approval_task = tokio::spawn(async move {
-            while let Some(req) = approval_rx.recv().await {
-                tracing::warn!(
-                    tool = %req.tool_name,
-                    command = %req.command,
-                    "auto-allowing tool (no approval UI configured)"
-                );
-                let _ = req.response_tx.send(ApprovalDecision::Allow);
-            }
-        });
-
         Self {
             provider: config.provider,
             registry: config.registry,
@@ -61,8 +51,8 @@ impl Agent {
             system_prompt: config.system_prompt,
             session_id: config.session_id,
             working_dir: config.working_dir,
-            approval_tx,
-            _approval_task: approval_task,
+            approval_tx: config.approval_tx,
+            tool_config: config.tool_config,
         }
     }
 
@@ -115,7 +105,7 @@ impl Agent {
                 working_dir: self.working_dir.clone(),
                 approval_tx: self.approval_tx.clone(),
                 delta_tx: delta_tx.clone(),
-                tool_config: Arc::new(ToolConfig::default()),
+                tool_config: Arc::clone(&self.tool_config),
             };
 
             let tool_results = if should_parallelize(&response.tool_calls, &self.registry) {
@@ -257,24 +247,31 @@ mod tests {
         }
     }
 
-    fn make_agent(responses: Vec<ChatResponse>, max_iterations: u32) -> Agent {
+    fn make_agent(
+        responses: Vec<ChatResponse>,
+        max_iterations: u32,
+    ) -> (Agent, mpsc::Receiver<ApprovalRequest>) {
         let provider = Arc::new(MockProvider::new(responses));
         let registry = Arc::new(ToolRegistry::new());
-        Agent::new(AgentConfig {
+        let (approval_tx, approval_rx) = mpsc::channel(8);
+        let agent = Agent::new(AgentConfig {
             provider,
             registry,
             max_iterations,
             system_prompt: "You are a helpful assistant.".to_string(),
             session_id: "test-session".to_string(),
             working_dir: std::env::temp_dir(),
-        })
+            approval_tx,
+            tool_config: Arc::new(ToolConfig::default()),
+        });
+        (agent, approval_rx)
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_simple_conversation_no_tools() {
-        let mut agent = make_agent(vec![simple_response("Hello, world!")], 10);
+        let (mut agent, _rx) = make_agent(vec![simple_response("Hello, world!")], 10);
         let (delta_tx, _delta_rx) = mpsc::channel(32);
         let mut history: Vec<Message> = vec![];
 
@@ -295,7 +292,7 @@ mod tests {
         // Iteration 1: provider returns a tool call.
         // Iteration 2: provider returns a final text response.
         let responses = vec![tool_use_response("unknown_tool"), simple_response("Done!")];
-        let mut agent = make_agent(responses, 10);
+        let (mut agent, _rx) = make_agent(responses, 10);
         let (delta_tx, _delta_rx) = mpsc::channel(32);
         let mut history: Vec<Message> = vec![];
 
@@ -319,7 +316,7 @@ mod tests {
         // budget=2 means 2 iterations; each consumes one iteration.
         let responses: Vec<ChatResponse> =
             (0..10).map(|_| tool_use_response("unknown_tool")).collect();
-        let mut agent = make_agent(responses, 2);
+        let (mut agent, _rx) = make_agent(responses, 2);
         let (delta_tx, _delta_rx) = mpsc::channel(32);
         let mut history: Vec<Message> = vec![];
 
