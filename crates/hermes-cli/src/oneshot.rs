@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use hermes_agent::loop_runner::{Agent, AgentConfig};
-use hermes_config::config::AppConfig;
+use hermes_config::config::{AppConfig, hermes_home};
 use hermes_core::{
     message::Message,
     stream::StreamDelta,
     tool::{ApprovalDecision, ApprovalRequest},
 };
+use hermes_memory::MemoryManager;
 use hermes_provider::create_provider;
 use hermes_tools::registry::ToolRegistry;
 use secrecy::SecretString;
@@ -53,6 +54,9 @@ pub async fn run_oneshot(
         }
     });
 
+    let memory_dir = hermes_home().join("memories");
+    let memory = MemoryManager::new(memory_dir, None).context("failed to initialize memory")?;
+
     let agent_config = AgentConfig {
         provider,
         registry,
@@ -62,6 +66,7 @@ pub async fn run_oneshot(
         working_dir,
         approval_tx,
         tool_config,
+        memory,
     };
 
     let mut agent = Agent::new(agent_config);

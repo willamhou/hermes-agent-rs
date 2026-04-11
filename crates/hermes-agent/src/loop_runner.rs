@@ -27,6 +27,7 @@ pub struct AgentConfig {
     pub working_dir: PathBuf,
     pub approval_tx: mpsc::Sender<ApprovalRequest>,
     pub tool_config: Arc<ToolConfig>,
+    pub memory: hermes_memory::MemoryManager,
 }
 
 /// Stateful agent that drives a conversation loop.
@@ -39,6 +40,7 @@ pub struct Agent {
     working_dir: PathBuf,
     approval_tx: mpsc::Sender<ApprovalRequest>,
     tool_config: Arc<ToolConfig>,
+    memory: hermes_memory::MemoryManager,
 }
 
 impl Agent {
@@ -53,6 +55,7 @@ impl Agent {
             working_dir: config.working_dir,
             approval_tx: config.approval_tx,
             tool_config: config.tool_config,
+            memory: config.memory,
         }
     }
 
@@ -68,11 +71,25 @@ impl Agent {
     ) -> Result<String> {
         history.push(Message::user(user_message));
 
+        // Take prefetched memory context (for future external providers)
+        let _memory_ctx = self.memory.take_prefetched(&self.session_id).await;
+
+        // Build system prompt with memory blocks
+        let memory_block = self.memory.system_prompt_blocks();
+        let mut full_system = if memory_block.is_empty() {
+            self.system_prompt.clone()
+        } else {
+            format!("{}\n\n{}", self.system_prompt, memory_block)
+        };
+        let _ = &mut full_system; // Task 8 (compression) will reassign this
+
+        let mut final_response = String::new();
+
         while self.budget.try_consume() {
             let schemas: Vec<ToolSchema> = self.registry.available_schemas();
 
             let request = ChatRequest {
-                system: &self.system_prompt,
+                system: &full_system,
                 system_segments: None,
                 messages: history.as_slice(),
                 tools: &schemas,
@@ -96,7 +113,8 @@ impl Agent {
             history.push(assistant_msg);
 
             if response.tool_calls.is_empty() {
-                return Ok(response.content);
+                final_response = response.content;
+                break;
             }
 
             // Execute tools.
@@ -127,7 +145,17 @@ impl Agent {
             }
         }
 
-        Ok("[iteration budget exhausted]".to_string())
+        if final_response.is_empty() {
+            return Ok("[iteration budget exhausted]".to_string());
+        }
+
+        // Memory lifecycle: sync turn data and prefetch for next turn
+        self.memory
+            .sync_turn(user_message, &final_response, &self.session_id);
+        self.memory
+            .queue_prefetch(&final_response, &self.session_id);
+
+        Ok(final_response)
     }
 
     /// Iterations remaining in the current budget.
@@ -251,9 +279,13 @@ mod tests {
         responses: Vec<ChatResponse>,
         max_iterations: u32,
     ) -> (Agent, mpsc::Receiver<ApprovalRequest>) {
+        use hermes_memory::MemoryManager;
+
         let provider = Arc::new(MockProvider::new(responses));
         let registry = Arc::new(ToolRegistry::new());
         let (approval_tx, approval_rx) = mpsc::channel(8);
+        let memory_dir = std::env::temp_dir().join(format!("hermes-test-{}", uuid::Uuid::new_v4()));
+        let memory = MemoryManager::new(memory_dir, None).unwrap();
         let agent = Agent::new(AgentConfig {
             provider,
             registry,
@@ -263,6 +295,7 @@ mod tests {
             working_dir: std::env::temp_dir(),
             approval_tx,
             tool_config: Arc::new(ToolConfig::default()),
+            memory,
         });
         (agent, approval_rx)
     }

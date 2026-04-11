@@ -10,6 +10,7 @@ license.workspace = true
 hermes-core.workspace = true
 hermes-provider.workspace = true
 hermes-tools.workspace = true
+hermes-memory.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true

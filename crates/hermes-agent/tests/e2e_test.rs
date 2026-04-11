@@ -14,6 +14,7 @@ use hermes_core::{
     stream::StreamDelta,
     tool::{ApprovalDecision, ApprovalRequest, ToolConfig},
 };
+use hermes_memory::MemoryManager;
 use hermes_tools::{
     file_read::ReadFileTool, file_write::WriteFileTool, registry::ToolRegistry,
     terminal::TerminalTool,
@@ -134,6 +135,7 @@ where
     });
 
     let workspace_path = workspace.path().to_path_buf();
+    let memory = MemoryManager::new(workspace.path().join(".hermes-memory"), None).unwrap();
 
     Agent::new(AgentConfig {
         provider: Arc::new(provider),
@@ -147,6 +149,7 @@ where
             workspace_root: workspace_path,
             ..ToolConfig::default()
         }),
+        memory,
     })
 }
 

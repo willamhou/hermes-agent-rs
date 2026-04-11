@@ -14,6 +14,7 @@ use hermes_core::{
     stream::StreamDelta,
     tool::{ApprovalDecision, ApprovalRequest},
 };
+use hermes_memory::MemoryManager;
 use hermes_provider::create_provider;
 use hermes_tools::registry::ToolRegistry;
 use secrecy::SecretString;
@@ -56,6 +57,9 @@ pub async fn run_repl() -> Result<()> {
 
     let system_prompt = "You are Hermes, a helpful AI assistant.".to_string();
 
+    let memory_dir = hermes_home().join("memories");
+    let memory = MemoryManager::new(memory_dir, None).context("failed to initialize memory")?;
+
     let agent_config = AgentConfig {
         provider,
         registry,
@@ -65,6 +69,7 @@ pub async fn run_repl() -> Result<()> {
         working_dir: working_dir.clone(),
         approval_tx,
         tool_config,
+        memory,
     };
     let mut agent = Agent::new(agent_config);
     let mut history: Vec<Message> = Vec::new();
@@ -160,6 +165,9 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
         }
     });
 
+    let memory_dir = hermes_home().join("memories");
+    let memory = MemoryManager::new(memory_dir, None).context("failed to initialize memory")?;
+
     let mut agent = Agent::new(AgentConfig {
         provider,
         registry,
@@ -169,6 +177,7 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
         working_dir,
         approval_tx,
         tool_config,
+        memory,
     });
 
     println!("Hermes — model: {model}");
