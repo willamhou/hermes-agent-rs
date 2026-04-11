@@ -35,9 +35,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Async
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
 
 # HTTP
 reqwest = { version = "0.12", features = ["json", "stream"] }
+bytes = "1"
 
 # Config
 serde_yaml_ng = "0.10"
