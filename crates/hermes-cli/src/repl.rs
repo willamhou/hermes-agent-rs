@@ -1,0 +1,138 @@
+//! Interactive REPL loop for the Hermes CLI.
+
+use std::sync::Arc;
+
+use anyhow::{Context as _, Result};
+use hermes_agent::loop_runner::{Agent, AgentConfig};
+use hermes_config::config::{AppConfig, hermes_home};
+use hermes_core::{message::Message, stream::StreamDelta};
+use hermes_provider::create_provider;
+use hermes_tools::registry::ToolRegistry;
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+use crate::render::render_stream;
+
+/// Start the interactive REPL.
+pub async fn run_repl() -> Result<()> {
+    // ── Configuration ────────────────────────────────────────────────────────
+    let config = AppConfig::load();
+    let api_key = config.api_key().with_context(|| {
+        format!(
+            "No API key found. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or HERMES_API_KEY.\n\
+             Configured model: {}",
+            config.model
+        )
+    })?;
+
+    // ── Provider + tools ─────────────────────────────────────────────────────
+    let provider =
+        create_provider(&config.model, &api_key, None).context("failed to create provider")?;
+    let registry = Arc::new(ToolRegistry::from_inventory());
+
+    // ── Agent ────────────────────────────────────────────────────────────────
+    let session_id = Uuid::new_v4().to_string();
+    let agent_config = AgentConfig {
+        provider,
+        registry,
+        max_iterations: config.max_iterations,
+        system_prompt: "You are Hermes, a helpful AI assistant.".to_string(),
+        session_id,
+    };
+    let mut agent = Agent::new(agent_config);
+    let mut history: Vec<Message> = Vec::new();
+
+    // ── Banner ───────────────────────────────────────────────────────────────
+    println!("Hermes — model: {}", config.model);
+    println!("Type /help for commands, /quit to exit.\n");
+
+    // ── Readline channel ─────────────────────────────────────────────────────
+    // rustyline is blocking; run it in a dedicated thread and communicate
+    // with the async loop via a channel.
+    let (input_tx, mut input_rx) = mpsc::channel::<String>(32);
+
+    let history_path = hermes_home().join("cli_history.txt");
+    let history_path_clone = history_path.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let mut rl = match rustyline::DefaultEditor::new() {
+            Ok(editor) => editor,
+            Err(e) => {
+                eprintln!("Failed to initialise readline: {e}");
+                return;
+            }
+        };
+
+        // Load history (ignore errors — file may not exist yet).
+        let _ = rl.load_history(&history_path_clone);
+
+        loop {
+            match rl.readline("> ") {
+                Ok(line) => {
+                    let trimmed = line.trim().to_string();
+                    if !trimmed.is_empty() {
+                        rl.add_history_entry(&trimmed).ok();
+                    }
+                    if input_tx.blocking_send(trimmed).is_err() {
+                        // Receiver dropped; the async side has exited.
+                        break;
+                    }
+                }
+                Err(rustyline::error::ReadlineError::Interrupted)
+                | Err(rustyline::error::ReadlineError::Eof) => {
+                    let _ = input_tx.blocking_send("/quit".to_string());
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+
+        let _ = rl.save_history(&history_path_clone);
+    });
+
+    // ── Main async loop ───────────────────────────────────────────────────────
+    while let Some(input) = input_rx.recv().await {
+        match input.as_str() {
+            "" => continue,
+            "/quit" | "/exit" => {
+                println!("Goodbye.");
+                break;
+            }
+            "/new" => {
+                history.clear();
+                println!("Conversation reset.");
+                continue;
+            }
+            "/help" => {
+                println!("/quit — exit");
+                println!("/new  — reset conversation history");
+                println!("/help — show this message");
+                continue;
+            }
+            _ => {}
+        }
+
+        // Regular user message — stream the response.
+        let (delta_tx, delta_rx) = mpsc::channel::<StreamDelta>(64);
+        let render_handle = tokio::spawn(render_stream(delta_rx));
+
+        let result = agent.run_conversation(&input, &mut history, delta_tx).await;
+
+        // Await renderer (it terminates when the sender is dropped, which
+        // happens as `delta_tx` goes out of scope above when run_conversation
+        // returns; drop explicitly to be clear).
+        let _ = render_handle.await;
+
+        if let Err(e) = result {
+            eprintln!("Error: {e:#}");
+        }
+    }
+
+    // Save history path (already saved in spawn_blocking on exit, but also
+    // ensure the home directory exists so subsequent runs can load it).
+    if let Some(parent) = history_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    Ok(())
+}
