@@ -45,6 +45,7 @@ bytes = "1"
 # Config
 serde_yaml_ng = "0.10"
 dotenvy = "0.15"
+dirs = "6"
 
 # SQLite
 tokio-rusqlite = "0.7"
