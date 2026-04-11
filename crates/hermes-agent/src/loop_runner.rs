@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     budget::IterationBudget,
+    cache_manager::PromptCacheManager,
     parallel::{execute_parallel, execute_sequential, should_parallelize},
 };
 
@@ -41,6 +42,7 @@ pub struct Agent {
     approval_tx: mpsc::Sender<ApprovalRequest>,
     tool_config: Arc<ToolConfig>,
     memory: hermes_memory::MemoryManager,
+    cache_manager: PromptCacheManager,
 }
 
 impl Agent {
@@ -56,6 +58,7 @@ impl Agent {
             approval_tx: config.approval_tx,
             tool_config: config.tool_config,
             memory: config.memory,
+            cache_manager: PromptCacheManager::new(),
         }
     }
 
@@ -83,6 +86,18 @@ impl Agent {
         };
         let _ = &mut full_system; // Task 8 (compression) will reassign this
 
+        // Build cache segments (provider-gated)
+        let mut segments = if self.provider.supports_caching() {
+            let memory_block = self.memory.system_prompt_blocks();
+            Some(
+                self.cache_manager
+                    .get_or_freeze(&self.system_prompt, &memory_block),
+            )
+        } else {
+            None
+        };
+        let _ = &mut segments; // Task 8 (compression) will reassign
+
         let mut final_response = String::new();
 
         while self.budget.try_consume() {
@@ -90,7 +105,7 @@ impl Agent {
 
             let request = ChatRequest {
                 system: &full_system,
-                system_segments: None,
+                system_segments: segments.as_deref(),
                 messages: history.as_slice(),
                 tools: &schemas,
                 max_tokens: 4096,
