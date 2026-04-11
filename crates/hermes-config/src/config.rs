@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use hermes_core::tool::{FileToolConfig, TerminalToolConfig, ToolConfig};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -21,6 +22,69 @@ pub fn hermes_home() -> PathBuf {
         .join(".hermes")
 }
 
+// ─── Terminal config ──────────────────────────────────────────────────────────
+
+/// YAML-compatible terminal tool configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalConfigYaml {
+    #[serde(default = "default_terminal_timeout")]
+    pub timeout: u64,
+    #[serde(default = "default_terminal_max_timeout")]
+    pub max_timeout: u64,
+    #[serde(default = "default_terminal_output_max_chars")]
+    pub output_max_chars: usize,
+}
+
+fn default_terminal_timeout() -> u64 {
+    180
+}
+
+fn default_terminal_max_timeout() -> u64 {
+    600
+}
+
+fn default_terminal_output_max_chars() -> usize {
+    50_000
+}
+
+impl Default for TerminalConfigYaml {
+    fn default() -> Self {
+        Self {
+            timeout: default_terminal_timeout(),
+            max_timeout: default_terminal_max_timeout(),
+            output_max_chars: default_terminal_output_max_chars(),
+        }
+    }
+}
+
+// ─── File config ──────────────────────────────────────────────────────────────
+
+/// YAML-compatible file tool configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileConfigYaml {
+    #[serde(default = "default_file_read_max_chars")]
+    pub read_max_chars: usize,
+    #[serde(default = "default_file_read_max_lines")]
+    pub read_max_lines: usize,
+}
+
+fn default_file_read_max_chars() -> usize {
+    100_000
+}
+
+fn default_file_read_max_lines() -> usize {
+    2000
+}
+
+impl Default for FileConfigYaml {
+    fn default() -> Self {
+        Self {
+            read_max_chars: default_file_read_max_chars(),
+            read_max_lines: default_file_read_max_lines(),
+        }
+    }
+}
+
 // ─── Config struct ────────────────────────────────────────────────────────────
 
 /// Top-level application configuration.
@@ -37,6 +101,14 @@ pub struct AppConfig {
     /// Sampling temperature (0.0 – 1.0).
     #[serde(default = "default_temperature")]
     pub temperature: f32,
+
+    /// Terminal tool configuration.
+    #[serde(default)]
+    pub terminal: TerminalConfigYaml,
+
+    /// File tool configuration.
+    #[serde(default)]
+    pub file: FileConfigYaml,
 }
 
 fn default_model() -> String {
@@ -57,6 +129,8 @@ impl Default for AppConfig {
             model: default_model(),
             max_iterations: default_max_iterations(),
             temperature: default_temperature(),
+            terminal: TerminalConfigYaml::default(),
+            file: FileConfigYaml::default(),
         }
     }
 }
@@ -64,8 +138,14 @@ impl Default for AppConfig {
 impl AppConfig {
     /// Load configuration from `hermes_home()/config.yaml`.
     ///
-    /// Falls back to [`AppConfig::default`] if the file is absent or unreadable.
+    /// Loads `.env` from `hermes_home()/.env` first, then falls back to
+    /// [`AppConfig::default`] if the YAML file is absent or unreadable.
     pub fn load() -> Self {
+        let env_path = hermes_home().join(".env");
+        if env_path.exists() {
+            let _ = dotenvy::from_path(&env_path);
+        }
+
         let path = hermes_home().join("config.yaml");
 
         let contents = match std::fs::read_to_string(&path) {
@@ -123,6 +203,27 @@ impl AppConfig {
             .ok()
             .filter(|k| !k.is_empty())
     }
+
+    /// Convert this config into a [`ToolConfig`] for the given workspace root.
+    pub fn tool_config(&self, workspace_root: PathBuf) -> ToolConfig {
+        ToolConfig {
+            terminal: TerminalToolConfig {
+                timeout: self.terminal.timeout,
+                max_timeout: self.terminal.max_timeout,
+                output_max_chars: self.terminal.output_max_chars,
+            },
+            file: FileToolConfig {
+                read_max_chars: self.file.read_max_chars,
+                read_max_lines: self.file.read_max_lines,
+                blocked_prefixes: vec![
+                    PathBuf::from("/etc/"),
+                    PathBuf::from("/boot/"),
+                    PathBuf::from("/usr/lib/systemd/"),
+                ],
+            },
+            workspace_root,
+        }
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -145,6 +246,8 @@ mod tests {
             model: "openai/gpt-4o".to_string(),
             max_iterations: 50,
             temperature: 0.5,
+            terminal: TerminalConfigYaml::default(),
+            file: FileConfigYaml::default(),
         };
         let yaml = serde_yaml_ng::to_string(&original).expect("serialize failed");
         let restored: AppConfig = serde_yaml_ng::from_str(&yaml).expect("deserialize failed");
@@ -155,9 +258,6 @@ mod tests {
 
     #[test]
     fn hermes_home_default() {
-        // When HERMES_HOME is not set, should resolve to something ending in ".hermes"
-        // We cannot rely on HOME being absent, so just verify the path ends with ".hermes"
-        // unless HERMES_HOME is overriding it.
         if std::env::var("HERMES_HOME").is_err() {
             let home = hermes_home();
             assert_eq!(home.file_name().and_then(|f| f.to_str()), Some(".hermes"));
@@ -166,8 +266,6 @@ mod tests {
 
     #[test]
     fn hermes_home_env_override() {
-        // Temporarily set HERMES_HOME and verify it's used.
-        // Use a temp-dir-style path to avoid side effects.
         let override_path = "/tmp/hermes_test_home";
         // SAFETY: single-threaded test, no concurrent env reads.
         unsafe {
@@ -179,5 +277,47 @@ mod tests {
             std::env::remove_var("HERMES_HOME");
         }
         assert_eq!(home, PathBuf::from(override_path));
+    }
+
+    #[test]
+    fn config_with_terminal_section() {
+        let yaml = r#"
+model: anthropic/claude-sonnet-4-20250514
+terminal:
+  timeout: 300
+  max_timeout: 900
+  output_max_chars: 80000
+"#;
+        let cfg: AppConfig = serde_yaml_ng::from_str(yaml).expect("deserialize failed");
+        assert_eq!(cfg.terminal.timeout, 300);
+        assert_eq!(cfg.terminal.max_timeout, 900);
+        assert_eq!(cfg.terminal.output_max_chars, 80_000);
+    }
+
+    #[test]
+    fn config_defaults_when_sections_missing() {
+        let yaml = r#"
+model: openai/gpt-4o
+"#;
+        let cfg: AppConfig = serde_yaml_ng::from_str(yaml).expect("deserialize failed");
+        assert_eq!(cfg.terminal.timeout, 180);
+        assert_eq!(cfg.terminal.max_timeout, 600);
+        assert_eq!(cfg.terminal.output_max_chars, 50_000);
+        assert_eq!(cfg.file.read_max_chars, 100_000);
+        assert_eq!(cfg.file.read_max_lines, 2000);
+    }
+
+    #[test]
+    fn tool_config_conversion() {
+        let cfg = AppConfig::default();
+        let root = PathBuf::from("/tmp/workspace");
+        let tc = cfg.tool_config(root.clone());
+        assert_eq!(tc.terminal.timeout, 180);
+        assert_eq!(tc.terminal.max_timeout, 600);
+        assert_eq!(tc.terminal.output_max_chars, 50_000);
+        assert_eq!(tc.file.read_max_chars, 100_000);
+        assert_eq!(tc.file.read_max_lines, 2000);
+        assert_eq!(tc.workspace_root, root);
+        assert!(tc.file.blocked_prefixes.contains(&PathBuf::from("/etc/")));
     }
 }

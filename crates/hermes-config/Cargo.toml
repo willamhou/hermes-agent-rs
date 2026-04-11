@@ -11,5 +11,6 @@ hermes-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
+dotenvy.workspace = true
 tracing.workspace = true
 dirs.workspace = true
