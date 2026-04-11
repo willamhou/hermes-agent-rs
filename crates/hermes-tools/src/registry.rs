@@ -77,11 +77,13 @@ impl Default for ToolRegistry {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
     use async_trait::async_trait;
     use hermes_core::{
         error::Result,
         message::ToolResult,
-        tool::{Tool, ToolContext, ToolSchema},
+        tool::{Tool, ToolConfig, ToolContext, ToolSchema},
     };
 
     // ── Mock tools ────────────────────────────────────────────────────────────
@@ -158,6 +160,7 @@ mod tests {
             working_dir: std::path::PathBuf::from("/tmp"),
             approval_tx,
             delta_tx,
+            tool_config: Arc::new(ToolConfig::default()),
         };
         (ctx, approval_rx, delta_rx)
     }

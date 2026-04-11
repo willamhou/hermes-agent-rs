@@ -7,7 +7,7 @@ use hermes_core::{
     message::{Content, Message, Role},
     provider::{ChatRequest, Provider},
     stream::StreamDelta,
-    tool::{ApprovalDecision, ApprovalRequest, ToolContext, ToolSchema},
+    tool::{ApprovalDecision, ApprovalRequest, ToolConfig, ToolContext, ToolSchema},
 };
 use hermes_tools::registry::ToolRegistry;
 use tokio::sync::mpsc;
@@ -115,6 +115,7 @@ impl Agent {
                 working_dir: self.working_dir.clone(),
                 approval_tx: self.approval_tx.clone(),
                 delta_tx: delta_tx.clone(),
+                tool_config: Arc::new(ToolConfig::default()),
             };
 
             let tool_results = if should_parallelize(&response.tool_calls, &self.registry) {

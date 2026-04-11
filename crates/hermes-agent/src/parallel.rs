@@ -34,6 +34,14 @@ pub fn should_parallelize(calls: &[ToolCall], registry: &ToolRegistry) -> bool {
         return false;
     }
 
+    // Any exclusive tool prevents parallelism.
+    if calls
+        .iter()
+        .any(|c| registry.get(&c.name).is_some_and(|t| t.is_exclusive()))
+    {
+        return false;
+    }
+
     // Collect write paths from non-read-only tools that carry a "path" arg.
     let write_paths: Vec<String> = calls
         .iter()
