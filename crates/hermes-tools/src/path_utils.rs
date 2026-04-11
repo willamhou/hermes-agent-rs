@@ -17,24 +17,73 @@ pub fn resolve_path(path: &str, working_dir: &Path) -> PathBuf {
     }
 }
 
+/// Lexically normalize a path by resolving `.` and `..` components without
+/// hitting the filesystem. This is used as a fallback when `canonicalize` fails
+/// (e.g. the path does not exist yet) to ensure `..`-based traversal attacks are
+/// caught even when the target path is absent.
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut components: Vec<Component<'_>> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Pop the last normal component if possible; otherwise keep the `..`
+                // so the resulting path is still "more traversed" than any workspace root.
+                match components.last() {
+                    Some(Component::Normal(_)) => {
+                        components.pop();
+                    }
+                    _ => components.push(component),
+                }
+            }
+            other => components.push(other),
+        }
+    }
+    components.iter().collect()
+}
+
 /// Check resolved path is under workspace_root. Returns Err(String) if escapes.
-/// For files that don't exist yet: canonicalize parent + file_name.
+/// For files that don't exist yet: canonicalize parent + file_name, then fall back
+/// to lexical normalization so that `..`-traversal attacks are caught even when
+/// the target path is absent on disk.
+///
+/// Also detects dangling symlinks (symlinks whose target does not exist) and
+/// resolves them so they cannot be used to escape the sandbox.
 pub fn check_sandbox(resolved: &Path, workspace_root: &Path) -> Result<(), String> {
     let canonical_root = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
 
+    // Detect dangling symlinks: symlink_metadata succeeds but metadata (which
+    // follows symlinks) fails.  Read the link target and check it directly.
+    let lmeta = std::fs::symlink_metadata(resolved);
+    if let Ok(meta) = &lmeta {
+        if meta.file_type().is_symlink() {
+            // Follow the symlink target (may be relative)
+            let target = std::fs::read_link(resolved).unwrap_or_else(|_| resolved.to_path_buf());
+            let target_abs = if target.is_absolute() {
+                target
+            } else {
+                resolved.parent().unwrap_or(Path::new(".")).join(&target)
+            };
+            // Recurse: check the resolved symlink target
+            return check_sandbox(&target_abs, workspace_root);
+        }
+    }
+
     let canonical_path = if resolved.exists() {
         resolved
             .canonicalize()
-            .unwrap_or_else(|_| resolved.to_path_buf())
+            .unwrap_or_else(|_| normalize_path(resolved))
     } else {
-        // For files that don't exist yet: canonicalize parent + file_name
+        // For files that don't exist yet: canonicalize parent + file_name,
+        // then fall back to lexical normalization to catch `..` traversal.
         let parent = resolved.parent().unwrap_or(Path::new("."));
         let file_name = resolved.file_name().unwrap_or_default();
         let canonical_parent = parent
             .canonicalize()
-            .unwrap_or_else(|_| parent.to_path_buf());
+            .unwrap_or_else(|_| normalize_path(parent));
         canonical_parent.join(file_name)
     };
 
