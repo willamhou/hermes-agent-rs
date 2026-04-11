@@ -61,10 +61,12 @@ pub async fn render_stream(mut rx: mpsc::Receiver<StreamDelta>) {
                 let _ = lock.flush();
             }
             StreamDelta::Done => {
+                // Done marks end of one LLM call, but the agent loop may
+                // issue more calls (after tool execution). Don't break here;
+                // the renderer stops when the channel sender is dropped.
                 let mut lock = stdout.lock();
                 let _ = writeln!(lock);
                 let _ = lock.flush();
-                break;
             }
         }
     }
