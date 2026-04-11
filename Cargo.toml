@@ -64,6 +64,7 @@ secrecy = { version = "0.10", features = ["serde"] }
 inventory = "0.3"
 dashmap = "6"
 walkdir = "2"
+regex = "1"
 
 # Tokenizer
 tokenizers = "0.20"
