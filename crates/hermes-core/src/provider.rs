@@ -17,6 +17,7 @@ pub struct ChatRequest<'a> {
     pub stop_sequences: Vec<String>,
 }
 
+#[derive(Clone)]
 pub struct CacheSegment {
     pub text: String,
     pub label: &'static str,
