@@ -14,3 +14,12 @@ serde_yaml_ng.workspace = true
 dotenvy.workspace = true
 tracing.workspace = true
 dirs.workspace = true
+tokio.workspace = true
+tokio-rusqlite.workspace = true
+rusqlite.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
