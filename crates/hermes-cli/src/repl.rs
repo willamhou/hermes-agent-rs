@@ -1,12 +1,16 @@
 //! Interactive REPL loop for the Hermes CLI.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context as _, Result};
 use hermes_agent::loop_runner::{Agent, AgentConfig};
-use hermes_config::config::{AppConfig, hermes_home};
+use hermes_config::{
+    SqliteSessionStore,
+    config::{AppConfig, hermes_home},
+};
 use hermes_core::{
     message::Message,
+    session::{SessionMeta, SessionStore as _},
     stream::StreamDelta,
     tool::{ApprovalDecision, ApprovalRequest},
 };
@@ -38,7 +42,6 @@ pub async fn run_repl() -> Result<()> {
     // ── Agent ────────────────────────────────────────────────────────────────
     let session_id = Uuid::new_v4().to_string();
     let working_dir = std::env::current_dir().context("failed to get current directory")?;
-
     let tool_config = Arc::new(config.tool_config(working_dir.clone()));
 
     let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
@@ -49,26 +52,140 @@ pub async fn run_repl() -> Result<()> {
         }
     });
 
+    let system_prompt = "You are Hermes, a helpful AI assistant.".to_string();
+
     let agent_config = AgentConfig {
         provider,
         registry,
         max_iterations: config.max_iterations,
-        system_prompt: "You are Hermes, a helpful AI assistant.".to_string(),
-        session_id,
-        working_dir,
+        system_prompt: system_prompt.clone(),
+        session_id: session_id.clone(),
+        working_dir: working_dir.clone(),
         approval_tx,
         tool_config,
     };
     let mut agent = Agent::new(agent_config);
     let mut history: Vec<Message> = Vec::new();
 
+    // ── Session store ─────────────────────────────────────────────────────────
+    let store = SqliteSessionStore::open()
+        .await
+        .context("failed to open session store")?;
+
+    let meta = SessionMeta {
+        id: session_id.clone(),
+        source: "cli".to_string(),
+        model: config.model.clone(),
+        system_prompt,
+        cwd: working_dir.to_string_lossy().to_string(),
+        started_at: chrono::Utc::now().to_rfc3339(),
+        ended_at: None,
+        message_count: 0,
+        tool_call_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        title: None,
+    };
+    let _ = store.create_session(&meta).await;
+
     // ── Banner ───────────────────────────────────────────────────────────────
     println!("Hermes — model: {}", config.model);
+    println!("Session: {session_id}");
     println!("Type /help for commands, /quit to exit.\n");
 
+    repl_loop(&mut agent, &mut history, &store, &session_id, &config).await?;
+
+    let _ = store.end_session(&session_id).await;
+
+    Ok(())
+}
+
+/// Resume an existing session by ID, or the most recent session if `resume_id` is None.
+pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
+    let store = SqliteSessionStore::open()
+        .await
+        .context("failed to open session store")?;
+
+    // Find session to resume
+    let session_id = if let Some(id) = resume_id {
+        id
+    } else {
+        let sessions = store
+            .list_sessions(1)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        sessions
+            .first()
+            .map(|s| s.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("no sessions to resume"))?
+    };
+
+    let meta = store
+        .get_session(&session_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
+
+    // Load history
+    let mut history = store
+        .load_history(&session_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!(
+        "Resuming session {} ({} messages)",
+        session_id,
+        history.len()
+    );
+
+    // ── Build agent with session's model ──────────────────────────────────────
+    let config = AppConfig::load();
+    let model = meta.model.clone();
+    let api_key = config.api_key().with_context(|| "No API key")?;
+    let provider = create_provider(&model, SecretString::new(api_key.into()), None)
+        .context("failed to create provider")?;
+    let registry = Arc::new(ToolRegistry::from_inventory());
+    let working_dir = PathBuf::from(&meta.cwd);
+    let tool_config = Arc::new(config.tool_config(working_dir.clone()));
+
+    let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
+    tokio::spawn(async move {
+        while let Some(req) = approval_rx.recv().await {
+            tracing::warn!(tool = %req.tool_name, "auto-allowing tool");
+            let _ = req.response_tx.send(ApprovalDecision::Allow);
+        }
+    });
+
+    let mut agent = Agent::new(AgentConfig {
+        provider,
+        registry,
+        max_iterations: config.max_iterations,
+        system_prompt: meta.system_prompt.clone(),
+        session_id: session_id.clone(),
+        working_dir,
+        approval_tx,
+        tool_config,
+    });
+
+    println!("Hermes — model: {model}");
+    println!("Type /help for commands, /quit to exit.\n");
+
+    repl_loop(&mut agent, &mut history, &store, &session_id, &config).await?;
+
+    let _ = store.end_session(&session_id).await;
+
+    Ok(())
+}
+
+/// Core REPL loop shared by `run_repl` and `run_repl_with_resume`.
+async fn repl_loop(
+    agent: &mut Agent,
+    history: &mut Vec<Message>,
+    store: &SqliteSessionStore,
+    session_id: &str,
+    _config: &AppConfig,
+) -> Result<()> {
     // ── Readline channel ─────────────────────────────────────────────────────
-    // rustyline is blocking; run it in a dedicated thread and communicate
-    // with the async loop via a channel.
     let (input_tx, mut input_rx) = mpsc::channel::<String>(32);
 
     let history_path = hermes_home().join("cli_history.txt");
@@ -119,6 +236,8 @@ pub async fn run_repl() -> Result<()> {
                 break;
             }
             "/new" => {
+                // End current session and start fresh (caller will create new session if needed)
+                let _ = store.end_session(session_id).await;
                 history.clear();
                 println!("Conversation reset.");
                 continue;
@@ -132,11 +251,17 @@ pub async fn run_repl() -> Result<()> {
             _ => {}
         }
 
-        // Regular user message — stream the response.
+        // Regular user message — persist user message, then stream the response.
+        let user_msg = Message::user(&input);
+        let _ = store.append_message(session_id, &user_msg).await;
+
+        // Track how many messages exist before this turn so we can persist new ones.
+        let pre_len = history.len();
+
         let (delta_tx, delta_rx) = mpsc::channel::<StreamDelta>(64);
         let render_handle = tokio::spawn(render_stream(delta_rx));
 
-        let result = agent.run_conversation(&input, &mut history, delta_tx).await;
+        let result = agent.run_conversation(&input, history, delta_tx).await;
 
         // Await renderer (it terminates when the sender is dropped, which
         // happens as `delta_tx` goes out of scope above when run_conversation
@@ -145,11 +270,16 @@ pub async fn run_repl() -> Result<()> {
 
         if let Err(e) = result {
             eprintln!("Error: {e:#}");
+        } else {
+            // Persist all messages added during this turn, skipping the user
+            // message at pre_len (already persisted above).
+            for msg in &history[pre_len + 1..] {
+                let _ = store.append_message(session_id, msg).await;
+            }
         }
     }
 
-    // Save history path (already saved in spawn_blocking on exit, but also
-    // ensure the home directory exists so subsequent runs can load it).
+    // Ensure the home directory exists so subsequent runs can load readline history.
     if let Some(parent) = history_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
