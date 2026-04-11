@@ -63,7 +63,12 @@ impl Tool for WriteFileTool {
         // Resolve path
         let resolved = path_utils::resolve_path(&path_str, &ctx.working_dir);
 
-        // Safety check
+        // Safety checks
+        if let Err(e) = crate::path_utils::check_sandbox(&resolved, &ctx.tool_config.workspace_root)
+        {
+            return Ok(ToolResult::error(e));
+        }
+
         if path_utils::is_blocked_write_path(&resolved, &ctx.tool_config) {
             return Ok(ToolResult::error("write to this path is blocked"));
         }
@@ -109,14 +114,23 @@ mod tests {
     use std::sync::Arc;
 
     fn make_ctx(working_dir: std::path::PathBuf) -> ToolContext {
+        make_ctx_with_root(working_dir.clone(), working_dir)
+    }
+
+    fn make_ctx_with_root(
+        working_dir: std::path::PathBuf,
+        workspace_root: std::path::PathBuf,
+    ) -> ToolContext {
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(8);
         let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel(8);
+        let mut config = ToolConfig::default();
+        config.workspace_root = workspace_root;
         ToolContext {
             session_id: "test-session".to_string(),
             working_dir,
             approval_tx,
             delta_tx,
-            tool_config: Arc::new(ToolConfig::default()),
+            tool_config: Arc::new(config),
         }
     }
 
@@ -204,6 +218,40 @@ mod tests {
         let result = tool.execute(args, &ctx).await.unwrap();
 
         assert!(result.is_error);
-        assert!(result.content.contains("blocked"));
+        // sandbox check fires before is_blocked_write_path
+        assert!(
+            result.content.contains("blocked") || result.content.contains("escapes workspace root")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_file_sandbox_escape() {
+        let tmp = std::env::temp_dir().join(format!("hermes_sandbox_write_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Workspace root is tmp; try to write outside it
+        let ctx = make_ctx(tmp.clone());
+        let tool = WriteFileTool;
+        let outside = std::env::temp_dir().join("hermes_escape_target.txt");
+        let args = serde_json::json!({
+            "path": outside.to_str().unwrap(),
+            "content": "should not write"
+        });
+        let result = tool.execute(args, &ctx).await.unwrap();
+
+        assert!(
+            result.is_error,
+            "expected sandbox error, got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("escapes workspace root"),
+            "unexpected error: {}",
+            result.content
+        );
+        // Ensure the file was not created
+        assert!(!outside.exists(), "file should not have been created");
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

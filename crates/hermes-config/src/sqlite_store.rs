@@ -152,7 +152,7 @@ impl SessionStore for SqliteSessionStore {
         let sid = session_id.to_owned();
         let role_str = role_to_str(&msg.role).to_owned();
         let content_text = msg.content.as_text_lossy();
-        let is_tool = matches!(msg.role, Role::Tool);
+        let tool_call_count_delta = msg.tool_calls.len() as i64;
 
         // Serialize tool_calls → Option<String>
         let tool_calls_json: Option<String> =
@@ -186,23 +186,15 @@ impl SessionStore for SqliteSessionStore {
                 )?;
                 let row_id = c.last_insert_rowid();
 
-                // Update session message_count (and tool_call_count for tool messages)
-                if is_tool {
-                    c.execute(
-                        "UPDATE sessions \
-                         SET message_count = message_count + 1, \
-                             tool_call_count = tool_call_count + 1 \
-                         WHERE id = (SELECT session_id FROM messages WHERE id = ?1)",
-                        rusqlite::params![row_id],
-                    )?;
-                } else {
-                    c.execute(
-                        "UPDATE sessions \
-                         SET message_count = message_count + 1 \
-                         WHERE id = (SELECT session_id FROM messages WHERE id = ?1)",
-                        rusqlite::params![row_id],
-                    )?;
-                }
+                // Update session message_count and tool_call_count (counting invocations,
+                // i.e. assistant messages with non-empty tool_calls).
+                c.execute(
+                    "UPDATE sessions \
+                     SET message_count = message_count + 1, \
+                         tool_call_count = tool_call_count + ?1 \
+                     WHERE id = ?2",
+                    rusqlite::params![tool_call_count_delta, sid],
+                )?;
 
                 Ok(row_id)
             })
@@ -247,7 +239,10 @@ impl SessionStore for SqliteSessionStore {
                     let content = Content::Text(content_str.unwrap_or_default());
 
                     let tool_calls: Vec<ToolCall> = match tool_calls_str {
-                        Some(json) => serde_json::from_str(&json).unwrap_or_default(),
+                        Some(ref json) => serde_json::from_str(json).unwrap_or_else(|e| {
+                            tracing::warn!(session_id = %sid, "failed to deserialize tool_calls: {e}");
+                            vec![]
+                        }),
                         None => vec![],
                     };
 

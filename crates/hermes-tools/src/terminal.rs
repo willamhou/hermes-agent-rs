@@ -76,15 +76,44 @@ pub fn detect_dangerous(command: &str) -> Option<&'static str> {
 
 // ── Output truncation ─────────────────────────────────────────────────────────
 
+/// Find the largest byte index <= `index` that is a valid UTF-8 char boundary.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Find the smallest byte index >= `index` that is a valid UTF-8 char boundary.
+fn ceil_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
 fn truncate_output(output: &str, max_chars: usize) -> String {
     if output.len() <= max_chars {
         return output.to_string();
     }
-    let head_len = max_chars * 40 / 100;
-    let tail_len = max_chars * 60 / 100;
-    let head = &output[..head_len];
-    let tail = &output[output.len() - tail_len..];
-    let omitted = output.len() - head_len - tail_len;
+    let head_target = max_chars * 40 / 100;
+    let tail_target = max_chars * 60 / 100;
+
+    // Find safe char boundaries to avoid splitting multi-byte characters
+    let head_end = floor_char_boundary(output, head_target);
+    let tail_start = ceil_char_boundary(output, output.len().saturating_sub(tail_target));
+
+    let head = &output[..head_end];
+    let tail = &output[tail_start..];
+    let omitted = output.len() - head.len() - tail.len();
     format!("{head}\n\n[...truncated {omitted} chars...]\n\n{tail}")
 }
 
@@ -146,12 +175,19 @@ impl Tool for TerminalTool {
             requested.min(max)
         };
 
-        // Parse workdir: optional, default ctx.working_dir
-        let workdir = args
-            .get("workdir")
-            .and_then(|v| v.as_str())
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| ctx.working_dir.clone());
+        // Parse workdir: optional, default ctx.working_dir; sandbox-checked if provided
+        let workdir = match args.get("workdir").and_then(|v| v.as_str()) {
+            Some(w) => {
+                let resolved = crate::path_utils::resolve_path(w, &ctx.working_dir);
+                if let Err(e) =
+                    crate::path_utils::check_sandbox(&resolved, &ctx.tool_config.workspace_root)
+                {
+                    return Ok(ToolResult::error(format!("workdir denied: {e}")));
+                }
+                resolved
+            }
+            None => ctx.working_dir.clone(),
+        };
 
         // Check for dangerous command
         if let Some(reason) = detect_dangerous(&command) {
@@ -260,12 +296,14 @@ mod tests {
     ) {
         let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(8);
         let (delta_tx, delta_rx) = tokio::sync::mpsc::channel(8);
+        let mut config = ToolConfig::default();
+        config.workspace_root = std::path::PathBuf::from("/tmp");
         let ctx = ToolContext {
             session_id: "test-session".to_string(),
             working_dir: std::path::PathBuf::from("/tmp"),
             approval_tx,
             delta_tx,
-            tool_config: Arc::new(ToolConfig::default()),
+            tool_config: Arc::new(config),
         };
         (ctx, approval_rx, delta_rx)
     }
@@ -358,6 +396,23 @@ mod tests {
         // Head: 40 chars, tail: 60 chars
         assert!(result.starts_with(&"A".repeat(40)));
         assert!(result.ends_with(&"A".repeat(60)));
+    }
+
+    #[test]
+    fn test_truncate_output_multibyte() {
+        // Each Chinese character is 3 bytes in UTF-8
+        // Build a string >100 bytes using Chinese chars so truncation at byte boundaries
+        // would previously panic
+        let chinese = "你好世界"; // 4 chars, 12 bytes each repetition
+        let output = chinese.repeat(20); // 80 chars, 240 bytes
+        // max_chars=100 bytes means truncation is needed (240 > 100)
+        let result = truncate_output(&output, 100);
+        assert!(
+            result.contains("[...truncated"),
+            "should be truncated: {result}"
+        );
+        // Verify the result is valid UTF-8 (would panic before the fix if sliced mid-char)
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
     }
 
     // ── terminal execution tests ──────────────────────────────────────────────

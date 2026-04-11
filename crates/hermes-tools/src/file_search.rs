@@ -151,6 +151,13 @@ impl Tool for SearchFilesTool {
 
         let search_root = path_utils::resolve_path(search_path_str, &ctx.working_dir);
 
+        // Sandbox check: ensure the search root is within the workspace
+        if let Err(e) =
+            crate::path_utils::check_sandbox(&search_root, &ctx.tool_config.workspace_root)
+        {
+            return Ok(ToolResult::error(e));
+        }
+
         match target.as_str() {
             "files" => search_files_mode(&pattern, &search_root, limit),
             _ => search_content_mode(
@@ -325,14 +332,24 @@ mod tests {
     use std::sync::Arc;
 
     fn make_ctx(working_dir: std::path::PathBuf) -> ToolContext {
+        make_ctx_with_root(working_dir.clone(), working_dir)
+    }
+
+    #[allow(dead_code)]
+    fn make_ctx_with_root(
+        working_dir: std::path::PathBuf,
+        workspace_root: std::path::PathBuf,
+    ) -> ToolContext {
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(8);
         let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel(8);
+        let mut config = ToolConfig::default();
+        config.workspace_root = workspace_root;
         ToolContext {
             session_id: "test-session".to_string(),
             working_dir,
             approval_tx,
             delta_tx,
-            tool_config: Arc::new(ToolConfig::default()),
+            tool_config: Arc::new(config),
         }
     }
 

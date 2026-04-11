@@ -79,6 +79,11 @@ impl Tool for ReadFileTool {
         let resolved = path_utils::resolve_path(&path_str, &ctx.working_dir);
 
         // Safety checks
+        if let Err(e) = crate::path_utils::check_sandbox(&resolved, &ctx.tool_config.workspace_root)
+        {
+            return Ok(ToolResult::error(e));
+        }
+
         if path_utils::is_blocked_device(&resolved) {
             return Ok(ToolResult::error("blocked device path"));
         }
@@ -155,14 +160,23 @@ mod tests {
     use std::sync::Arc;
 
     fn make_ctx(working_dir: std::path::PathBuf) -> ToolContext {
+        make_ctx_with_root(working_dir.clone(), working_dir)
+    }
+
+    fn make_ctx_with_root(
+        working_dir: std::path::PathBuf,
+        workspace_root: std::path::PathBuf,
+    ) -> ToolContext {
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(8);
         let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel(8);
+        let mut config = ToolConfig::default();
+        config.workspace_root = workspace_root;
         ToolContext {
             session_id: "test-session".to_string(),
             working_dir,
             approval_tx,
             delta_tx,
-            tool_config: Arc::new(ToolConfig::default()),
+            tool_config: Arc::new(config),
         }
     }
 
@@ -249,13 +263,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_file_device_blocked() {
+        // /dev/zero will be caught by the sandbox check first (escapes /tmp workspace)
+        // Use a workspace_root outside /dev to ensure the sandbox check fires
         let ctx = make_ctx(std::path::PathBuf::from("/tmp"));
         let tool = ReadFileTool;
         let args = serde_json::json!({"path": "/dev/zero"});
         let result = tool.execute(args, &ctx).await.unwrap();
 
         assert!(result.is_error);
-        assert!(result.content.contains("blocked device path"));
+        // Either sandbox check or device check fires
+        assert!(
+            result.content.contains("escapes workspace root")
+                || result.content.contains("blocked device path")
+        );
     }
 
     #[tokio::test]
@@ -267,5 +287,30 @@ mod tests {
 
         assert!(result.is_error);
         assert!(result.content.contains("failed to read file"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_sandbox_escape() {
+        let tmp = std::env::temp_dir().join(format!("hermes_sandbox_read_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Workspace root is tmp; try to read /etc/hostname (outside workspace)
+        let ctx = make_ctx(tmp.clone());
+        let tool = ReadFileTool;
+        let args = serde_json::json!({"path": "/etc/hostname"});
+        let result = tool.execute(args, &ctx).await.unwrap();
+
+        assert!(
+            result.is_error,
+            "expected sandbox error, got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("escapes workspace root"),
+            "unexpected error: {}",
+            result.content
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

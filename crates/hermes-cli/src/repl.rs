@@ -47,6 +47,8 @@ pub async fn run_repl() -> Result<()> {
     let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
     tokio::spawn(async move {
         while let Some(req) = approval_rx.recv().await {
+            // Phase 2: auto-allow all tool approvals. AllowSession/AllowAlways
+            // memory will be implemented when the interactive approval UI is added.
             tracing::warn!(tool = %req.tool_name, command = %req.command, "auto-allowing tool (no approval UI)");
             let _ = req.response_tx.send(ApprovalDecision::Allow);
         }
@@ -151,6 +153,8 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
     let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
     tokio::spawn(async move {
         while let Some(req) = approval_rx.recv().await {
+            // Phase 2: auto-allow all tool approvals. AllowSession/AllowAlways
+            // memory will be implemented when the interactive approval UI is added.
             tracing::warn!(tool = %req.tool_name, "auto-allowing tool");
             let _ = req.response_tx.send(ApprovalDecision::Allow);
         }
@@ -268,14 +272,15 @@ async fn repl_loop(
         // returns; drop explicitly to be clear).
         let _ = render_handle.await;
 
+        // Persist all messages added during this turn regardless of success/failure,
+        // skipping the user message at pre_len (already persisted above).
+        // This ensures tool-result messages are not lost when an error occurs.
+        for msg in &history[pre_len + 1..] {
+            let _ = store.append_message(session_id, msg).await;
+        }
+
         if let Err(e) = result {
             eprintln!("Error: {e:#}");
-        } else {
-            // Persist all messages added during this turn, skipping the user
-            // message at pre_len (already persisted above).
-            for msg in &history[pre_len + 1..] {
-                let _ = store.append_message(session_id, msg).await;
-            }
         }
     }
 
