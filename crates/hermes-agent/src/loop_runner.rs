@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use crate::{
     budget::IterationBudget,
     cache_manager::PromptCacheManager,
+    compressor::{CompressionConfig, CompressionResult, ContextCompressor},
     parallel::{execute_parallel, execute_sequential, should_parallelize},
 };
 
@@ -29,6 +30,7 @@ pub struct AgentConfig {
     pub approval_tx: mpsc::Sender<ApprovalRequest>,
     pub tool_config: Arc<ToolConfig>,
     pub memory: hermes_memory::MemoryManager,
+    pub compression: CompressionConfig,
 }
 
 /// Stateful agent that drives a conversation loop.
@@ -43,6 +45,7 @@ pub struct Agent {
     tool_config: Arc<ToolConfig>,
     memory: hermes_memory::MemoryManager,
     cache_manager: PromptCacheManager,
+    compressor: ContextCompressor,
 }
 
 impl Agent {
@@ -59,6 +62,7 @@ impl Agent {
             tool_config: config.tool_config,
             memory: config.memory,
             cache_manager: PromptCacheManager::new(),
+            compressor: ContextCompressor::new(config.compression),
         }
     }
 
@@ -157,6 +161,54 @@ impl Agent {
                     name: Some(tr.tool_name),
                     tool_call_id: Some(tr.call_id),
                 });
+            }
+
+            // Check if context compression is needed
+            let tool_count = schemas.len();
+            if self
+                .compressor
+                .should_compress(&full_system, history, tool_count)
+            {
+                tracing::info!("context compression triggered");
+                let contrib = self.memory.on_pre_compress(history).await;
+                match self
+                    .compressor
+                    .compress(history, self.provider.as_ref(), contrib.as_deref())
+                    .await
+                {
+                    Ok(CompressionResult::Compressed {
+                        before_tokens,
+                        after_tokens,
+                        ..
+                    }) => {
+                        tracing::info!(
+                            before = before_tokens,
+                            after = after_tokens,
+                            "compression complete"
+                        );
+                        // Invalidate prompt cache — system prompt context changed
+                        self.cache_manager.invalidate();
+                        // Refresh memory snapshot
+                        let _ = self.memory.refresh_snapshot();
+                        // Rebuild full_system and segments
+                        let memory_block = self.memory.system_prompt_blocks();
+                        full_system = if memory_block.is_empty() {
+                            self.system_prompt.clone()
+                        } else {
+                            format!("{}\n\n{}", self.system_prompt, memory_block)
+                        };
+                        if self.provider.supports_caching() {
+                            segments = Some(
+                                self.cache_manager
+                                    .get_or_freeze(&self.system_prompt, &memory_block),
+                            );
+                        }
+                    }
+                    Ok(CompressionResult::NotNeeded) => {}
+                    Err(e) => {
+                        tracing::warn!("compression failed: {e}");
+                    }
+                }
             }
         }
 
@@ -296,6 +348,8 @@ mod tests {
     ) -> (Agent, mpsc::Receiver<ApprovalRequest>) {
         use hermes_memory::MemoryManager;
 
+        use crate::compressor::CompressionConfig;
+
         let provider = Arc::new(MockProvider::new(responses));
         let registry = Arc::new(ToolRegistry::new());
         let (approval_tx, approval_rx) = mpsc::channel(8);
@@ -311,6 +365,7 @@ mod tests {
             approval_tx,
             tool_config: Arc::new(ToolConfig::default()),
             memory,
+            compression: CompressionConfig::default(),
         });
         (agent, approval_rx)
     }

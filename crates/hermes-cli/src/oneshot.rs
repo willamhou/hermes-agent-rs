@@ -3,7 +3,10 @@
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use hermes_agent::loop_runner::{Agent, AgentConfig};
+use hermes_agent::{
+    compressor::CompressionConfig,
+    loop_runner::{Agent, AgentConfig},
+};
 use hermes_config::config::{AppConfig, hermes_home};
 use hermes_core::{
     message::Message,
@@ -67,6 +70,7 @@ pub async fn run_oneshot(
         approval_tx,
         tool_config,
         memory,
+        compression: CompressionConfig::default(),
     };
 
     let mut agent = Agent::new(agent_config);

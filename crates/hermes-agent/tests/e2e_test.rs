@@ -6,7 +6,10 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use hermes_agent::loop_runner::{Agent, AgentConfig};
+use hermes_agent::{
+    compressor::CompressionConfig,
+    loop_runner::{Agent, AgentConfig},
+};
 use hermes_core::{
     error::Result as HermesResult,
     message::{Content, Role, ToolCall},
@@ -150,6 +153,7 @@ where
             ..ToolConfig::default()
         }),
         memory,
+        compression: CompressionConfig::default(),
     })
 }
 

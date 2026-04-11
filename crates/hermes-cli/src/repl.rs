@@ -3,7 +3,10 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context as _, Result};
-use hermes_agent::loop_runner::{Agent, AgentConfig};
+use hermes_agent::{
+    compressor::CompressionConfig,
+    loop_runner::{Agent, AgentConfig},
+};
 use hermes_config::{
     SqliteSessionStore,
     config::{AppConfig, hermes_home},
@@ -70,6 +73,7 @@ pub async fn run_repl() -> Result<()> {
         approval_tx,
         tool_config,
         memory,
+        compression: CompressionConfig::default(),
     };
     let mut agent = Agent::new(agent_config);
     let mut history: Vec<Message> = Vec::new();
@@ -178,6 +182,7 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
         approval_tx,
         tool_config,
         memory,
+        compression: CompressionConfig::default(),
     });
 
     println!("Hermes — model: {model}");
