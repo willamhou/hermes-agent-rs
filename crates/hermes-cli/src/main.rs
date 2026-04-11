@@ -1,5 +1,6 @@
 //! Hermes CLI entry point.
 
+mod oneshot;
 mod render;
 mod repl;
 
@@ -12,6 +13,14 @@ struct Cli {
     /// Send a single message and print the response (non-interactive).
     #[arg(short, long)]
     message: Option<String>,
+
+    /// Override the model (e.g. "openai/gpt-4o").
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Override the provider base URL.
+    #[arg(long)]
+    base_url: Option<String>,
 }
 
 #[tokio::main]
@@ -26,9 +35,8 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    if cli.message.is_some() {
-        println!("not yet implemented");
-        return Ok(());
+    if let Some(msg) = cli.message {
+        return oneshot::run_oneshot(&msg, cli.model.as_deref(), cli.base_url.as_deref()).await;
     }
 
     repl::run_repl().await
