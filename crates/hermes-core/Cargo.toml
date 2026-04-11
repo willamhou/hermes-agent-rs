@@ -1,0 +1,15 @@
+[package]
+name = "hermes-core"
+description = "Core types, traits, and errors for Hermes Agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+secrecy.workspace = true

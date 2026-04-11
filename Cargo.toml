@@ -1,0 +1,81 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hermes-core",
+    "crates/hermes-provider",
+    "crates/hermes-tools",
+    "crates/hermes-mcp",
+    "crates/hermes-memory",
+    "crates/hermes-agent",
+    "crates/hermes-config",
+    "crates/hermes-skills",
+    "crates/hermes-cli",
+    "crates/hermes-gateway",
+    "crates/hermes-cron",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/user/hermes-agent-rs"
+
+[workspace.dependencies]
+# Core
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+thiserror = "2"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Config
+serde_yaml_ng = "0.10"
+dotenvy = "0.15"
+
+# SQLite
+tokio-rusqlite = "0.7"
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# CLI
+rustyline = "15"
+crossterm = "0.28"
+clap = { version = "4", features = ["derive"] }
+comrak = "0.35"
+
+# Security
+secrecy = { version = "0.10", features = ["serde"] }
+
+# Tools
+inventory = "0.3"
+dashmap = "6"
+walkdir = "2"
+
+# Tokenizer
+tokenizers = "0.20"
+
+# Cron
+cron = "0.15"
+
+# Internal crates
+hermes-core = { path = "crates/hermes-core" }
+hermes-provider = { path = "crates/hermes-provider" }
+hermes-tools = { path = "crates/hermes-tools" }
+hermes-mcp = { path = "crates/hermes-mcp" }
+hermes-memory = { path = "crates/hermes-memory" }
+hermes-agent = { path = "crates/hermes-agent" }
+hermes-config = { path = "crates/hermes-config" }
+hermes-skills = { path = "crates/hermes-skills" }
+hermes-cli = { path = "crates/hermes-cli" }
+hermes-gateway = { path = "crates/hermes-gateway" }
+hermes-cron = { path = "crates/hermes-cron" }

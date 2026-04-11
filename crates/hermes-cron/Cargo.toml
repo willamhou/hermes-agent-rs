@@ -1,0 +1,22 @@
+[package]
+name = "hermes-cron"
+description = "Scheduled task scheduler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hermes-core.workspace = true
+hermes-agent.workspace = true
+hermes-provider.workspace = true
+hermes-tools.workspace = true
+hermes-config.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+cron.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true

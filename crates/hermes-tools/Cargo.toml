@@ -1,0 +1,17 @@
+[package]
+name = "hermes-tools"
+description = "Tool trait, registry, and built-in tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hermes-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+inventory.workspace = true
+tracing.workspace = true

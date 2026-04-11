@@ -1,0 +1,25 @@
+[package]
+name = "hermes-gateway"
+description = "Multi-platform gateway and adapters (Telegram, Discord, Slack, etc.)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hermes-core.workspace = true
+hermes-agent.workspace = true
+hermes-provider.workspace = true
+hermes-tools.workspace = true
+hermes-config.workspace = true
+hermes-memory.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+dashmap.workspace = true
+secrecy.workspace = true
+tracing.workspace = true
+uuid.workspace = true

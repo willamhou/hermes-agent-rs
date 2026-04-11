@@ -1,0 +1,15 @@
+[package]
+name = "hermes-skills"
+description = "Skill discovery, parsing, injection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hermes-core.workspace = true
+serde.workspace = true
+serde_yaml_ng.workspace = true
+anyhow.workspace = true
+walkdir.workspace = true
+tracing.workspace = true
