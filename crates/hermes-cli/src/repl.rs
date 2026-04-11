@@ -8,6 +8,7 @@ use hermes_config::config::{AppConfig, hermes_home};
 use hermes_core::{message::Message, stream::StreamDelta};
 use hermes_provider::create_provider;
 use hermes_tools::registry::ToolRegistry;
+use secrecy::SecretString;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -26,18 +27,20 @@ pub async fn run_repl() -> Result<()> {
     })?;
 
     // ── Provider + tools ─────────────────────────────────────────────────────
-    let provider =
-        create_provider(&config.model, &api_key, None).context("failed to create provider")?;
+    let provider = create_provider(&config.model, SecretString::new(api_key.into()), None)
+        .context("failed to create provider")?;
     let registry = Arc::new(ToolRegistry::from_inventory());
 
     // ── Agent ────────────────────────────────────────────────────────────────
     let session_id = Uuid::new_v4().to_string();
+    let working_dir = std::env::current_dir().context("failed to get current directory")?;
     let agent_config = AgentConfig {
         provider,
         registry,
         max_iterations: config.max_iterations,
         system_prompt: "You are Hermes, a helpful AI assistant.".to_string(),
         session_id,
+        working_dir,
     };
     let mut agent = Agent::new(agent_config);
     let mut history: Vec<Message> = Vec::new();

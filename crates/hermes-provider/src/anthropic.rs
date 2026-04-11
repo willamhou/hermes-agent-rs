@@ -59,17 +59,17 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     /// Build a new provider. Creates a reqwest client with a 300-second timeout.
-    pub fn new(config: AnthropicConfig, info: ModelInfo) -> Self {
+    pub fn new(config: AnthropicConfig, info: ModelInfo) -> hermes_core::error::Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
-            .expect("failed to build reqwest client");
+            .map_err(|e| HermesError::Config(format!("failed to build HTTP client: {e}")))?;
 
-        Self {
+        Ok(Self {
             client,
             config,
             info,
-        }
+        })
     }
 
     /// Returns auth headers.
@@ -468,15 +468,28 @@ impl AnthropicProvider {
                 }
 
                 "content_block_stop" => {
-                    // Finalise any pending tool_use block.
-                    if let Some(pt) = pending_tool.take() {
-                        let arguments =
-                            serde_json::from_str::<Value>(&pt.input_json).unwrap_or(json!({}));
-                        tool_calls.push(hermes_core::message::ToolCall {
-                            id: pt.id,
-                            name: pt.name,
-                            arguments,
-                        });
+                    // Finalise the pending tool_use block only when the stopped
+                    // block is actually of type tool_use (guard against spurious
+                    // stop events on text/thinking blocks).
+                    let stopped_index = parsed
+                        .get("index")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(active_block as u64)
+                        as usize;
+                    let stopped_type = block_types
+                        .get(stopped_index)
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
+                    if stopped_type == "tool_use" {
+                        if let Some(pt) = pending_tool.take() {
+                            let arguments =
+                                serde_json::from_str::<Value>(&pt.input_json).unwrap_or(json!({}));
+                            tool_calls.push(hermes_core::message::ToolCall {
+                                id: pt.id,
+                                name: pt.name,
+                                arguments,
+                            });
+                        }
                     }
                 }
 
@@ -538,9 +551,9 @@ impl AnthropicProvider {
 
 // ─── Provider impl ────────────────────────────────────────────────────────────
 
-#[async_trait]
-impl Provider for AnthropicProvider {
-    async fn chat(
+impl AnthropicProvider {
+    /// Single attempt at the Messages API. Used by the retry loop in `chat()`.
+    async fn try_chat(
         &self,
         request: &ChatRequest<'_>,
         delta_tx: Option<&mpsc::Sender<StreamDelta>>,
@@ -574,6 +587,43 @@ impl Provider for AnthropicProvider {
         }
 
         Self::stream_response(response, delta_tx).await
+    }
+}
+
+#[async_trait]
+impl Provider for AnthropicProvider {
+    async fn chat(
+        &self,
+        request: &ChatRequest<'_>,
+        delta_tx: Option<&mpsc::Sender<StreamDelta>>,
+    ) -> Result<ChatResponse> {
+        use crate::retry::{RetryAction, RetryPolicy};
+
+        let policy = RetryPolicy::default();
+        let mut last_error: Option<HermesError> = None;
+
+        for attempt in 0..=policy.max_retries {
+            if attempt > 0 {
+                if let Some(ref err) = last_error {
+                    match policy.should_retry(err, attempt - 1, None) {
+                        RetryAction::RetryAfter(delay) => {
+                            tracing::warn!(attempt, ?delay, "anthropic: retrying after error");
+                            tokio::time::sleep(delay).await;
+                        }
+                        RetryAction::DoNotRetry => return Err(last_error.unwrap()),
+                    }
+                }
+            }
+
+            match self.try_chat(request, delta_tx).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap())
     }
 
     fn supports_reasoning(&self) -> bool {
@@ -671,7 +721,7 @@ mod tests {
             api_version: "2023-06-01".to_string(),
             max_thinking_tokens: Some(10_000),
         };
-        AnthropicProvider::new(config, dummy_info())
+        AnthropicProvider::new(config, dummy_info()).expect("failed to build test provider")
     }
 
     // ── convert_messages: strict alternation ─────────────────────────────────
@@ -807,7 +857,8 @@ mod tests {
             api_key: SecretString::new("sk-ant-api-03-testkey".into()),
             ..AnthropicConfig::default()
         };
-        let provider = AnthropicProvider::new(config, dummy_info());
+        let provider =
+            AnthropicProvider::new(config, dummy_info()).expect("failed to build test provider");
         let headers = provider.auth_headers();
 
         assert_eq!(headers.len(), 1);
@@ -823,7 +874,8 @@ mod tests {
             api_key: SecretString::new("sk-ant-oat01-myoauthtoken".into()),
             ..AnthropicConfig::default()
         };
-        let provider = AnthropicProvider::new(config, dummy_info());
+        let provider =
+            AnthropicProvider::new(config, dummy_info()).expect("failed to build test provider");
         let headers = provider.auth_headers();
 
         assert_eq!(headers.len(), 1);

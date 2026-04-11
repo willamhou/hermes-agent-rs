@@ -1,9 +1,9 @@
 //! Agent loop: orchestrates provider calls, tool execution, and budget control.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
-use anyhow::Result;
 use hermes_core::{
+    error::Result,
     message::{Content, Message, Role},
     provider::{ChatRequest, Provider},
     stream::StreamDelta,
@@ -24,6 +24,7 @@ pub struct AgentConfig {
     pub max_iterations: u32,
     pub system_prompt: String,
     pub session_id: String,
+    pub working_dir: PathBuf,
 }
 
 /// Stateful agent that drives a conversation loop.
@@ -33,17 +34,35 @@ pub struct Agent {
     budget: IterationBudget,
     system_prompt: String,
     session_id: String,
+    working_dir: PathBuf,
+    approval_tx: mpsc::Sender<ApprovalRequest>,
+    _approval_task: tokio::task::JoinHandle<()>,
 }
 
 impl Agent {
     /// Construct an agent from `AgentConfig`.
     pub fn new(config: AgentConfig) -> Self {
+        let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
+        let approval_task = tokio::spawn(async move {
+            while let Some(req) = approval_rx.recv().await {
+                tracing::warn!(
+                    tool = %req.tool_name,
+                    command = %req.command,
+                    "auto-allowing tool (no approval UI configured)"
+                );
+                let _ = req.response_tx.send(ApprovalDecision::Allow);
+            }
+        });
+
         Self {
             provider: config.provider,
             registry: config.registry,
             budget: IterationBudget::new(config.max_iterations),
             system_prompt: config.system_prompt,
             session_id: config.session_id,
+            working_dir: config.working_dir,
+            approval_tx,
+            _approval_task: approval_task,
         }
     }
 
@@ -59,15 +78,6 @@ impl Agent {
     ) -> Result<String> {
         history.push(Message::user(user_message));
 
-        // Dummy approval channel — always denies; callers that need real
-        // approval must supply their own channel via a higher-level wrapper.
-        let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
-        tokio::spawn(async move {
-            while let Some(req) = approval_rx.recv().await {
-                let _ = req.response_tx.send(ApprovalDecision::Deny);
-            }
-        });
-
         while self.budget.try_consume() {
             let schemas: Vec<ToolSchema> = self.registry.available_schemas();
 
@@ -82,11 +92,7 @@ impl Agent {
                 stop_sequences: vec![],
             };
 
-            let response = self
-                .provider
-                .chat(&request, Some(&delta_tx))
-                .await
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let response = self.provider.chat(&request, Some(&delta_tx)).await?;
 
             // Push assistant turn to history.
             let assistant_msg = Message {
@@ -106,8 +112,8 @@ impl Agent {
             // Execute tools.
             let ctx = ToolContext {
                 session_id: self.session_id.clone(),
-                working_dir: std::path::PathBuf::from("."),
-                approval_tx: approval_tx.clone(),
+                working_dir: self.working_dir.clone(),
+                approval_tx: self.approval_tx.clone(),
                 delta_tx: delta_tx.clone(),
             };
 
@@ -259,6 +265,7 @@ mod tests {
             max_iterations,
             system_prompt: "You are a helpful assistant.".to_string(),
             session_id: "test-session".to_string(),
+            working_dir: std::env::temp_dir(),
         })
     }
 

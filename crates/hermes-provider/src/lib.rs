@@ -93,15 +93,13 @@ pub fn generic_model_info(provider: &str, model: &str) -> ModelInfo {
 /// `base_url` overrides the default endpoint when provided and non-empty.
 pub fn create_provider(
     model_string: &str,
-    api_key: &str,
+    api_key: SecretString,
     base_url: Option<&str>,
 ) -> Result<Arc<dyn Provider>> {
     let (provider_name, model) = match model_string.split_once('/') {
         Some((p, m)) => (p, m),
         None => ("openai", model_string),
     };
-
-    let api_key_secret = SecretString::new(api_key.to_string().into());
 
     match provider_name {
         "anthropic" => {
@@ -111,13 +109,13 @@ pub fn create_provider(
                 .to_string();
             let config = AnthropicConfig {
                 base_url: url,
-                api_key: api_key_secret,
+                api_key,
                 model: model.to_string(),
                 api_version: "2023-06-01".to_string(),
                 max_thinking_tokens: None,
             };
             let info = anthropic_model_info(model);
-            Ok(Arc::new(AnthropicProvider::new(config, info)))
+            Ok(Arc::new(AnthropicProvider::new(config, info)?))
         }
         "openrouter" => {
             let url = base_url
@@ -126,13 +124,13 @@ pub fn create_provider(
                 .to_string();
             let config = OpenAiConfig {
                 base_url: url,
-                api_key: api_key_secret,
+                api_key,
                 model: model.to_string(),
                 org_id: None,
                 auth_style: AuthStyle::Bearer,
             };
             let info = generic_model_info("openrouter", model);
-            Ok(Arc::new(OpenAiProvider::new(config, info)))
+            Ok(Arc::new(OpenAiProvider::new(config, info)?))
         }
         "openai" => {
             let url = base_url
@@ -141,13 +139,13 @@ pub fn create_provider(
                 .to_string();
             let config = OpenAiConfig {
                 base_url: url,
-                api_key: api_key_secret,
+                api_key,
                 model: model.to_string(),
                 org_id: None,
                 auth_style: AuthStyle::Bearer,
             };
             let info = openai_model_info(model);
-            Ok(Arc::new(OpenAiProvider::new(config, info)))
+            Ok(Arc::new(OpenAiProvider::new(config, info)?))
         }
         unknown => {
             // Unknown providers default to OpenAI-compatible
@@ -157,13 +155,13 @@ pub fn create_provider(
                 .to_string();
             let config = OpenAiConfig {
                 base_url: url,
-                api_key: api_key_secret,
+                api_key,
                 model: model.to_string(),
                 org_id: None,
                 auth_style: AuthStyle::Bearer,
             };
             let info = generic_model_info(unknown, model);
-            Ok(Arc::new(OpenAiProvider::new(config, info)))
+            Ok(Arc::new(OpenAiProvider::new(config, info)?))
         }
     }
 }
@@ -176,8 +174,12 @@ mod tests {
 
     #[test]
     fn create_anthropic_provider() {
-        let p = create_provider("anthropic/claude-sonnet-4-20250514", "sk-ant-key", None)
-            .expect("should create anthropic provider");
+        let p = create_provider(
+            "anthropic/claude-sonnet-4-20250514",
+            SecretString::new("sk-ant-key".into()),
+            None,
+        )
+        .expect("should create anthropic provider");
         let info = p.model_info();
         assert_eq!(info.provider, "anthropic");
         assert_eq!(info.id, "claude-sonnet-4-20250514");
@@ -187,8 +189,12 @@ mod tests {
 
     #[test]
     fn create_openai_provider() {
-        let p = create_provider("openai/gpt-4o", "sk-openai-key", None)
-            .expect("should create openai provider");
+        let p = create_provider(
+            "openai/gpt-4o",
+            SecretString::new("sk-openai-key".into()),
+            None,
+        )
+        .expect("should create openai provider");
         let info = p.model_info();
         assert_eq!(info.provider, "openai");
         assert_eq!(info.id, "gpt-4o");
@@ -198,7 +204,7 @@ mod tests {
     fn create_openrouter_provider() {
         let p = create_provider(
             "openrouter/meta-llama/llama-3.1-8b-instruct",
-            "sk-or-key",
+            SecretString::new("sk-or-key".into()),
             None,
         )
         .expect("should create openrouter provider");
@@ -209,8 +215,12 @@ mod tests {
 
     #[test]
     fn create_unknown_provider_defaults_to_openai() {
-        let p = create_provider("mistral/mistral-large", "some-key", None)
-            .expect("unknown provider should fall through to openai-compat");
+        let p = create_provider(
+            "mistral/mistral-large",
+            SecretString::new("some-key".into()),
+            None,
+        )
+        .expect("unknown provider should fall through to openai-compat");
         let info = p.model_info();
         assert_eq!(info.provider, "mistral");
         assert_eq!(info.id, "mistral-large");
@@ -218,7 +228,7 @@ mod tests {
 
     #[test]
     fn no_slash_defaults_to_openai() {
-        let p = create_provider("gpt-4o-mini", "sk-key", None)
+        let p = create_provider("gpt-4o-mini", SecretString::new("sk-key".into()), None)
             .expect("no-slash model should default to openai");
         let info = p.model_info();
         assert_eq!(info.provider, "openai");

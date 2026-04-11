@@ -46,17 +46,17 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     /// Build a new provider. Creates a reqwest client with a 300-second timeout.
-    pub fn new(config: OpenAiConfig, info: ModelInfo) -> Self {
+    pub fn new(config: OpenAiConfig, info: ModelInfo) -> hermes_core::error::Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(300))
             .build()
-            .expect("failed to build reqwest client");
+            .map_err(|e| HermesError::Config(format!("failed to build HTTP client: {e}")))?;
 
-        Self {
+        Ok(Self {
             client,
             config,
             info,
-        }
+        })
     }
 
     /// Returns auth and org headers for the configured auth style.
@@ -386,9 +386,9 @@ impl OpenAiProvider {
 
 // ─── Provider impl ────────────────────────────────────────────────────────────
 
-#[async_trait]
-impl Provider for OpenAiProvider {
-    async fn chat(
+impl OpenAiProvider {
+    /// Single attempt at the Chat Completions API. Used by the retry loop in `chat()`.
+    async fn try_chat(
         &self,
         request: &ChatRequest<'_>,
         delta_tx: Option<&mpsc::Sender<StreamDelta>>,
@@ -420,6 +420,43 @@ impl Provider for OpenAiProvider {
         }
 
         Self::stream_response(response, delta_tx).await
+    }
+}
+
+#[async_trait]
+impl Provider for OpenAiProvider {
+    async fn chat(
+        &self,
+        request: &ChatRequest<'_>,
+        delta_tx: Option<&mpsc::Sender<StreamDelta>>,
+    ) -> Result<ChatResponse> {
+        use crate::retry::{RetryAction, RetryPolicy};
+
+        let policy = RetryPolicy::default();
+        let mut last_error: Option<HermesError> = None;
+
+        for attempt in 0..=policy.max_retries {
+            if attempt > 0 {
+                if let Some(ref err) = last_error {
+                    match policy.should_retry(err, attempt - 1, None) {
+                        RetryAction::RetryAfter(delay) => {
+                            tracing::warn!(attempt, ?delay, "openai: retrying after error");
+                            tokio::time::sleep(delay).await;
+                        }
+                        RetryAction::DoNotRetry => return Err(last_error.unwrap()),
+                    }
+                }
+            }
+
+            match self.try_chat(request, delta_tx).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap())
     }
 
     fn supports_tool_calling(&self) -> bool {
@@ -517,7 +554,7 @@ mod tests {
             org_id: None,
             auth_style: AuthStyle::Bearer,
         };
-        OpenAiProvider::new(config, dummy_info())
+        OpenAiProvider::new(config, dummy_info()).expect("failed to build test provider")
     }
 
     // ── classify_http_error ───────────────────────────────────────────────────
