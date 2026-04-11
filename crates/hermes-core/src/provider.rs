@@ -84,8 +84,14 @@ pub trait Provider: Send + Sync {
         delta_tx: Option<&mpsc::Sender<StreamDelta>>,
     ) -> Result<ChatResponse>;
 
-    fn supports_tool_calling(&self) -> bool { true }
-    fn supports_reasoning(&self) -> bool { false }
-    fn supports_caching(&self) -> bool { false }
+    fn supports_tool_calling(&self) -> bool {
+        true
+    }
+    fn supports_reasoning(&self) -> bool {
+        false
+    }
+    fn supports_caching(&self) -> bool {
+        false
+    }
     fn model_info(&self) -> &ModelInfo;
 }

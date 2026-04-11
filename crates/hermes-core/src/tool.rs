@@ -41,7 +41,11 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn schema(&self) -> ToolSchema;
     fn toolset(&self) -> &str;
-    fn is_available(&self) -> bool { true }
-    fn is_read_only(&self) -> bool { false }
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn is_read_only(&self) -> bool {
+        false
+    }
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> Result<ToolResult>;
 }
