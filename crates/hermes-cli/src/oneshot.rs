@@ -49,7 +49,11 @@ pub async fn run_oneshot(
 
     let approval_manager = ApprovalManager::load_or_default();
     let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(8);
-    approval_manager.spawn_handler(approval_rx, is_interactive_terminal());
+    approval_manager.spawn_handler(
+        approval_rx,
+        config.approval.policy.clone(),
+        is_interactive_terminal(),
+    );
 
     let memory_dir = hermes_home().join("memories");
     let memory = MemoryManager::new(memory_dir, None).context("failed to initialize memory")?;

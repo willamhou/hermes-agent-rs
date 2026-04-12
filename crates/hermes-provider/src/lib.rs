@@ -2,6 +2,7 @@
 
 pub mod anthropic;
 pub mod openai;
+pub mod responses;
 pub mod retry;
 pub mod sse;
 pub mod tool_assembler;
@@ -15,6 +16,7 @@ use secrecy::SecretString;
 use crate::{
     anthropic::{AnthropicConfig, AnthropicProvider},
     openai::{AuthStyle, OpenAiConfig, OpenAiProvider},
+    responses::ResponsesProvider,
 };
 
 // ─── Model info helpers ───────────────────────────────────────────────────────
@@ -79,6 +81,26 @@ pub fn generic_model_info(provider: &str, model: &str) -> ModelInfo {
     }
 }
 
+/// Default `ModelInfo` for OpenAI Responses API models.
+pub fn responses_model_info(model: &str) -> ModelInfo {
+    ModelInfo {
+        id: model.to_string(),
+        provider: "openai-codex".to_string(),
+        max_context: 200_000,
+        max_output: 16_384,
+        supports_tools: true,
+        supports_vision: true,
+        supports_reasoning: true,
+        supports_caching: false,
+        pricing: ModelPricing {
+            input_per_mtok: 5.0,
+            output_per_mtok: 15.0,
+            cache_read_per_mtok: 0.0,
+            cache_create_per_mtok: 0.0,
+        },
+    }
+}
+
 // ─── Factory ──────────────────────────────────────────────────────────────────
 
 /// Create a provider from a `"provider/model"` string.
@@ -86,6 +108,7 @@ pub fn generic_model_info(provider: &str, model: &str) -> ModelInfo {
 /// Routing rules:
 /// - `"anthropic/<model>"` → [`AnthropicProvider`]
 /// - `"openai/<model>"` → [`OpenAiProvider`] against `https://api.openai.com/v1`
+/// - `"openai-codex/<model>"` / `"openai-responses/<model>"` → [`ResponsesProvider`]
 /// - `"openrouter/<model>"` → [`OpenAiProvider`] against `https://openrouter.ai/api/v1`
 /// - `"<unknown>/<model>"` → [`OpenAiProvider`] using `base_url` (or OpenAI default)
 /// - No slash → treated as an OpenAI model name
@@ -146,6 +169,21 @@ pub fn create_provider(
             };
             let info = openai_model_info(model);
             Ok(Arc::new(OpenAiProvider::new(config, info)?))
+        }
+        "openai-codex" | "openai-responses" => {
+            let url = base_url
+                .filter(|s| !s.is_empty())
+                .unwrap_or("https://api.openai.com/v1")
+                .to_string();
+            let config = OpenAiConfig {
+                base_url: url,
+                api_key,
+                model: model.to_string(),
+                org_id: None,
+                auth_style: AuthStyle::Bearer,
+            };
+            let info = responses_model_info(model);
+            Ok(Arc::new(ResponsesProvider::new(config, info)?))
         }
         unknown => {
             // Unknown providers default to OpenAI-compatible
@@ -211,6 +249,20 @@ mod tests {
         let info = p.model_info();
         assert_eq!(info.provider, "openrouter");
         assert_eq!(info.id, "meta-llama/llama-3.1-8b-instruct");
+    }
+
+    #[test]
+    fn create_openai_responses_provider() {
+        let p = create_provider(
+            "openai-codex/gpt-5",
+            SecretString::new("sk-openai-key".into()),
+            None,
+        )
+        .expect("should create responses provider");
+        let info = p.model_info();
+        assert_eq!(info.provider, "openai-codex");
+        assert_eq!(info.id, "gpt-5");
+        assert!(info.supports_reasoning);
     }
 
     #[test]

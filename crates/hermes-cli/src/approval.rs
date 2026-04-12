@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use hermes_config::config::hermes_home;
+use hermes_config::config::{ApprovalPolicy, hermes_home};
 use hermes_core::tool::{ApprovalDecision, ApprovalRequest};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -104,6 +104,7 @@ impl ApprovalManager {
     pub fn spawn_handler(
         self,
         mut approval_rx: mpsc::Receiver<ApprovalRequest>,
+        policy: ApprovalPolicy,
         interactive: bool,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -115,24 +116,46 @@ impl ApprovalManager {
                         "reusing remembered approval decision"
                     );
                     remembered
-                } else if !interactive {
-                    tracing::warn!(
-                        tool = %req.tool_name,
-                        "denying approval request in non-interactive mode"
-                    );
-                    ApprovalDecision::Deny
                 } else {
-                    let tool_name = req.tool_name.clone();
-                    let command = req.command.clone();
-                    let reason = req.reason.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        prompt_for_approval(&tool_name, &command, &reason)
-                    })
-                    .await
-                    {
-                        Ok(decision) => decision,
-                        Err(err) => {
-                            tracing::warn!(tool = %req.tool_name, "approval prompt failed: {err}");
+                    match policy {
+                        ApprovalPolicy::Yolo => {
+                            tracing::warn!(
+                                tool = %req.tool_name,
+                                "auto-allowing approval request due to yolo policy"
+                            );
+                            ApprovalDecision::Allow
+                        }
+                        ApprovalPolicy::Deny => {
+                            tracing::warn!(
+                                tool = %req.tool_name,
+                                "denying approval request due to deny policy"
+                            );
+                            ApprovalDecision::Deny
+                        }
+                        ApprovalPolicy::Ask if interactive => {
+                            let tool_name = req.tool_name.clone();
+                            let command = req.command.clone();
+                            let reason = req.reason.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                prompt_for_approval(&tool_name, &command, &reason)
+                            })
+                            .await
+                            {
+                                Ok(decision) => decision,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        tool = %req.tool_name,
+                                        "approval prompt failed: {err}"
+                                    );
+                                    ApprovalDecision::Deny
+                                }
+                            }
+                        }
+                        ApprovalPolicy::Ask => {
+                            tracing::warn!(
+                                tool = %req.tool_name,
+                                "denying approval request in non-interactive ask mode"
+                            );
                             ApprovalDecision::Deny
                         }
                     }
@@ -232,6 +255,7 @@ fn parse_approval_choice(input: &str) -> Option<ApprovalDecision> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::{mpsc, oneshot};
 
     #[test]
     fn allow_session_is_not_persisted() {
@@ -282,5 +306,53 @@ mod tests {
         );
         assert_eq!(parse_approval_choice(""), Some(ApprovalDecision::Deny));
         assert_eq!(parse_approval_choice("weird"), None);
+    }
+
+    #[tokio::test]
+    async fn yolo_policy_auto_allows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = ApprovalManager::load(tmp.path().join("approvals.json")).unwrap();
+        let (approval_tx, approval_rx) = mpsc::channel(1);
+        let handle = manager.spawn_handler(approval_rx, ApprovalPolicy::Yolo, false);
+
+        let (response_tx, response_rx) = oneshot::channel();
+        approval_tx
+            .send(ApprovalRequest {
+                tool_name: "terminal".to_string(),
+                memory_key: "terminal:sha256:test".to_string(),
+                command: "rm -rf /tmp/demo".to_string(),
+                reason: "recursive delete".to_string(),
+                response_tx,
+            })
+            .await
+            .unwrap();
+        drop(approval_tx);
+
+        assert_eq!(response_rx.await.unwrap(), ApprovalDecision::Allow);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ask_policy_denies_when_not_interactive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = ApprovalManager::load(tmp.path().join("approvals.json")).unwrap();
+        let (approval_tx, approval_rx) = mpsc::channel(1);
+        let handle = manager.spawn_handler(approval_rx, ApprovalPolicy::Ask, false);
+
+        let (response_tx, response_rx) = oneshot::channel();
+        approval_tx
+            .send(ApprovalRequest {
+                tool_name: "terminal".to_string(),
+                memory_key: "terminal:sha256:test".to_string(),
+                command: "rm -rf /tmp/demo".to_string(),
+                reason: "recursive delete".to_string(),
+                response_tx,
+            })
+            .await
+            .unwrap();
+        drop(approval_tx);
+
+        assert_eq!(response_rx.await.unwrap(), ApprovalDecision::Deny);
+        handle.await.unwrap();
     }
 }

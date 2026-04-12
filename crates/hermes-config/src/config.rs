@@ -85,6 +85,23 @@ impl Default for FileConfigYaml {
     }
 }
 
+// ─── Approval config ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicy {
+    #[default]
+    Ask,
+    Yolo,
+    Deny,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ApprovalConfigYaml {
+    #[serde(default)]
+    pub policy: ApprovalPolicy,
+}
+
 // ─── Config struct ────────────────────────────────────────────────────────────
 
 /// Top-level application configuration.
@@ -109,6 +126,10 @@ pub struct AppConfig {
     /// File tool configuration.
     #[serde(default)]
     pub file: FileConfigYaml,
+
+    /// Dangerous tool approval behavior.
+    #[serde(default)]
+    pub approval: ApprovalConfigYaml,
 }
 
 fn default_model() -> String {
@@ -131,6 +152,7 @@ impl Default for AppConfig {
             temperature: default_temperature(),
             terminal: TerminalConfigYaml::default(),
             file: FileConfigYaml::default(),
+            approval: ApprovalConfigYaml::default(),
         }
     }
 }
@@ -186,7 +208,7 @@ impl AppConfig {
 
         let provider_var = match provider.as_str() {
             "anthropic" => Some("ANTHROPIC_API_KEY"),
-            "openai" => Some("OPENAI_API_KEY"),
+            "openai" | "openai-codex" | "openai-responses" => Some("OPENAI_API_KEY"),
             "openrouter" => Some("OPENROUTER_API_KEY"),
             _ => None,
         };
@@ -231,6 +253,9 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn default_config() {
@@ -238,6 +263,7 @@ mod tests {
         assert_eq!(cfg.model, "anthropic/claude-sonnet-4-20250514");
         assert_eq!(cfg.max_iterations, 90);
         assert!((cfg.temperature - 0.7f32).abs() < f32::EPSILON);
+        assert_eq!(cfg.approval.policy, ApprovalPolicy::Ask);
     }
 
     #[test]
@@ -248,33 +274,68 @@ mod tests {
             temperature: 0.5,
             terminal: TerminalConfigYaml::default(),
             file: FileConfigYaml::default(),
+            approval: ApprovalConfigYaml::default(),
         };
         let yaml = serde_yaml_ng::to_string(&original).expect("serialize failed");
         let restored: AppConfig = serde_yaml_ng::from_str(&yaml).expect("deserialize failed");
         assert_eq!(restored.model, original.model);
         assert_eq!(restored.max_iterations, original.max_iterations);
         assert!((restored.temperature - original.temperature).abs() < f32::EPSILON);
+        assert_eq!(restored.approval.policy, ApprovalPolicy::Ask);
     }
 
     #[test]
     fn hermes_home_default() {
-        if std::env::var("HERMES_HOME").is_err() {
-            let home = hermes_home();
-            assert_eq!(home.file_name().and_then(|f| f.to_str()), Some(".hermes"));
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var("HERMES_HOME").ok();
+        // SAFETY: test holds ENV_LOCK, so no concurrent env mutation in this module.
+        unsafe {
+            std::env::remove_var("HERMES_HOME");
         }
+
+        let home = hermes_home();
+
+        match previous {
+            Some(value) => {
+                // SAFETY: test holds ENV_LOCK, so no concurrent env mutation in this module.
+                unsafe {
+                    std::env::set_var("HERMES_HOME", value);
+                }
+            }
+            None => {
+                // SAFETY: test holds ENV_LOCK, so no concurrent env mutation in this module.
+                unsafe {
+                    std::env::remove_var("HERMES_HOME");
+                }
+            }
+        }
+
+        assert_eq!(home.file_name().and_then(|f| f.to_str()), Some(".hermes"));
     }
 
     #[test]
     fn hermes_home_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var("HERMES_HOME").ok();
         let override_path = "/tmp/hermes_test_home";
-        // SAFETY: single-threaded test, no concurrent env reads.
+        // SAFETY: test holds ENV_LOCK, so no concurrent env mutation in this module.
         unsafe {
             std::env::set_var("HERMES_HOME", override_path);
         }
         let home = hermes_home();
-        // SAFETY: single-threaded test.
-        unsafe {
-            std::env::remove_var("HERMES_HOME");
+        match previous {
+            Some(value) => {
+                // SAFETY: test holds ENV_LOCK, so no concurrent env mutation in this module.
+                unsafe {
+                    std::env::set_var("HERMES_HOME", value);
+                }
+            }
+            None => {
+                // SAFETY: test holds ENV_LOCK, so no concurrent env mutation in this module.
+                unsafe {
+                    std::env::remove_var("HERMES_HOME");
+                }
+            }
         }
         assert_eq!(home, PathBuf::from(override_path));
     }
@@ -305,6 +366,18 @@ model: openai/gpt-4o
         assert_eq!(cfg.terminal.output_max_chars, 50_000);
         assert_eq!(cfg.file.read_max_chars, 100_000);
         assert_eq!(cfg.file.read_max_lines, 2000);
+        assert_eq!(cfg.approval.policy, ApprovalPolicy::Ask);
+    }
+
+    #[test]
+    fn approval_policy_serde_roundtrip() {
+        let yaml = r#"
+model: openai-codex/gpt-5
+approval:
+  policy: yolo
+"#;
+        let cfg: AppConfig = serde_yaml_ng::from_str(yaml).expect("deserialize failed");
+        assert_eq!(cfg.approval.policy, ApprovalPolicy::Yolo);
     }
 
     #[test]

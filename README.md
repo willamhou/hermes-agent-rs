@@ -8,7 +8,7 @@ Current implementation includes:
 
 - Interactive CLI and one-shot mode in `crates/hermes-cli`
 - Agent loop with streaming, tool execution, prompt caching, and context compression
-- Provider support for Anthropic, OpenAI, and OpenRouter-compatible endpoints
+- Provider support for Anthropic, OpenAI chat-compatible, OpenAI Responses, and OpenRouter-compatible endpoints
 - Built-in tools for files, terminal, patching, memory, web search/extract, vision, and opt-in code execution
 - Local memory snapshots plus request-local skill matching/injection
 - SQLite-backed session history and resume support
@@ -17,7 +17,6 @@ Still in progress:
 
 - MCP integration
 - Multi-platform gateway adapters
-- Interactive approval UI and approval memory
 - Browser automation, delegation, and voice-related tools
 
 ## Workspace Layout
@@ -76,6 +75,8 @@ terminal:
   timeout: 180
   max_timeout: 600
   output_max_chars: 50000
+approval:
+  policy: ask
 file:
   read_max_chars: 100000
   read_max_lines: 2000
@@ -99,6 +100,7 @@ cargo test --workspace
 
 ## Notes
 
-- Dangerous tool actions now prompt for approval in the CLI, with `AllowSession` and `AllowAlways` memory stored under `$HERMES_HOME/approvals.json`.
+- Dangerous tool actions use `approval.policy: ask | yolo | deny`, with `AllowSession` and `AllowAlways` memory stored under `$HERMES_HOME/approvals.json`.
 - `execute_code` is disabled by default and is only exposed when `HERMES_ENABLE_EXECUTE_CODE=1`.
+- Use the `openai-codex/<model>` or `openai-responses/<model>` prefix to target OpenAI's `/v1/responses` API.
 - Phase-by-phase design notes live under [`docs/specs`](docs/specs).
