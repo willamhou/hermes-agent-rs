@@ -20,6 +20,9 @@ fn make_test_ctx(workspace: &Path) -> ToolContext {
             file: FileToolConfig::default(),
             workspace_root: workspace.to_path_buf(),
         }),
+        memory: None,
+        aux_provider: None,
+        skills: None,
     }
 }
 
@@ -289,6 +292,9 @@ async fn test_write_file_etc_blocked() {
             file: FileToolConfig::default(),
             workspace_root: std::path::PathBuf::from("/tmp"),
         }),
+        memory: None,
+        aux_provider: None,
+        skills: None,
     };
 
     let tool = hermes_tools::file_write::WriteFileTool;

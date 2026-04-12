@@ -161,6 +161,9 @@ mod tests {
             approval_tx,
             delta_tx,
             tool_config: Arc::new(ToolConfig::default()),
+            memory: None,
+            aux_provider: None,
+            skills: None,
         };
         (ctx, approval_rx, delta_rx)
     }

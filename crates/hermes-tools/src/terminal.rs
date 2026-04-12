@@ -296,14 +296,19 @@ mod tests {
     ) {
         let (approval_tx, approval_rx) = tokio::sync::mpsc::channel(8);
         let (delta_tx, delta_rx) = tokio::sync::mpsc::channel(8);
-        let mut config = ToolConfig::default();
-        config.workspace_root = std::path::PathBuf::from("/tmp");
+        let config = ToolConfig {
+            workspace_root: std::path::PathBuf::from("/tmp"),
+            ..ToolConfig::default()
+        };
         let ctx = ToolContext {
             session_id: "test-session".to_string(),
             working_dir: std::path::PathBuf::from("/tmp"),
             approval_tx,
             delta_tx,
             tool_config: Arc::new(config),
+            memory: None,
+            aux_provider: None,
+            skills: None,
         };
         (ctx, approval_rx, delta_rx)
     }

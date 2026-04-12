@@ -342,14 +342,19 @@ mod tests {
     ) -> ToolContext {
         let (approval_tx, _approval_rx) = tokio::sync::mpsc::channel(8);
         let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel(8);
-        let mut config = ToolConfig::default();
-        config.workspace_root = workspace_root;
+        let config = ToolConfig {
+            workspace_root,
+            ..ToolConfig::default()
+        };
         ToolContext {
             session_id: "test-session".to_string(),
             working_dir,
             approval_tx,
             delta_tx,
             tool_config: Arc::new(config),
+            memory: None,
+            aux_provider: None,
+            skills: None,
         }
     }
 

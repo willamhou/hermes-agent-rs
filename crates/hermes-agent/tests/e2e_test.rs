@@ -153,6 +153,7 @@ where
             ..ToolConfig::default()
         }),
         memory,
+        skills: None,
         compression: CompressionConfig::default(),
     })
 }
