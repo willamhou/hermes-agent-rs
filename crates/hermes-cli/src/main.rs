@@ -4,6 +4,7 @@ mod approval;
 mod oneshot;
 mod render;
 mod repl;
+mod tooling;
 
 use clap::Parser;
 use hermes_core::session::SessionStore as _;

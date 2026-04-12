@@ -85,6 +85,26 @@ impl Default for FileConfigYaml {
     }
 }
 
+// ─── MCP config ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    #[serde(default = "default_mcp_server_enabled")]
+    pub enabled: bool,
+}
+
+fn default_mcp_server_enabled() -> bool {
+    true
+}
+
 // ─── Approval config ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -130,6 +150,10 @@ pub struct AppConfig {
     /// Dangerous tool approval behavior.
     #[serde(default)]
     pub approval: ApprovalConfigYaml,
+
+    /// External MCP servers discovered at startup.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 fn default_model() -> String {
@@ -153,6 +177,7 @@ impl Default for AppConfig {
             terminal: TerminalConfigYaml::default(),
             file: FileConfigYaml::default(),
             approval: ApprovalConfigYaml::default(),
+            mcp_servers: vec![],
         }
     }
 }
@@ -275,6 +300,7 @@ mod tests {
             terminal: TerminalConfigYaml::default(),
             file: FileConfigYaml::default(),
             approval: ApprovalConfigYaml::default(),
+            mcp_servers: vec![],
         };
         let yaml = serde_yaml_ng::to_string(&original).expect("serialize failed");
         let restored: AppConfig = serde_yaml_ng::from_str(&yaml).expect("deserialize failed");
@@ -282,6 +308,7 @@ mod tests {
         assert_eq!(restored.max_iterations, original.max_iterations);
         assert!((restored.temperature - original.temperature).abs() < f32::EPSILON);
         assert_eq!(restored.approval.policy, ApprovalPolicy::Ask);
+        assert!(restored.mcp_servers.is_empty());
     }
 
     #[test]
@@ -367,6 +394,7 @@ model: openai/gpt-4o
         assert_eq!(cfg.file.read_max_chars, 100_000);
         assert_eq!(cfg.file.read_max_lines, 2000);
         assert_eq!(cfg.approval.policy, ApprovalPolicy::Ask);
+        assert!(cfg.mcp_servers.is_empty());
     }
 
     #[test]
@@ -378,6 +406,21 @@ approval:
 "#;
         let cfg: AppConfig = serde_yaml_ng::from_str(yaml).expect("deserialize failed");
         assert_eq!(cfg.approval.policy, ApprovalPolicy::Yolo);
+    }
+
+    #[test]
+    fn mcp_server_defaults_enabled() {
+        let yaml = r#"
+model: openai/gpt-4o
+mcp_servers:
+  - name: demo
+    command: /usr/bin/demo-mcp
+"#;
+        let cfg: AppConfig = serde_yaml_ng::from_str(yaml).expect("deserialize failed");
+        assert_eq!(cfg.mcp_servers.len(), 1);
+        assert_eq!(cfg.mcp_servers[0].name, "demo");
+        assert!(cfg.mcp_servers[0].enabled);
+        assert!(cfg.mcp_servers[0].args.is_empty());
     }
 
     #[test]

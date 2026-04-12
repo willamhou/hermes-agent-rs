@@ -10,12 +10,13 @@ Current implementation includes:
 - Agent loop with streaming, tool execution, prompt caching, and context compression
 - Provider support for Anthropic, OpenAI chat-compatible, OpenAI Responses, and OpenRouter-compatible endpoints
 - Built-in tools for files, terminal, patching, memory, web search/extract, vision, and opt-in code execution
+- Runtime MCP tool discovery from configured stdio servers
 - Local memory snapshots plus request-local skill matching/injection
 - SQLite-backed session history and resume support
 
 Still in progress:
 
-- MCP integration
+- HTTP MCP transport and richer MCP capability coverage
 - Multi-platform gateway adapters
 - Browser automation, delegation, and voice-related tools
 
@@ -77,6 +78,10 @@ terminal:
   output_max_chars: 50000
 approval:
   policy: ask
+mcp_servers:
+  - name: docs
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
 file:
   read_max_chars: 100000
   read_max_lines: 2000
@@ -101,6 +106,7 @@ cargo test --workspace
 ## Notes
 
 - Dangerous tool actions use `approval.policy: ask | yolo | deny`, with `AllowSession` and `AllowAlways` memory stored under `$HERMES_HOME/approvals.json`.
+- `mcp_servers` currently supports stdio servers and auto-registers their tools at CLI startup.
 - `execute_code` is disabled by default and is only exposed when `HERMES_ENABLE_EXECUTE_CODE=1`.
 - Use the `openai-codex/<model>` or `openai-responses/<model>` prefix to target OpenAI's `/v1/responses` API.
 - Phase-by-phase design notes live under [`docs/specs`](docs/specs).
