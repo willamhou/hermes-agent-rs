@@ -60,6 +60,7 @@ comrak = "0.35"
 
 # Security
 secrecy = { version = "0.10", features = ["serde"] }
+sha2 = "0.10"
 
 # Tools
 inventory = "0.3"

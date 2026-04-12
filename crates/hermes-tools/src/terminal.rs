@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
 
+use crate::approval_key::approval_memory_key;
 use hermes_core::{
     error::Result,
     message::ToolResult,
@@ -194,7 +195,7 @@ impl Tool for TerminalTool {
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
             let req = ApprovalRequest {
                 tool_name: "terminal".to_string(),
-                memory_key: format!("terminal:{command}"),
+                memory_key: approval_memory_key("terminal", &command),
                 command: command.clone(),
                 reason: reason.to_string(),
                 response_tx,
@@ -422,6 +423,26 @@ mod tests {
     }
 
     // ── terminal execution tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_dangerous_terminal_approval_key_is_hashed() {
+        let (ctx, mut approval_rx, _delta_rx) = make_ctx();
+        let handle = tokio::spawn(async move {
+            let tool = TerminalTool;
+            let args = serde_json::json!({
+                "command": "git push https://token@example.com/repo main --force"
+            });
+            tool.execute(args, &ctx).await
+        });
+
+        let req = approval_rx.recv().await.expect("approval request");
+        assert!(req.memory_key.starts_with("terminal:sha256:"));
+        assert!(!req.memory_key.contains("token@example.com"));
+        let _ = req.response_tx.send(ApprovalDecision::Deny);
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.is_error);
+    }
 
     #[tokio::test]
     async fn test_terminal_echo() {
