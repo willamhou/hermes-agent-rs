@@ -9,15 +9,17 @@ Current implementation includes:
 - Interactive CLI and one-shot mode in `crates/hermes-cli`
 - Agent loop with streaming, tool execution, prompt caching, and context compression
 - Provider support for Anthropic, OpenAI chat-compatible, OpenAI Responses, and OpenRouter-compatible endpoints
-- Built-in tools for files, terminal, patching, memory, web search/extract, vision, browser automation, and opt-in code execution
+- Built-in tools for files, terminal, patching, memory, web search/extract, vision, and opt-in code execution
 - Runtime MCP tool discovery from configured stdio and HTTP servers
+- MCP bridge tools for prompts and resources, gated on negotiated server capabilities
 - Local memory snapshots plus request-local skill matching/injection
 - SQLite-backed session history and resume support
 
 Still in progress:
 
 - Multi-platform gateway adapters
-- Delegation and voice-related tools
+- MCP notifications, dynamic refresh, and resource subscriptions
+- Browser automation, delegation, and voice-related tools
 
 ## Workspace Layout
 
@@ -75,14 +77,6 @@ terminal:
   timeout: 180
   max_timeout: 600
   output_max_chars: 50000
-browser:
-  headless: true
-  sandbox: true
-  launch_timeout_secs: 20
-  action_timeout_secs: 30
-  output_max_chars: 50000
-  viewport_width: 1280
-  viewport_height: 720
 approval:
   policy: ask
 mcp_servers:
@@ -118,9 +112,9 @@ cargo test --workspace
 ## Notes
 
 - Dangerous tool actions use `approval.policy: ask | yolo | deny`, with `AllowSession` and `AllowAlways` memory stored under `$HERMES_HOME/approvals.json`.
-- The `browser` tool lazily launches a Chromium/Chrome session per agent session and supports `navigate`, `snapshot`, `extract_text`, `click`, `type`, `press_key`, `wait`, and `close`.
 - `mcp_servers` supports `transport: stdio | http` and auto-registers discovered MCP tools at CLI startup.
-- MCP bridge tools cover prompts and resources for all transports; resource subscribe/unsubscribe is currently exposed for `stdio` MCP servers, `mcp_resource_updates` surfaces recent resource change notifications persisted under `$HERMES_HOME/mcp-resource-updates.json`, and both stdio plus supported HTTP SSE notification streams refresh the registry after `notifications/*/list_changed`.
+- MCP prompt/resource bridge tools are only registered when the target server negotiated those capabilities.
 - `execute_code` is disabled by default and is only exposed when `HERMES_ENABLE_EXECUTE_CODE=1`.
 - Use the `openai-codex/<model>` or `openai-responses/<model>` prefix to target OpenAI's `/v1/responses` API.
 - Phase-by-phase design notes live under [`docs/specs`](docs/specs).
+- A current implementation snapshot lives in [`docs/STATUS.md`](docs/STATUS.md).
