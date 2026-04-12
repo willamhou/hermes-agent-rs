@@ -12,13 +12,13 @@ use hermes_core::{message::Message, stream::StreamDelta, tool::ApprovalRequest};
 use hermes_memory::MemoryManager;
 use hermes_provider::create_provider;
 use hermes_skills::SkillManager;
-use hermes_tools::registry::ToolRegistry;
 use secrecy::SecretString;
 use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
 use crate::approval::{ApprovalManager, is_interactive_terminal};
 use crate::render::render_stream;
+use crate::tooling::build_registry;
 
 /// Send a single message, stream the response, then exit.
 pub async fn run_oneshot(
@@ -42,7 +42,7 @@ pub async fn run_oneshot(
     let provider = create_provider(model, SecretString::new(api_key.into()), base_url_override)
         .context("failed to create provider")?;
 
-    let registry = Arc::new(ToolRegistry::from_inventory());
+    let registry = build_registry(&config).await;
     let working_dir = std::env::current_dir().context("failed to get current directory")?;
 
     let tool_config = Arc::new(config.tool_config(working_dir.clone()));

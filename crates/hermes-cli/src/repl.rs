@@ -20,13 +20,13 @@ use hermes_core::{
 use hermes_memory::MemoryManager;
 use hermes_provider::create_provider;
 use hermes_skills::SkillManager;
-use hermes_tools::registry::ToolRegistry;
 use secrecy::SecretString;
 use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
 use crate::approval::{ApprovalManager, is_interactive_terminal};
 use crate::render::render_stream;
+use crate::tooling::build_registry;
 
 /// Start the interactive REPL.
 pub async fn run_repl() -> Result<()> {
@@ -43,7 +43,7 @@ pub async fn run_repl() -> Result<()> {
     // ── Provider + tools ─────────────────────────────────────────────────────
     let provider = create_provider(&config.model, SecretString::new(api_key.into()), None)
         .context("failed to create provider")?;
-    let registry = Arc::new(ToolRegistry::from_inventory());
+    let registry = build_registry(&config).await;
 
     // ── Agent ────────────────────────────────────────────────────────────────
     let session_id = Uuid::new_v4().to_string();
@@ -160,7 +160,7 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
     let api_key = config.api_key().with_context(|| "No API key")?;
     let provider = create_provider(&model, SecretString::new(api_key.into()), None)
         .context("failed to create provider")?;
-    let registry = Arc::new(ToolRegistry::from_inventory());
+    let registry = build_registry(&config).await;
     let working_dir = PathBuf::from(&meta.cwd);
     let tool_config = Arc::new(config.tool_config(working_dir.clone()));
 
