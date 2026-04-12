@@ -6,6 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::Context as _;
@@ -28,11 +29,12 @@ type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
 
 const JSONRPC_VERSION: &str = "2.0";
 const PROTOCOL_VERSION: &str = "2024-11-05";
+const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone)]
 struct StdioMcpClient {
     server_name: String,
-    _child: Arc<Mutex<Child>>,
+    child: Arc<Mutex<Child>>,
     stdin: Arc<Mutex<ChildStdin>>,
     pending: PendingMap,
     next_id: Arc<AtomicU64>,
@@ -72,16 +74,24 @@ impl StdioMcpClient {
 
         let client = Self {
             server_name: config.name.clone(),
-            _child: Arc::new(Mutex::new(child)),
+            child: Arc::new(Mutex::new(child)),
             stdin: Arc::new(Mutex::new(stdin)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
         };
 
-        spawn_stdout_reader(config.name.clone(), stdout, Arc::clone(&client.pending));
+        spawn_stdout_reader(
+            config.name.clone(),
+            stdout,
+            Arc::clone(&client.stdin),
+            Arc::clone(&client.pending),
+        );
         spawn_stderr_logger(config.name.clone(), stderr);
 
-        client.initialize().await?;
+        if let Err(err) = client.initialize().await {
+            client.shutdown().await;
+            return Err(err);
+        }
         Ok(client)
     }
 
@@ -140,12 +150,23 @@ impl StdioMcpClient {
             return Err(err);
         }
 
-        let response = rx.await.map_err(|_| {
-            HermesError::Mcp(format!(
-                "MCP server '{}' closed before responding to {method}",
-                self.server_name
-            ))
-        })?;
+        let response = match tokio::time::timeout(MCP_REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => {
+                return Err(HermesError::Mcp(format!(
+                    "MCP server '{}' closed before responding to {method}",
+                    self.server_name
+                )));
+            }
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                return Err(HermesError::Mcp(format!(
+                    "MCP server '{}' timed out waiting for {method} after {}s",
+                    self.server_name,
+                    MCP_REQUEST_TIMEOUT.as_secs()
+                )));
+            }
+        };
 
         if let Some(error) = response.get("error") {
             let message = error
@@ -222,31 +243,22 @@ impl StdioMcpClient {
     }
 
     async fn write_message(&self, payload: Value) -> Result<()> {
-        let bytes = serde_json::to_vec(&payload)
-            .map_err(|err| HermesError::Mcp(format!("failed to serialize MCP payload: {err}")))?;
-        let mut stdin = self.stdin.lock().await;
-        stdin
-            .write_all(format!("Content-Length: {}\r\n\r\n", bytes.len()).as_bytes())
-            .await
-            .map_err(|err| {
-                HermesError::Mcp(format!(
-                    "failed writing MCP header to '{}': {err}",
-                    self.server_name
-                ))
-            })?;
-        stdin.write_all(&bytes).await.map_err(|err| {
-            HermesError::Mcp(format!(
-                "failed writing MCP body to '{}': {err}",
-                self.server_name
-            ))
-        })?;
-        stdin.flush().await.map_err(|err| {
-            HermesError::Mcp(format!(
-                "failed flushing MCP request to '{}': {err}",
-                self.server_name
-            ))
-        })?;
-        Ok(())
+        write_framed_message(&self.server_name, &self.stdin, &payload).await
+    }
+
+    async fn shutdown(&self) {
+        let mut child = self.child.lock().await;
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(server = %self.server_name, "failed to inspect MCP child state: {err}");
+            }
+        }
+
+        if let Err(err) = child.kill().await {
+            tracing::warn!(server = %self.server_name, "failed to terminate MCP child: {err}");
+        }
     }
 }
 
@@ -298,6 +310,11 @@ pub async fn discover_tools(configs: &[McpServerConfig]) -> Vec<Box<dyn Tool>> {
         match StdioMcpClient::connect(config).await {
             Ok(client) => match client.list_tools().await {
                 Ok(descriptors) => {
+                    if descriptors.is_empty() {
+                        tracing::warn!(server = %config.name, "MCP server reported no tools; skipping");
+                        client.shutdown().await;
+                        continue;
+                    }
                     for descriptor in descriptors {
                         tools.push(Box::new(McpToolAdapter {
                             server_name: config.name.clone(),
@@ -308,6 +325,7 @@ pub async fn discover_tools(configs: &[McpServerConfig]) -> Vec<Box<dyn Tool>> {
                 }
                 Err(err) => {
                     tracing::warn!(server = %config.name, "failed to list MCP tools: {err}");
+                    client.shutdown().await;
                 }
             },
             Err(err) => {
@@ -319,19 +337,44 @@ pub async fn discover_tools(configs: &[McpServerConfig]) -> Vec<Box<dyn Tool>> {
     tools
 }
 
-fn spawn_stdout_reader(server_name: String, stdout: ChildStdout, pending: PendingMap) {
+fn spawn_stdout_reader(
+    server_name: String,
+    stdout: ChildStdout,
+    stdin: Arc<Mutex<ChildStdin>>,
+    pending: PendingMap,
+) {
     tokio::spawn(async move {
         let mut reader = BufReader::new(stdout);
         loop {
             match read_stdio_message(&mut reader).await {
-                Ok(Some(message)) => {
-                    let Some(id) = message.get("id").and_then(|v| v.as_u64()) else {
-                        continue;
-                    };
-                    if let Some(tx) = pending.lock().await.remove(&id) {
-                        let _ = tx.send(message);
+                Ok(Some(message)) => match classify_inbound_message(message) {
+                    InboundMessage::Response { id, message } => {
+                        if let Some(tx) = pending.lock().await.remove(&id) {
+                            let _ = tx.send(message);
+                        }
                     }
-                }
+                    InboundMessage::Request { id, method } => {
+                        tracing::warn!(server = %server_name, method = %method, "ignoring unsupported inbound MCP method");
+                        if let Some(id) = id {
+                            let payload = json!({
+                                "jsonrpc": JSONRPC_VERSION,
+                                "id": id,
+                                "error": {
+                                    "code": -32601,
+                                    "message": format!("unsupported inbound MCP method '{method}'"),
+                                }
+                            });
+                            if let Err(err) =
+                                write_framed_message(&server_name, &stdin, &payload).await
+                            {
+                                tracing::warn!(server = %server_name, method = %method, "failed to reject unsupported inbound MCP method: {err}");
+                            }
+                        }
+                    }
+                    InboundMessage::Other => {
+                        tracing::debug!(server = %server_name, "ignoring non-response MCP message");
+                    }
+                },
                 Ok(None) => {
                     tracing::info!(server = %server_name, "MCP stdout closed");
                     pending.lock().await.clear();
@@ -345,6 +388,38 @@ fn spawn_stdout_reader(server_name: String, stdout: ChildStdout, pending: Pendin
             }
         }
     });
+}
+
+async fn write_framed_message(
+    server_name: &str,
+    stdin: &Arc<Mutex<ChildStdin>>,
+    payload: &Value,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(payload)
+        .map_err(|err| HermesError::Mcp(format!("failed to serialize MCP payload: {err}")))?;
+    let mut stdin = stdin.lock().await;
+    stdin
+        .write_all(format!("Content-Length: {}\r\n\r\n", bytes.len()).as_bytes())
+        .await
+        .map_err(|err| {
+            HermesError::Mcp(format!(
+                "failed writing MCP header to '{}': {err}",
+                server_name
+            ))
+        })?;
+    stdin.write_all(&bytes).await.map_err(|err| {
+        HermesError::Mcp(format!(
+            "failed writing MCP body to '{}': {err}",
+            server_name
+        ))
+    })?;
+    stdin.flush().await.map_err(|err| {
+        HermesError::Mcp(format!(
+            "failed flushing MCP request to '{}': {err}",
+            server_name
+        ))
+    })?;
+    Ok(())
 }
 
 fn spawn_stderr_logger(server_name: String, stderr: ChildStderr) {
@@ -445,6 +520,29 @@ fn flatten_tool_content(parts: &[Value]) -> String {
     chunks.join("\n")
 }
 
+enum InboundMessage {
+    Response { id: u64, message: Value },
+    Request { id: Option<Value>, method: String },
+    Other,
+}
+
+fn classify_inbound_message(message: Value) -> InboundMessage {
+    if let Some(method) = message.get("method").and_then(|value| value.as_str()) {
+        return InboundMessage::Request {
+            id: message.get("id").cloned(),
+            method: method.to_string(),
+        };
+    }
+
+    if let Some(id) = message.get("id").and_then(|value| value.as_u64()) {
+        if message.get("result").is_some() || message.get("error").is_some() {
+            return InboundMessage::Response { id, message };
+        }
+    }
+
+    InboundMessage::Other
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ToolsListResult {
     tools: Vec<McpToolDescriptor>,
@@ -518,5 +616,40 @@ mod tests {
         let parsed: ToolsListResult = serde_json::from_value(payload).unwrap();
         assert_eq!(parsed.tools.len(), 1);
         assert_eq!(parsed.next_cursor.as_deref(), Some("page-2"));
+    }
+
+    #[test]
+    fn classify_inbound_message_treats_server_request_as_request() {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "sampling/createMessage",
+            "params": {}
+        });
+
+        match classify_inbound_message(payload) {
+            InboundMessage::Request { id, method } => {
+                assert_eq!(id, Some(json!(7)));
+                assert_eq!(method, "sampling/createMessage");
+            }
+            _ => panic!("expected request classification"),
+        }
+    }
+
+    #[test]
+    fn classify_inbound_message_treats_result_as_response() {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {"ok": true}
+        });
+
+        match classify_inbound_message(payload.clone()) {
+            InboundMessage::Response { id, message } => {
+                assert_eq!(id, 3);
+                assert_eq!(message, payload);
+            }
+            _ => panic!("expected response classification"),
+        }
     }
 }
