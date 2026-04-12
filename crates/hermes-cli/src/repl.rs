@@ -52,7 +52,11 @@ pub async fn run_repl() -> Result<()> {
 
     let approval_manager = ApprovalManager::load_or_default();
     let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(8);
-    approval_manager.spawn_handler(approval_rx, is_interactive_terminal());
+    approval_manager.spawn_handler(
+        approval_rx,
+        config.approval.policy.clone(),
+        is_interactive_terminal(),
+    );
 
     let system_prompt = "You are Hermes, a helpful AI assistant.".to_string();
 
@@ -162,7 +166,11 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
 
     let approval_manager = ApprovalManager::load_or_default();
     let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(8);
-    approval_manager.spawn_handler(approval_rx, is_interactive_terminal());
+    approval_manager.spawn_handler(
+        approval_rx,
+        config.approval.policy.clone(),
+        is_interactive_terminal(),
+    );
 
     let memory_dir = hermes_home().join("memories");
     let memory = MemoryManager::new(memory_dir, None).context("failed to initialize memory")?;
