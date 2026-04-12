@@ -87,9 +87,20 @@ impl Default for FileConfigYaml {
 
 // ─── MCP config ───────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransportKind {
+    #[default]
+    Stdio,
+    Http,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct McpServerConfig {
     pub name: String,
+    #[serde(default)]
+    pub transport: McpTransportKind,
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -97,6 +108,10 @@ pub struct McpServerConfig {
     pub env: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
     #[serde(default = "default_mcp_server_enabled")]
     pub enabled: bool,
 }
@@ -419,8 +434,37 @@ mcp_servers:
         let cfg: AppConfig = serde_yaml_ng::from_str(yaml).expect("deserialize failed");
         assert_eq!(cfg.mcp_servers.len(), 1);
         assert_eq!(cfg.mcp_servers[0].name, "demo");
+        assert_eq!(cfg.mcp_servers[0].transport, McpTransportKind::Stdio);
         assert!(cfg.mcp_servers[0].enabled);
         assert!(cfg.mcp_servers[0].args.is_empty());
+    }
+
+    #[test]
+    fn mcp_http_server_config_deserializes() {
+        let yaml = r#"
+model: openai/gpt-4o
+mcp_servers:
+  - name: remote-docs
+    transport: http
+    url: https://mcp.example.com
+    headers:
+      Authorization: Bearer test-token
+"#;
+        let cfg: AppConfig = serde_yaml_ng::from_str(yaml).expect("deserialize failed");
+        assert_eq!(cfg.mcp_servers.len(), 1);
+        assert_eq!(cfg.mcp_servers[0].transport, McpTransportKind::Http);
+        assert_eq!(
+            cfg.mcp_servers[0].url.as_deref(),
+            Some("https://mcp.example.com")
+        );
+        assert_eq!(
+            cfg.mcp_servers[0]
+                .headers
+                .get("Authorization")
+                .map(String::as_str),
+            Some("Bearer test-token")
+        );
+        assert!(cfg.mcp_servers[0].command.is_empty());
     }
 
     #[test]
