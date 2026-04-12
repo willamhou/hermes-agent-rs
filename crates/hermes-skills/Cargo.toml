@@ -8,8 +8,16 @@ license.workspace = true
 
 [dependencies]
 hermes-core.workspace = true
+hermes-tools.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 serde_yaml_ng.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
+inventory.workspace = true
+tokio.workspace = true
 walkdir.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

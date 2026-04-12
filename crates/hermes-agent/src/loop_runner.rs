@@ -7,10 +7,10 @@ use hermes_core::{
     message::{Content, Message, Role},
     provider::{ChatRequest, Provider},
     stream::StreamDelta,
-    tool::{ApprovalRequest, ToolConfig, ToolContext, ToolSchema},
+    tool::{ApprovalRequest, SkillAccess, ToolConfig, ToolContext, ToolSchema},
 };
 use hermes_tools::registry::ToolRegistry;
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 
 use crate::{
     budget::IterationBudget,
@@ -30,6 +30,7 @@ pub struct AgentConfig {
     pub approval_tx: mpsc::Sender<ApprovalRequest>,
     pub tool_config: Arc<ToolConfig>,
     pub memory: hermes_memory::MemoryManager,
+    pub skills: Option<Arc<RwLock<hermes_skills::SkillManager>>>,
     pub compression: CompressionConfig,
 }
 
@@ -44,6 +45,7 @@ pub struct Agent {
     approval_tx: mpsc::Sender<ApprovalRequest>,
     tool_config: Arc<ToolConfig>,
     memory: hermes_memory::MemoryManager,
+    skills: Option<Arc<RwLock<hermes_skills::SkillManager>>>,
     cache_manager: PromptCacheManager,
     compressor: ContextCompressor,
 }
@@ -61,6 +63,7 @@ impl Agent {
             approval_tx: config.approval_tx,
             tool_config: config.tool_config,
             memory: config.memory,
+            skills: config.skills,
             cache_manager: PromptCacheManager::new(),
             compressor: ContextCompressor::new(config.compression),
         }
@@ -77,6 +80,11 @@ impl Agent {
         delta_tx: mpsc::Sender<StreamDelta>,
     ) -> Result<String> {
         history.push(Message::user(user_message));
+        let active_skills = if let Some(skills) = &self.skills {
+            skills.read().await.match_for_turn(user_message, history, 3)
+        } else {
+            Vec::new()
+        };
 
         // Take prefetched memory context (for future external providers)
         let _memory_ctx = self.memory.take_prefetched(&self.session_id).await;
@@ -106,11 +114,14 @@ impl Agent {
 
         while self.budget.try_consume() {
             let schemas: Vec<ToolSchema> = self.registry.available_schemas();
+            let request_history =
+                inject_active_skills_into_history(self.skills.as_ref(), &active_skills, history)
+                    .await;
 
             let request = ChatRequest {
                 system: &full_system,
                 system_segments: segments.as_deref(),
-                messages: history.as_slice(),
+                messages: request_history.as_slice(),
                 tools: &schemas,
                 max_tokens: 4096,
                 temperature: 0.0,
@@ -143,6 +154,12 @@ impl Agent {
                 approval_tx: self.approval_tx.clone(),
                 delta_tx: delta_tx.clone(),
                 tool_config: Arc::clone(&self.tool_config),
+                memory: Some(self.memory.tool_handle()),
+                aux_provider: Some(Arc::clone(&self.provider)),
+                skills: self.skills.as_ref().map(|skills| {
+                    Arc::new(hermes_skills::SharedSkillManager::new(Arc::clone(skills)))
+                        as Arc<dyn SkillAccess>
+                }),
             };
 
             let tool_results = if should_parallelize(&response.tool_calls, &self.registry) {
@@ -150,6 +167,10 @@ impl Agent {
             } else {
                 execute_sequential(&response.tool_calls, Arc::clone(&self.registry), &ctx).await
             };
+
+            let memory_write_succeeded = tool_results
+                .iter()
+                .any(|tr| tr.tool_name == "memory_write" && !tr.result.is_error);
 
             // Push one tool-result message per result.
             for tr in tool_results {
@@ -163,11 +184,32 @@ impl Agent {
                 });
             }
 
+            if memory_write_succeeded {
+                self.cache_manager.invalidate();
+                let memory_block = self.memory.system_prompt_blocks();
+                full_system = if memory_block.is_empty() {
+                    self.system_prompt.clone()
+                } else {
+                    format!("{}\n\n{}", self.system_prompt, memory_block)
+                };
+                segments = if self.provider.supports_caching() {
+                    Some(
+                        self.cache_manager
+                            .get_or_freeze(&self.system_prompt, &memory_block),
+                    )
+                } else {
+                    None
+                };
+            }
+
             // Check if context compression is needed
             let tool_count = schemas.len();
+            let compression_history =
+                inject_active_skills_into_history(self.skills.as_ref(), &active_skills, history)
+                    .await;
             if self
                 .compressor
-                .should_compress(&full_system, history, tool_count)
+                .should_compress(&full_system, &compression_history, tool_count)
             {
                 tracing::info!("context compression triggered");
                 let contrib = self.memory.on_pre_compress(history).await;
@@ -236,10 +278,30 @@ impl Agent {
     }
 }
 
+async fn inject_active_skills_into_history(
+    skills: Option<&Arc<RwLock<hermes_skills::SkillManager>>>,
+    active_skills: &[hermes_skills::Skill],
+    history: &[Message],
+) -> Vec<Message> {
+    if active_skills.is_empty() {
+        return history.to_vec();
+    }
+
+    let mut request_history = history.to_vec();
+    if let Some(skills) = skills {
+        skills
+            .read()
+            .await
+            .inject_active_into_history(active_skills, &mut request_history);
+    }
+    request_history
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -346,9 +408,21 @@ mod tests {
         responses: Vec<ChatResponse>,
         max_iterations: u32,
     ) -> (Agent, mpsc::Receiver<ApprovalRequest>) {
-        use hermes_memory::MemoryManager;
+        make_agent_with_config_and_skills(
+            responses,
+            max_iterations,
+            CompressionConfig::default(),
+            None,
+        )
+    }
 
-        use crate::compressor::CompressionConfig;
+    fn make_agent_with_config_and_skills(
+        responses: Vec<ChatResponse>,
+        max_iterations: u32,
+        compression: CompressionConfig,
+        skills: Option<Arc<RwLock<hermes_skills::SkillManager>>>,
+    ) -> (Agent, mpsc::Receiver<ApprovalRequest>) {
+        use hermes_memory::MemoryManager;
 
         let provider = Arc::new(MockProvider::new(responses));
         let registry = Arc::new(ToolRegistry::new());
@@ -365,7 +439,8 @@ mod tests {
             approval_tx,
             tool_config: Arc::new(ToolConfig::default()),
             memory,
-            compression: CompressionConfig::default(),
+            skills,
+            compression,
         });
         (agent, approval_rx)
     }
@@ -430,5 +505,55 @@ mod tests {
 
         assert_eq!(result, "[iteration budget exhausted]");
         assert!(agent.remaining_budget() == 0);
+    }
+
+    #[tokio::test]
+    async fn test_skill_injection_counts_toward_compression() {
+        let skills_dir = tempfile::tempdir().unwrap();
+        let skill_dir = skills_dir.path().join("compress-helper");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                r#"---
+name: compress-helper
+description: Helps with compression tests
+platforms: [linux]
+---
+
+{}
+"#,
+                "A".repeat(2_400)
+            ),
+        )
+        .unwrap();
+
+        let skills = Arc::new(RwLock::new(
+            hermes_skills::SkillManager::new(vec![skills_dir.path().to_path_buf()]).unwrap(),
+        ));
+        let compression = CompressionConfig {
+            max_context_tokens: 200,
+            pressure_threshold: 0.4,
+            target_after_compression: 0.1,
+            protect_head_messages: 1,
+        };
+        let compressor = ContextCompressor::new(compression);
+        let history = vec![Message::user("please use $compress-helper")];
+        let active_skills =
+            skills
+                .read()
+                .await
+                .match_for_turn("please use $compress-helper", &history, 3);
+        let request_history =
+            inject_active_skills_into_history(Some(&skills), &active_skills, &history).await;
+
+        assert!(!compressor.should_compress("You are a helpful assistant.", &history, 0));
+        assert!(compressor.should_compress("You are a helpful assistant.", &request_history, 0));
+        assert!(
+            request_history[0]
+                .content
+                .as_text_lossy()
+                .contains("[Active skills for this turn]")
+        );
     }
 }

@@ -1,20 +1,57 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use tokio::sync::Mutex;
+use async_trait::async_trait;
+use tokio::sync::Mutex as AsyncMutex;
 
-use hermes_core::error::Result;
+use hermes_core::error::{HermesError, Result};
 use hermes_core::memory::MemoryProvider;
 use hermes_core::message::Message;
+use hermes_core::tool::MemoryAccess;
 
 use crate::builtin::BuiltinMemory;
 
-/// Orchestrates [`BuiltinMemory`] and an optional external [`MemoryProvider`].
-pub struct MemoryManager {
-    builtin: BuiltinMemory,
+fn lock_builtin<'a>(builtin: &'a Mutex<BuiltinMemory>) -> Result<MutexGuard<'a, BuiltinMemory>> {
+    builtin
+        .lock()
+        .map_err(|_| HermesError::Memory("builtin memory lock poisoned".to_string()))
+}
+
+#[derive(Clone)]
+struct MemoryToolHandle {
+    builtin: Arc<Mutex<BuiltinMemory>>,
     external: Option<Arc<dyn MemoryProvider>>,
-    prefetch_cache: Arc<Mutex<HashMap<String, String>>>,
+}
+
+#[async_trait]
+impl MemoryAccess for MemoryToolHandle {
+    fn read_live(&self, key: &str) -> Result<Option<String>> {
+        lock_builtin(&self.builtin)?.read_live(key)
+    }
+
+    fn write_live(&self, key: &str, content: &str) -> Result<()> {
+        lock_builtin(&self.builtin)?.write(key, content)
+    }
+
+    fn refresh_snapshot(&self) -> Result<()> {
+        lock_builtin(&self.builtin)?.refresh_snapshot()
+    }
+
+    async fn on_memory_write(&self, action: &str, target: &str, content: &str) -> Result<()> {
+        if let Some(ext) = &self.external {
+            ext.on_memory_write(action, target, content).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Orchestrates [`BuiltinMemory`] and an optional external [`MemoryProvider`].
+#[derive(Clone)]
+pub struct MemoryManager {
+    builtin: Arc<Mutex<BuiltinMemory>>,
+    external: Option<Arc<dyn MemoryProvider>>,
+    prefetch_cache: Arc<AsyncMutex<HashMap<String, String>>>,
 }
 
 impl MemoryManager {
@@ -22,9 +59,18 @@ impl MemoryManager {
     pub fn new(memory_dir: PathBuf, external: Option<Arc<dyn MemoryProvider>>) -> Result<Self> {
         let builtin = BuiltinMemory::load(memory_dir)?;
         Ok(Self {
-            builtin,
+            builtin: Arc::new(Mutex::new(builtin)),
             external,
-            prefetch_cache: Arc::new(Mutex::new(HashMap::new())),
+            prefetch_cache: Arc::new(AsyncMutex::new(HashMap::new())),
+        })
+    }
+
+    /// Create a tool-facing handle that can read/write live memory and mirror
+    /// writes to external providers.
+    pub fn tool_handle(&self) -> Arc<dyn MemoryAccess> {
+        Arc::new(MemoryToolHandle {
+            builtin: Arc::clone(&self.builtin),
+            external: self.external.clone(),
         })
     }
 
@@ -33,8 +79,10 @@ impl MemoryManager {
     pub fn system_prompt_blocks(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
 
-        if let Some(block) = self.builtin.system_prompt_block() {
-            parts.push(block);
+        if let Ok(guard) = lock_builtin(&self.builtin) {
+            if let Some(block) = guard.system_prompt_block() {
+                parts.push(block);
+            }
         }
         if let Some(ext) = &self.external {
             if let Some(block) = ext.system_prompt_block() {
@@ -75,7 +123,6 @@ impl MemoryManager {
     /// Take a prefetched value for `session_id` from cache.
     /// Falls back to a synchronous prefetch if external exists but cache misses.
     pub async fn take_prefetched(&self, session_id: &str) -> Option<String> {
-        // Lock scope: drop the guard before any await
         let cached = {
             let mut guard = self.prefetch_cache.lock().await;
             guard.remove(session_id)
@@ -85,7 +132,6 @@ impl MemoryManager {
             return cached;
         }
 
-        // Fallback: sync prefetch
         if let Some(ext) = &self.external {
             match ext.prefetch("", session_id).await {
                 Ok(data) if !data.is_empty() => return Some(data),
@@ -126,21 +172,26 @@ impl MemoryManager {
     }
 
     /// Re-read files into the builtin snapshot.
-    pub fn refresh_snapshot(&mut self) -> Result<()> {
-        self.builtin.refresh_snapshot()
+    pub fn refresh_snapshot(&self) -> Result<()> {
+        lock_builtin(&self.builtin)?.refresh_snapshot()
     }
 
-    /// Borrow the underlying [`BuiltinMemory`].
-    pub fn builtin(&self) -> &BuiltinMemory {
-        &self.builtin
+    /// Read a live on-disk memory value.
+    pub fn read_live(&self, key: &str) -> Result<Option<String>> {
+        lock_builtin(&self.builtin)?.read_live(key)
+    }
+
+    /// Write a live on-disk memory value without mutating the frozen snapshot.
+    pub fn write_live(&self, key: &str, content: &str) -> Result<()> {
+        lock_builtin(&self.builtin)?.write(key, content)
     }
 
     /// Create a child manager: clones builtin state, no external, fresh cache.
     pub fn new_child(&self) -> Result<Self> {
         Ok(Self {
-            builtin: self.builtin.clone(),
+            builtin: Arc::new(Mutex::new(lock_builtin(&self.builtin)?.clone())),
             external: None,
-            prefetch_cache: Arc::new(Mutex::new(HashMap::new())),
+            prefetch_cache: Arc::new(AsyncMutex::new(HashMap::new())),
         })
     }
 }
@@ -148,7 +199,6 @@ impl MemoryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use hermes_core::error::Result as HermesResult;
     use tempfile::TempDir;
 
@@ -193,7 +243,6 @@ mod tests {
         let mgr = MemoryManager::new(dir.path().to_path_buf(), Some(Arc::new(MockMemoryProvider)))
             .unwrap();
         let child = mgr.new_child().unwrap();
-        // child has no external
         assert!(child.external.is_none());
     }
 
@@ -217,14 +266,10 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_snapshot_updates() {
         let dir = tmp();
-        let mut mgr = MemoryManager::new(dir.path().to_path_buf(), None).unwrap();
-        // initially empty
+        let mgr = MemoryManager::new(dir.path().to_path_buf(), None).unwrap();
         assert_eq!(mgr.system_prompt_blocks(), "");
-        // write to disk directly
-        mgr.builtin().write("MEMORY", "updated notes").unwrap();
-        // blocks still empty (snapshot frozen)
+        mgr.write_live("MEMORY", "updated notes").unwrap();
         assert_eq!(mgr.system_prompt_blocks(), "");
-        // refresh and check
         mgr.refresh_snapshot().unwrap();
         let blocks = mgr.system_prompt_blocks();
         assert!(blocks.contains("updated notes"));
@@ -237,8 +282,6 @@ mod tests {
             .unwrap();
 
         mgr.queue_prefetch("some hint", "session-abc");
-
-        // Give the background task time to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let result = mgr.take_prefetched("session-abc").await;
@@ -250,9 +293,7 @@ mod tests {
         let dir = tmp();
         let mgr = MemoryManager::new(dir.path().to_path_buf(), Some(Arc::new(MockMemoryProvider)))
             .unwrap();
-        // Should not panic or block
         mgr.sync_turn("user message", "assistant response", "session-xyz");
-        // give background task a moment
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
 }

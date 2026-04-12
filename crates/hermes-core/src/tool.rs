@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 use crate::error::Result;
+use crate::message::Message;
 use crate::message::ToolResult;
 use crate::stream::StreamDelta;
 
@@ -76,6 +77,50 @@ pub struct ToolContext {
     pub approval_tx: mpsc::Sender<ApprovalRequest>,
     pub delta_tx: mpsc::Sender<StreamDelta>,
     pub tool_config: Arc<ToolConfig>,
+    pub memory: Option<Arc<dyn MemoryAccess>>,
+    pub aux_provider: Option<Arc<dyn crate::provider::Provider>>,
+    pub skills: Option<Arc<dyn SkillAccess>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SkillSummary {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SkillDoc {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+}
+
+#[async_trait]
+pub trait MemoryAccess: Send + Sync {
+    fn read_live(&self, key: &str) -> Result<Option<String>>;
+    fn write_live(&self, key: &str, content: &str) -> Result<()>;
+    fn refresh_snapshot(&self) -> Result<()>;
+
+    async fn on_memory_write(&self, action: &str, target: &str, content: &str) -> Result<()> {
+        let _ = (action, target, content);
+        Ok(())
+    }
+}
+
+#[async_trait]
+pub trait SkillAccess: Send + Sync {
+    async fn list(&self) -> Result<Vec<SkillSummary>>;
+    async fn get(&self, name: &str) -> Result<Option<SkillDoc>>;
+    async fn match_for_turn(
+        &self,
+        user_message: &str,
+        history: &[Message],
+        max_skills: usize,
+    ) -> Result<Vec<SkillDoc>>;
+    async fn create(&self, name: &str, content: &str) -> Result<()>;
+    async fn edit(&self, name: &str, content: &str) -> Result<()>;
+    async fn delete(&self, name: &str) -> Result<()>;
+    async fn reload(&self) -> Result<()>;
 }
 
 pub struct ApprovalRequest {

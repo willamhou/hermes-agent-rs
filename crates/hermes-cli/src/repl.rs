@@ -19,9 +19,10 @@ use hermes_core::{
 };
 use hermes_memory::MemoryManager;
 use hermes_provider::create_provider;
+use hermes_skills::SkillManager;
 use hermes_tools::registry::ToolRegistry;
 use secrecy::SecretString;
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
 use crate::render::render_stream;
@@ -62,6 +63,10 @@ pub async fn run_repl() -> Result<()> {
 
     let memory_dir = hermes_home().join("memories");
     let memory = MemoryManager::new(memory_dir, None).context("failed to initialize memory")?;
+    let skills_dir = hermes_home().join("skills");
+    let skills = Arc::new(RwLock::new(
+        SkillManager::new(vec![skills_dir]).context("failed to initialize skills")?,
+    ));
 
     let agent_config = AgentConfig {
         provider,
@@ -73,6 +78,7 @@ pub async fn run_repl() -> Result<()> {
         approval_tx,
         tool_config,
         memory,
+        skills: Some(skills),
         compression: CompressionConfig::default(),
     };
     let mut agent = Agent::new(agent_config);
@@ -171,6 +177,10 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
 
     let memory_dir = hermes_home().join("memories");
     let memory = MemoryManager::new(memory_dir, None).context("failed to initialize memory")?;
+    let skills_dir = hermes_home().join("skills");
+    let skills = Arc::new(RwLock::new(
+        SkillManager::new(vec![skills_dir]).context("failed to initialize skills")?,
+    ));
 
     let mut agent = Agent::new(AgentConfig {
         provider,
@@ -182,6 +192,7 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
         approval_tx,
         tool_config,
         memory,
+        skills: Some(skills),
         compression: CompressionConfig::default(),
     });
 
