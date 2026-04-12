@@ -82,6 +82,11 @@ mcp_servers:
   - name: docs
     command: npx
     args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+  - name: remote-docs
+    transport: http
+    url: https://mcp.example.com
+    headers:
+      Authorization: Bearer ${MCP_TOKEN}
 file:
   read_max_chars: 100000
   read_max_lines: 2000
@@ -106,7 +111,8 @@ cargo test --workspace
 ## Notes
 
 - Dangerous tool actions use `approval.policy: ask | yolo | deny`, with `AllowSession` and `AllowAlways` memory stored under `$HERMES_HOME/approvals.json`.
-- `mcp_servers` currently supports stdio servers and auto-registers their tools at CLI startup.
+- `mcp_servers` supports `transport: stdio | http` and auto-registers discovered MCP tools at CLI startup.
+- The current HTTP MCP client focuses on request/response tool discovery and execution; richer MCP capabilities such as resources and prompts are still pending.
 - `execute_code` is disabled by default and is only exposed when `HERMES_ENABLE_EXECUTE_CODE=1`.
 - Use the `openai-codex/<model>` or `openai-responses/<model>` prefix to target OpenAI's `/v1/responses` API.
 - Phase-by-phase design notes live under [`docs/specs`](docs/specs).
