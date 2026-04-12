@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use serde_json::json;
 
+use crate::approval_key::approval_memory_key;
 use hermes_core::{
     error::Result,
     message::ToolResult,
@@ -76,6 +77,7 @@ impl Tool for ExecuteCodeTool {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let approval = ApprovalRequest {
             tool_name: self.name().to_string(),
+            memory_key: approval_memory_key(self.name(), code),
             command: format!("python3 {}", temp_file.display()),
             reason: format!("python code execution requested\n{preview}"),
             response_tx,

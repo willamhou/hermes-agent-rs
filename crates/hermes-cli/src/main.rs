@@ -1,5 +1,6 @@
 //! Hermes CLI entry point.
 
+mod approval;
 mod oneshot;
 mod render;
 mod repl;

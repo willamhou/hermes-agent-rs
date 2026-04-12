@@ -8,11 +8,7 @@ use hermes_agent::{
     loop_runner::{Agent, AgentConfig},
 };
 use hermes_config::config::{AppConfig, hermes_home};
-use hermes_core::{
-    message::Message,
-    stream::StreamDelta,
-    tool::{ApprovalDecision, ApprovalRequest},
-};
+use hermes_core::{message::Message, stream::StreamDelta, tool::ApprovalRequest};
 use hermes_memory::MemoryManager;
 use hermes_provider::create_provider;
 use hermes_skills::SkillManager;
@@ -21,6 +17,7 @@ use secrecy::SecretString;
 use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
+use crate::approval::{ApprovalManager, is_interactive_terminal};
 use crate::render::render_stream;
 
 /// Send a single message, stream the response, then exit.
@@ -50,13 +47,9 @@ pub async fn run_oneshot(
 
     let tool_config = Arc::new(config.tool_config(working_dir.clone()));
 
-    let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
-    tokio::spawn(async move {
-        while let Some(req) = approval_rx.recv().await {
-            tracing::warn!(tool = %req.tool_name, command = %req.command, "auto-allowing tool (no approval UI)");
-            let _ = req.response_tx.send(ApprovalDecision::Allow);
-        }
-    });
+    let approval_manager = ApprovalManager::load_or_default();
+    let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(8);
+    approval_manager.spawn_handler(approval_rx, is_interactive_terminal());
 
     let memory_dir = hermes_home().join("memories");
     let memory = MemoryManager::new(memory_dir, None).context("failed to initialize memory")?;

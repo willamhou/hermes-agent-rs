@@ -1,5 +1,6 @@
 //! Tool trait, registry, and built-in tools
 
+mod approval_key;
 pub mod execute_code;
 pub mod file_read;
 pub mod file_search;
