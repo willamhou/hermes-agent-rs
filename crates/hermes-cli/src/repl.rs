@@ -289,7 +289,9 @@ async fn repl_loop(
         // Persist all messages added during this turn regardless of success/failure,
         // skipping the user message at pre_len (already persisted above).
         // This ensures tool-result messages are not lost when an error occurs.
-        for msg in &history[pre_len + 1..] {
+        // Clamp the start index: compression can shrink history below pre_len + 1.
+        let persist_start = (pre_len + 1).min(history.len());
+        for msg in &history[persist_start..] {
             let _ = store.append_message(session_id, msg).await;
         }
 

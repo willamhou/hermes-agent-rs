@@ -13,19 +13,21 @@ pub fn truncate_entries(content: &str, max_chars: usize) -> String {
         return content.to_string();
     }
 
-    // Split into entries
-    let entries: Vec<&str> = content.split('§').collect();
+    // Split into entries using the full separator constant
+    let entries: Vec<&str> = content.split(ENTRY_SEPARATOR).collect();
 
-    // Walk from the end, accumulating entries until we would exceed max_chars
+    // Walk from the end, accumulating entries until we would exceed max_chars.
+    // Count separators consistently: ENTRY_SEPARATOR.len() bytes between N entries.
     let mut kept: Vec<&str> = Vec::new();
     let mut total = 0usize;
-    // We need to count the separators too: between N entries there are N-1 separators
-    // Separator is "\n§\n" — length 3
-    const SEP_LEN: usize = 3;
 
     for entry in entries.iter().rev() {
         let entry_len = entry.len();
-        let added_sep = if kept.is_empty() { 0 } else { SEP_LEN };
+        let added_sep = if kept.is_empty() {
+            0
+        } else {
+            ENTRY_SEPARATOR.len()
+        };
         if total + entry_len + added_sep <= max_chars {
             total += entry_len + added_sep;
             kept.push(entry);
@@ -35,7 +37,7 @@ pub fn truncate_entries(content: &str, max_chars: usize) -> String {
     }
 
     kept.reverse();
-    kept.join("§")
+    kept.join(ENTRY_SEPARATOR)
 }
 
 /// File-backed memory with a frozen snapshot pattern.
@@ -211,10 +213,13 @@ mod tests {
 
     #[test]
     fn test_truncate_entries_over_limit() {
-        // Build many entries that together exceed the limit
+        // Build many entries that together exceed the limit.
+        // Use ENTRY_SEPARATOR ("\n§\n") so split/join are consistent.
         let entries: Vec<String> = (0..20).map(|i| format!("entry_{i:02}")).collect();
-        let content = entries.join("§");
-        // max_chars that fits only the last few entries
+        let content = entries.join(ENTRY_SEPARATOR);
+        // Each "entry_NN" is 8 chars; each separator is ENTRY_SEPARATOR.len() = 4 bytes.
+        // max_chars that fits only the last few entries:
+        // 3 entries = 3*8 + 2*4 = 32 bytes; 4 entries = 4*8 + 3*4 = 44 bytes.
         let max = 50usize;
         let result = truncate_entries(&content, max);
         // Oldest entries should be dropped

@@ -1,5 +1,6 @@
 //! Context compression: layered pruning, summarization, and tool-pair sanitization.
 
+use std::cmp::Reverse;
 use std::collections::HashSet;
 
 use hermes_core::{
@@ -282,16 +283,38 @@ fn sanitize_tool_pairs(messages: &mut Vec<Message>) {
     });
 
     // Add stubs for missing results (call with no matching result).
+    // Each stub must be placed immediately after the assistant message that issued the call,
+    // not at the end — the Anthropic API requires tool results to follow their parent.
     let missing: Vec<String> = expected.difference(&actual).cloned().collect();
-    for id in missing {
-        messages.push(Message {
-            role: Role::Tool,
-            content: Content::Text("[Tool result removed during compression]".to_string()),
-            tool_calls: vec![],
-            reasoning: None,
-            name: None,
-            tool_call_id: Some(id),
-        });
+
+    // Collect (insert_pos, stub) pairs, then insert from bottom to top so that
+    // earlier insertions don't shift the positions of later ones.
+    let mut insertions: Vec<(usize, Message)> = missing
+        .into_iter()
+        .map(|id| {
+            let insert_pos = messages
+                .iter()
+                .position(|m| {
+                    m.role == Role::Assistant && m.tool_calls.iter().any(|tc| tc.id == id)
+                })
+                .map(|i| i + 1)
+                .unwrap_or(messages.len());
+            let stub = Message {
+                role: Role::Tool,
+                content: Content::Text("[Tool result removed during compression]".to_string()),
+                tool_calls: vec![],
+                reasoning: None,
+                name: None,
+                tool_call_id: Some(id),
+            };
+            (insert_pos, stub)
+        })
+        .collect();
+
+    // Sort descending by position so insertions from the bottom don't invalidate earlier positions.
+    insertions.sort_by_key(|b| Reverse(b.0));
+    for (pos, stub) in insertions {
+        messages.insert(pos, stub);
     }
 }
 
@@ -329,11 +352,16 @@ fn serialize_messages(messages: &[Message]) -> String {
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
-    if s.len() <= max_chars {
+    if s.chars().count() <= max_chars {
         s.to_string()
     } else {
-        let truncated: String = s.chars().take(max_chars).collect();
-        format!("{truncated}...")
+        // Use char_indices for an efficient byte-boundary slice.
+        let end = s
+            .char_indices()
+            .nth(max_chars)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        format!("{}...", &s[..end])
     }
 }
 
@@ -639,7 +667,36 @@ mod tests {
         );
     }
 
-    // 10. sanitize — valid pairs unchanged
+    // 10. sanitize — stub inserted immediately after its parent assistant message
+    #[test]
+    fn test_sanitize_stub_position_after_parent() {
+        // History: [user, assistant(tool_calls=[c1]), user_msg]
+        // No tool result for c1.  After sanitize the stub must be at index 2
+        // (right after the assistant), NOT at the end (index 3).
+        let mut messages = vec![
+            Message::user("start"),
+            make_assistant_with_tool_call("c1", "read_file"),
+            Message::user("follow up"),
+        ];
+        sanitize_tool_pairs(&mut messages);
+
+        // Verify the stub exists.
+        let stub_pos = messages
+            .iter()
+            .position(|m| m.tool_call_id.as_deref() == Some("c1"))
+            .expect("stub should be present");
+
+        // The assistant is at index 1; the stub must be at index 2 (right after).
+        assert_eq!(
+            stub_pos, 2,
+            "stub should be at index 2, right after the assistant message"
+        );
+
+        // The original follow-up user message is now shifted to index 3.
+        assert_eq!(messages[3].content.as_text_lossy(), "follow up");
+    }
+
+    // 11. sanitize — valid pairs unchanged
     #[test]
     fn test_sanitize_valid_pairs_unchanged() {
         let mut messages = vec![
@@ -653,7 +710,7 @@ mod tests {
         assert_eq!(messages.len(), original_len);
     }
 
-    // 11. full compress with MockProvider
+    // 12. full compress with MockProvider
     #[tokio::test]
     async fn test_compress_full_with_mock() {
         let provider = MockProvider::new(vec![summary_response("This is the summary.")]);
@@ -713,7 +770,7 @@ mod tests {
         assert_eq!(last, "confirm");
     }
 
-    // 12. iterative compression preserves previous_summary
+    // 13. iterative compression preserves previous_summary
     #[tokio::test]
     async fn test_compress_iterative_summary() {
         let provider = MockProvider::new(vec![
@@ -752,7 +809,7 @@ mod tests {
         assert!(captured[1].contains("First summary."));
     }
 
-    // 13. compress not needed — few messages, high threshold
+    // 14. compress not needed — few messages, high threshold
     #[tokio::test]
     async fn test_compress_not_needed() {
         let provider = MockProvider::new(vec![]);
@@ -771,7 +828,7 @@ mod tests {
         assert!(matches!(result, CompressionResult::NotNeeded));
     }
 
-    // 14. compress — verify summary request shape
+    // 15. compress — verify summary request shape
     #[tokio::test]
     async fn test_compress_summary_request_shape() {
         let (provider, captured) =
