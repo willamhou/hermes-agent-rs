@@ -43,6 +43,13 @@ enum McpClient {
     Http(HttpMcpClient),
 }
 
+#[derive(Debug, Clone, Default)]
+struct McpCapabilities {
+    tools: bool,
+    prompts: bool,
+    resources: bool,
+}
+
 #[derive(Debug, Clone)]
 struct StdioMcpClient {
     server_name: String,
@@ -50,6 +57,7 @@ struct StdioMcpClient {
     stdin: Arc<Mutex<ChildStdin>>,
     pending: PendingMap,
     next_id: Arc<AtomicU64>,
+    capabilities: Arc<Mutex<McpCapabilities>>,
 }
 
 impl StdioMcpClient {
@@ -97,6 +105,7 @@ impl StdioMcpClient {
             stdin: Arc::new(Mutex::new(stdin)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
+            capabilities: Arc::new(Mutex::new(McpCapabilities::default())),
         };
 
         spawn_stdout_reader(
@@ -133,6 +142,7 @@ impl StdioMcpClient {
             .get("protocolVersion")
             .and_then(|v| v.as_str())
             .unwrap_or(PROTOCOL_VERSION);
+        *self.capabilities.lock().await = parse_capabilities(&result);
         tracing::info!(
             server = %self.server_name,
             protocol_version = negotiated,
@@ -279,6 +289,10 @@ impl StdioMcpClient {
             tracing::warn!(server = %self.server_name, "failed to terminate MCP child: {err}");
         }
     }
+
+    async fn capabilities(&self) -> McpCapabilities {
+        self.capabilities.lock().await.clone()
+    }
 }
 
 impl McpClient {
@@ -303,6 +317,57 @@ impl McpClient {
         }
     }
 
+    async fn call_method(&self, method: &str, params: Value) -> Result<Value> {
+        match self {
+            Self::Stdio(client) => client.call_method(method, params).await,
+            Self::Http(client) => client.call_method(method, params).await,
+        }
+    }
+
+    async fn capabilities(&self) -> McpCapabilities {
+        match self {
+            Self::Stdio(client) => client.capabilities().await,
+            Self::Http(client) => client.capabilities().await,
+        }
+    }
+
+    async fn list_prompts(&self, cursor: Option<&str>) -> Result<Value> {
+        let params = match cursor {
+            Some(cursor) => json!({ "cursor": cursor }),
+            None => json!({}),
+        };
+        self.call_method("prompts/list", params).await
+    }
+
+    async fn get_prompt(&self, name: &str, arguments: Option<Value>) -> Result<Value> {
+        let mut params = json!({ "name": name });
+        if let Some(arguments) = arguments {
+            params["arguments"] = arguments;
+        }
+        self.call_method("prompts/get", params).await
+    }
+
+    async fn list_resources(&self, cursor: Option<&str>) -> Result<Value> {
+        let params = match cursor {
+            Some(cursor) => json!({ "cursor": cursor }),
+            None => json!({}),
+        };
+        self.call_method("resources/list", params).await
+    }
+
+    async fn list_resource_templates(&self, cursor: Option<&str>) -> Result<Value> {
+        let params = match cursor {
+            Some(cursor) => json!({ "cursor": cursor }),
+            None => json!({}),
+        };
+        self.call_method("resources/templates/list", params).await
+    }
+
+    async fn read_resource(&self, uri: &str) -> Result<Value> {
+        self.call_method("resources/read", json!({ "uri": uri }))
+            .await
+    }
+
     async fn shutdown(&self) {
         match self {
             Self::Stdio(client) => client.shutdown().await,
@@ -318,6 +383,7 @@ struct HttpMcpClient {
     client: Client,
     session_id: Arc<Mutex<Option<String>>>,
     negotiated_protocol: Arc<Mutex<String>>,
+    capabilities: Arc<Mutex<McpCapabilities>>,
 }
 
 impl HttpMcpClient {
@@ -355,6 +421,7 @@ impl HttpMcpClient {
             client,
             session_id: Arc::new(Mutex::new(None)),
             negotiated_protocol: Arc::new(Mutex::new(PROTOCOL_VERSION.to_string())),
+            capabilities: Arc::new(Mutex::new(McpCapabilities::default())),
         };
 
         http.initialize().await?;
@@ -381,6 +448,7 @@ impl HttpMcpClient {
             .and_then(|v| v.as_str())
             .unwrap_or(PROTOCOL_VERSION)
             .to_string();
+        *self.capabilities.lock().await = parse_capabilities(&result);
         *self.negotiated_protocol.lock().await = negotiated.clone();
         tracing::info!(
             server = %self.server_name,
@@ -639,6 +707,10 @@ impl HttpMcpClient {
         })
     }
 
+    async fn capabilities(&self) -> McpCapabilities {
+        self.capabilities.lock().await.clone()
+    }
+
     async fn shutdown(&self) {}
 }
 
@@ -647,6 +719,113 @@ struct McpToolAdapter {
     server_name: String,
     descriptor: McpToolDescriptor,
     client: McpClient,
+}
+
+#[derive(Debug, Clone)]
+struct McpServerDirectory {
+    entries: Arc<HashMap<String, McpServerEntry>>,
+}
+
+#[derive(Debug, Clone)]
+struct McpServerEntry {
+    client: McpClient,
+    capabilities: McpCapabilities,
+}
+
+impl McpServerDirectory {
+    fn new(entries: HashMap<String, McpServerEntry>) -> Self {
+        Self {
+            entries: Arc::new(entries),
+        }
+    }
+
+    fn has_prompt_support(&self) -> bool {
+        self.entries
+            .values()
+            .any(|entry| entry.capabilities.prompts)
+    }
+
+    fn has_resource_support(&self) -> bool {
+        self.entries
+            .values()
+            .any(|entry| entry.capabilities.resources)
+    }
+
+    fn resolve_prompt_server(&self, requested: Option<&str>) -> Result<(String, McpClient)> {
+        self.resolve_capability(requested, |capabilities| capabilities.prompts, "prompts")
+    }
+
+    fn resolve_resource_server(&self, requested: Option<&str>) -> Result<(String, McpClient)> {
+        self.resolve_capability(
+            requested,
+            |capabilities| capabilities.resources,
+            "resources",
+        )
+    }
+
+    fn resolve_capability<F>(
+        &self,
+        requested: Option<&str>,
+        supports: F,
+        capability_name: &str,
+    ) -> Result<(String, McpClient)>
+    where
+        F: Fn(&McpCapabilities) -> bool,
+    {
+        if let Some(server) = requested {
+            return self
+                .entries
+                .get(server)
+                .filter(|entry| supports(&entry.capabilities))
+                .cloned()
+                .map(|entry| (server.to_string(), entry.client))
+                .ok_or_else(|| {
+                    HermesError::Mcp(format!(
+                        "MCP server '{server}' does not support {capability_name}. Available servers: {}",
+                        self.supporting_server_names(&supports).join(", ")
+                    ))
+                });
+        }
+
+        let supported = self.supporting_entries(&supports);
+        match supported.len() {
+            0 => Err(HermesError::Mcp(format!(
+                "no MCP servers support {capability_name}"
+            ))),
+            1 => {
+                let (name, entry) = supported.into_iter().next().expect("len checked");
+                Ok((name, entry.client))
+            }
+            _ => Err(HermesError::Mcp(format!(
+                "multiple MCP servers support {capability_name}; pass `server`. Available servers: {}",
+                self.supporting_server_names(&supports).join(", ")
+            ))),
+        }
+    }
+
+    fn supporting_entries<F>(&self, supports: &F) -> Vec<(String, McpServerEntry)>
+    where
+        F: Fn(&McpCapabilities) -> bool,
+    {
+        let mut entries = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| supports(&entry.capabilities))
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect::<Vec<_>>();
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        entries
+    }
+
+    fn supporting_server_names<F>(&self, supports: &F) -> Vec<String>
+    where
+        F: Fn(&McpCapabilities) -> bool,
+    {
+        self.supporting_entries(supports)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -683,35 +862,282 @@ impl Tool for McpToolAdapter {
     }
 }
 
+#[derive(Debug, Clone)]
+struct McpPromptListTool {
+    servers: McpServerDirectory,
+}
+
+#[derive(Debug, Clone)]
+struct McpPromptGetTool {
+    servers: McpServerDirectory,
+}
+
+#[derive(Debug, Clone)]
+struct McpResourceListTool {
+    servers: McpServerDirectory,
+}
+
+#[derive(Debug, Clone)]
+struct McpResourceTemplateListTool {
+    servers: McpServerDirectory,
+}
+
+#[derive(Debug, Clone)]
+struct McpResourceReadTool {
+    servers: McpServerDirectory,
+}
+
+#[async_trait]
+impl Tool for McpPromptListTool {
+    fn name(&self) -> &str {
+        "mcp_prompt_list"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "mcp_prompt_list".to_string(),
+            description: "List prompts exposed by a configured MCP server. Use when the user wants to inspect or choose available MCP prompts.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "server": {"type": "string", "description": "MCP server name. Required when multiple MCP servers are configured."},
+                    "cursor": {"type": "string", "description": "Pagination cursor from a previous result."}
+                }
+            }),
+        }
+    }
+
+    fn toolset(&self) -> &str {
+        "mcp"
+    }
+
+    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+        let (server_name, client) = self
+            .servers
+            .resolve_prompt_server(optional_string_arg(&args, "server"))?;
+        let result = client
+            .list_prompts(optional_string_arg(&args, "cursor"))
+            .await?;
+        pretty_json_result(server_name, result)
+    }
+}
+
+#[async_trait]
+impl Tool for McpPromptGetTool {
+    fn name(&self) -> &str {
+        "mcp_prompt_get"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "mcp_prompt_get".to_string(),
+            description: "Fetch one MCP prompt definition and its rendered messages. Use when the user explicitly wants to inspect or apply a specific MCP prompt.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "server": {"type": "string", "description": "MCP server name. Required when multiple MCP servers are configured."},
+                    "name": {"type": "string", "description": "Prompt name."},
+                    "arguments": {"type": "object", "description": "Optional prompt arguments."}
+                },
+                "required": ["name"]
+            }),
+        }
+    }
+
+    fn toolset(&self) -> &str {
+        "mcp"
+    }
+
+    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+        let (server_name, client) = self
+            .servers
+            .resolve_prompt_server(optional_string_arg(&args, "server"))?;
+        let name = required_string_arg(&args, "name")?;
+        let arguments = args.get("arguments").cloned();
+        let result = client.get_prompt(name, arguments).await?;
+        pretty_json_result(server_name, result)
+    }
+}
+
+#[async_trait]
+impl Tool for McpResourceListTool {
+    fn name(&self) -> &str {
+        "mcp_resource_list"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "mcp_resource_list".to_string(),
+            description: "List resources exposed by a configured MCP server.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "server": {"type": "string", "description": "MCP server name. Required when multiple MCP servers are configured."},
+                    "cursor": {"type": "string", "description": "Pagination cursor from a previous result."}
+                }
+            }),
+        }
+    }
+
+    fn toolset(&self) -> &str {
+        "mcp"
+    }
+
+    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+        let (server_name, client) = self
+            .servers
+            .resolve_resource_server(optional_string_arg(&args, "server"))?;
+        let result = client
+            .list_resources(optional_string_arg(&args, "cursor"))
+            .await?;
+        pretty_json_result(server_name, result)
+    }
+}
+
+#[async_trait]
+impl Tool for McpResourceTemplateListTool {
+    fn name(&self) -> &str {
+        "mcp_resource_template_list"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "mcp_resource_template_list".to_string(),
+            description: "List resource templates exposed by a configured MCP server.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "server": {"type": "string", "description": "MCP server name. Required when multiple MCP servers are configured."},
+                    "cursor": {"type": "string", "description": "Pagination cursor from a previous result."}
+                }
+            }),
+        }
+    }
+
+    fn toolset(&self) -> &str {
+        "mcp"
+    }
+
+    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+        let (server_name, client) = self
+            .servers
+            .resolve_resource_server(optional_string_arg(&args, "server"))?;
+        let result = client
+            .list_resource_templates(optional_string_arg(&args, "cursor"))
+            .await?;
+        pretty_json_result(server_name, result)
+    }
+}
+
+#[async_trait]
+impl Tool for McpResourceReadTool {
+    fn name(&self) -> &str {
+        "mcp_resource_read"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "mcp_resource_read".to_string(),
+            description: "Read one resource from a configured MCP server.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "server": {"type": "string", "description": "MCP server name. Required when multiple MCP servers are configured."},
+                    "uri": {"type": "string", "description": "Resource URI to read."}
+                },
+                "required": ["uri"]
+            }),
+        }
+    }
+
+    fn toolset(&self) -> &str {
+        "mcp"
+    }
+
+    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+        let (server_name, client) = self
+            .servers
+            .resolve_resource_server(optional_string_arg(&args, "server"))?;
+        let uri = required_string_arg(&args, "uri")?;
+        let result = client.read_resource(uri).await?;
+        pretty_json_result(server_name, result)
+    }
+}
+
 pub async fn discover_tools(configs: &[McpServerConfig]) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+    let mut servers: HashMap<String, McpServerEntry> = HashMap::new();
 
     for config in configs.iter().filter(|config| config.enabled) {
         match McpClient::connect(config).await {
-            Ok(client) => match client.list_tools().await {
-                Ok(descriptors) => {
-                    if descriptors.is_empty() {
-                        tracing::warn!(server = %config.name, "MCP server reported no tools; skipping");
-                        client.shutdown().await;
-                        continue;
+            Ok(client) => {
+                let capabilities = client.capabilities().await;
+                let mut keep_server = capabilities.prompts || capabilities.resources;
+                let mut registered_model_tools = false;
+
+                if capabilities.tools {
+                    match client.list_tools().await {
+                        Ok(descriptors) => {
+                            if descriptors.is_empty() {
+                                tracing::info!(server = %config.name, "MCP server reported no model-callable tools");
+                            }
+                            for descriptor in descriptors {
+                                tools.push(Box::new(McpToolAdapter {
+                                    server_name: config.name.clone(),
+                                    descriptor,
+                                    client: client.clone(),
+                                }) as Box<dyn Tool>);
+                            }
+                            registered_model_tools = true;
+                        }
+                        Err(err) => {
+                            tracing::warn!(server = %config.name, "failed to list MCP tools: {err}");
+                            keep_server = false;
+                        }
                     }
-                    for descriptor in descriptors {
-                        tools.push(Box::new(McpToolAdapter {
-                            server_name: config.name.clone(),
-                            descriptor,
-                            client: client.clone(),
-                        }) as Box<dyn Tool>);
-                    }
+                } else {
+                    tracing::info!(server = %config.name, "MCP server does not advertise model-callable tools");
                 }
-                Err(err) => {
-                    tracing::warn!(server = %config.name, "failed to list MCP tools: {err}");
+
+                if keep_server {
+                    servers.insert(
+                        config.name.clone(),
+                        McpServerEntry {
+                            client: client.clone(),
+                            capabilities,
+                        },
+                    );
+                }
+
+                if !keep_server && !registered_model_tools {
                     client.shutdown().await;
                 }
-            },
+            }
             Err(err) => {
                 tracing::warn!(server = %config.name, "failed to connect MCP server: {err}");
             }
         }
+    }
+
+    let server_directory = McpServerDirectory::new(servers);
+    if server_directory.has_prompt_support() {
+        tools.push(Box::new(McpPromptListTool {
+            servers: server_directory.clone(),
+        }));
+        tools.push(Box::new(McpPromptGetTool {
+            servers: server_directory.clone(),
+        }));
+    }
+    if server_directory.has_resource_support() {
+        tools.push(Box::new(McpResourceListTool {
+            servers: server_directory.clone(),
+        }));
+        tools.push(Box::new(McpResourceTemplateListTool {
+            servers: server_directory.clone(),
+        }));
+        tools.push(Box::new(McpResourceReadTool {
+            servers: server_directory,
+        }));
     }
 
     tools
@@ -825,6 +1251,37 @@ fn build_http_headers(config: &McpServerConfig) -> Result<HeaderMap> {
 fn random_request_id() -> u64 {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1_000_000);
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn parse_capabilities(result: &Value) -> McpCapabilities {
+    let capabilities = result
+        .get("capabilities")
+        .and_then(|value| value.as_object());
+
+    McpCapabilities {
+        tools: capabilities.is_some_and(|caps| caps.contains_key("tools")),
+        prompts: capabilities.is_some_and(|caps| caps.contains_key("prompts")),
+        resources: capabilities.is_some_and(|caps| caps.contains_key("resources")),
+    }
+}
+
+fn optional_string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key).and_then(|value| value.as_str())
+}
+
+fn required_string_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
+    optional_string_arg(args, key)
+        .ok_or_else(|| HermesError::Mcp(format!("missing required MCP parameter: {key}")))
+}
+
+fn pretty_json_result(server_name: String, result: Value) -> Result<ToolResult> {
+    let wrapped = json!({
+        "server": server_name,
+        "result": result,
+    });
+    let rendered = serde_json::to_string_pretty(&wrapped)
+        .map_err(|err| HermesError::Mcp(format!("failed to render MCP response JSON: {err}")))?;
+    Ok(ToolResult::ok(rendered))
 }
 
 fn spawn_stderr_logger(server_name: String, stderr: ChildStderr) {
@@ -1111,5 +1568,92 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event.as_deref(), Some("message"));
         assert_eq!(events[0].data, "{\"jsonrpc\":\"2.0\",\n\"id\":1}");
+    }
+
+    #[test]
+    fn server_directory_requires_server_when_multiple() {
+        let directory = McpServerDirectory::new(HashMap::from([
+            (
+                "docs".to_string(),
+                McpServerEntry {
+                    client: McpClient::Http(HttpMcpClient {
+                        server_name: "docs".to_string(),
+                        endpoint: reqwest::Url::parse("https://example.com/mcp").unwrap(),
+                        client: Client::new(),
+                        session_id: Arc::new(Mutex::new(None)),
+                        negotiated_protocol: Arc::new(Mutex::new(PROTOCOL_VERSION.to_string())),
+                        capabilities: Arc::new(Mutex::new(McpCapabilities::default())),
+                    }),
+                    capabilities: McpCapabilities {
+                        prompts: true,
+                        ..McpCapabilities::default()
+                    },
+                },
+            ),
+            (
+                "files".to_string(),
+                McpServerEntry {
+                    client: McpClient::Http(HttpMcpClient {
+                        server_name: "files".to_string(),
+                        endpoint: reqwest::Url::parse("https://example.org/mcp").unwrap(),
+                        client: Client::new(),
+                        session_id: Arc::new(Mutex::new(None)),
+                        negotiated_protocol: Arc::new(Mutex::new(PROTOCOL_VERSION.to_string())),
+                        capabilities: Arc::new(Mutex::new(McpCapabilities::default())),
+                    }),
+                    capabilities: McpCapabilities {
+                        prompts: true,
+                        ..McpCapabilities::default()
+                    },
+                },
+            ),
+        ]));
+
+        let err = directory
+            .resolve_prompt_server(None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("multiple MCP servers support prompts"));
+        assert!(err.contains("docs"));
+        assert!(err.contains("files"));
+    }
+
+    #[test]
+    fn server_directory_uses_only_server_without_explicit_name() {
+        let directory = McpServerDirectory::new(HashMap::from([(
+            "docs".to_string(),
+            McpServerEntry {
+                client: McpClient::Http(HttpMcpClient {
+                    server_name: "docs".to_string(),
+                    endpoint: reqwest::Url::parse("https://example.com/mcp").unwrap(),
+                    client: Client::new(),
+                    session_id: Arc::new(Mutex::new(None)),
+                    negotiated_protocol: Arc::new(Mutex::new(PROTOCOL_VERSION.to_string())),
+                    capabilities: Arc::new(Mutex::new(McpCapabilities::default())),
+                }),
+                capabilities: McpCapabilities {
+                    prompts: true,
+                    ..McpCapabilities::default()
+                },
+            },
+        )]));
+
+        let (name, _) = directory.resolve_prompt_server(None).unwrap();
+        assert_eq!(name, "docs");
+    }
+
+    #[test]
+    fn parse_capabilities_reads_prompt_and_resource_flags() {
+        let payload = json!({
+            "capabilities": {
+                "prompts": {"listChanged": true},
+                "resources": {"subscribe": true}
+            }
+        });
+
+        let parsed = parse_capabilities(&payload);
+        assert!(!parsed.tools);
+        assert!(parsed.prompts);
+        assert!(parsed.resources);
     }
 }
