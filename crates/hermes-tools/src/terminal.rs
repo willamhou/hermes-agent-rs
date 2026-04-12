@@ -194,6 +194,7 @@ impl Tool for TerminalTool {
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
             let req = ApprovalRequest {
                 tool_name: "terminal".to_string(),
+                memory_key: format!("terminal:{command}"),
                 command: command.clone(),
                 reason: reason.to_string(),
                 response_tx,

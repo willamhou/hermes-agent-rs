@@ -76,6 +76,7 @@ impl Tool for ExecuteCodeTool {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let approval = ApprovalRequest {
             tool_name: self.name().to_string(),
+            memory_key: format!("execute_code:{code}"),
             command: format!("python3 {}", temp_file.display()),
             reason: format!("python code execution requested\n{preview}"),
             response_tx,

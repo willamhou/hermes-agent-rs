@@ -99,6 +99,6 @@ cargo test --workspace
 
 ## Notes
 
-- Dangerous tool approvals are still auto-allowed in the current CLI until an interactive approval flow lands.
+- Dangerous tool actions now prompt for approval in the CLI, with `AllowSession` and `AllowAlways` memory stored under `$HERMES_HOME/approvals.json`.
 - `execute_code` is disabled by default and is only exposed when `HERMES_ENABLE_EXECUTE_CODE=1`.
 - Phase-by-phase design notes live under [`docs/specs`](docs/specs).

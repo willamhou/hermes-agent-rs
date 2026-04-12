@@ -125,6 +125,7 @@ pub trait SkillAccess: Send + Sync {
 
 pub struct ApprovalRequest {
     pub tool_name: String,
+    pub memory_key: String,
     pub command: String,
     pub reason: String,
     pub response_tx: tokio::sync::oneshot::Sender<ApprovalDecision>,

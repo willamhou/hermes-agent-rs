@@ -15,7 +15,7 @@ use hermes_core::{
     message::Message,
     session::{SessionMeta, SessionStore as _},
     stream::StreamDelta,
-    tool::{ApprovalDecision, ApprovalRequest},
+    tool::ApprovalRequest,
 };
 use hermes_memory::MemoryManager;
 use hermes_provider::create_provider;
@@ -25,6 +25,7 @@ use secrecy::SecretString;
 use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
+use crate::approval::{ApprovalManager, is_interactive_terminal};
 use crate::render::render_stream;
 
 /// Start the interactive REPL.
@@ -49,15 +50,9 @@ pub async fn run_repl() -> Result<()> {
     let working_dir = std::env::current_dir().context("failed to get current directory")?;
     let tool_config = Arc::new(config.tool_config(working_dir.clone()));
 
-    let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
-    tokio::spawn(async move {
-        while let Some(req) = approval_rx.recv().await {
-            // Phase 2: auto-allow all tool approvals. AllowSession/AllowAlways
-            // memory will be implemented when the interactive approval UI is added.
-            tracing::warn!(tool = %req.tool_name, command = %req.command, "auto-allowing tool (no approval UI)");
-            let _ = req.response_tx.send(ApprovalDecision::Allow);
-        }
-    });
+    let approval_manager = ApprovalManager::load_or_default();
+    let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(8);
+    approval_manager.spawn_handler(approval_rx, is_interactive_terminal());
 
     let system_prompt = "You are Hermes, a helpful AI assistant.".to_string();
 
@@ -165,15 +160,9 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
     let working_dir = PathBuf::from(&meta.cwd);
     let tool_config = Arc::new(config.tool_config(working_dir.clone()));
 
-    let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
-    tokio::spawn(async move {
-        while let Some(req) = approval_rx.recv().await {
-            // Phase 2: auto-allow all tool approvals. AllowSession/AllowAlways
-            // memory will be implemented when the interactive approval UI is added.
-            tracing::warn!(tool = %req.tool_name, "auto-allowing tool");
-            let _ = req.response_tx.send(ApprovalDecision::Allow);
-        }
-    });
+    let approval_manager = ApprovalManager::load_or_default();
+    let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(8);
+    approval_manager.spawn_handler(approval_rx, is_interactive_terminal());
 
     let memory_dir = hermes_home().join("memories");
     let memory = MemoryManager::new(memory_dir, None).context("failed to initialize memory")?;
@@ -214,50 +203,11 @@ async fn repl_loop(
     session_id: &str,
     _config: &AppConfig,
 ) -> Result<()> {
-    // ── Readline channel ─────────────────────────────────────────────────────
-    let (input_tx, mut input_rx) = mpsc::channel::<String>(32);
-
     let history_path = hermes_home().join("cli_history.txt");
-    let history_path_clone = history_path.clone();
-
-    tokio::task::spawn_blocking(move || {
-        let mut rl = match rustyline::DefaultEditor::new() {
-            Ok(editor) => editor,
-            Err(e) => {
-                eprintln!("Failed to initialise readline: {e}");
-                return;
-            }
-        };
-
-        // Load history (ignore errors — file may not exist yet).
-        let _ = rl.load_history(&history_path_clone);
-
-        loop {
-            match rl.readline("> ") {
-                Ok(line) => {
-                    let trimmed = line.trim().to_string();
-                    if !trimmed.is_empty() {
-                        rl.add_history_entry(&trimmed).ok();
-                    }
-                    if input_tx.blocking_send(trimmed).is_err() {
-                        // Receiver dropped; the async side has exited.
-                        break;
-                    }
-                }
-                Err(rustyline::error::ReadlineError::Interrupted)
-                | Err(rustyline::error::ReadlineError::Eof) => {
-                    let _ = input_tx.blocking_send("/quit".to_string());
-                    break;
-                }
-                Err(_) => break,
-            }
-        }
-
-        let _ = rl.save_history(&history_path_clone);
-    });
 
     // ── Main async loop ───────────────────────────────────────────────────────
-    while let Some(input) = input_rx.recv().await {
+    loop {
+        let input = read_repl_input(history_path.clone()).await?;
         match input.as_str() {
             "" => continue,
             "/quit" | "/exit" => {
@@ -311,10 +261,36 @@ async fn repl_loop(
         }
     }
 
-    // Ensure the home directory exists so subsequent runs can load readline history.
-    if let Some(parent) = history_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
     Ok(())
+}
+
+async fn read_repl_input(history_path: PathBuf) -> Result<String> {
+    tokio::task::spawn_blocking(move || -> Result<String> {
+        let mut rl =
+            rustyline::DefaultEditor::new().context("failed to initialise readline editor")?;
+
+        let _ = rl.load_history(&history_path);
+
+        let input = match rl.readline("> ") {
+            Ok(line) => {
+                let trimmed = line.trim().to_string();
+                if !trimmed.is_empty() {
+                    rl.add_history_entry(&trimmed).ok();
+                }
+                trimmed
+            }
+            Err(rustyline::error::ReadlineError::Interrupted)
+            | Err(rustyline::error::ReadlineError::Eof) => "/quit".to_string(),
+            Err(err) => return Err(anyhow::anyhow!("readline failed: {err}")),
+        };
+
+        if let Some(parent) = history_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = rl.save_history(&history_path);
+
+        Ok(input)
+    })
+    .await
+    .context("readline task failed")?
 }
