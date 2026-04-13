@@ -112,7 +112,7 @@ cargo test --workspace
 
 - Dangerous tool actions use `approval.policy: ask | yolo | deny`, with `AllowSession` and `AllowAlways` memory stored under `$HERMES_HOME/approvals.json`.
 - `mcp_servers` supports `transport: stdio | http` and auto-registers discovered MCP tools at CLI startup.
-- MCP bridge tools cover prompts and resources for all transports; resource subscribe/unsubscribe is currently exposed for `stdio` MCP servers, `mcp_resource_updates` surfaces recent resource change notifications, and both stdio plus supported HTTP SSE notification streams refresh the registry after `notifications/*/list_changed`.
+- MCP bridge tools cover prompts and resources for all transports; resource subscribe/unsubscribe is currently exposed for `stdio` MCP servers, `mcp_resource_updates` surfaces recent resource change notifications persisted under `$HERMES_HOME/mcp-resource-updates.json`, and both stdio plus supported HTTP SSE notification streams refresh the registry after `notifications/*/list_changed`.
 - `execute_code` is disabled by default and is only exposed when `HERMES_ENABLE_EXECUTE_CODE=1`.
 - Use the `openai-codex/<model>` or `openai-responses/<model>` prefix to target OpenAI's `/v1/responses` API.
 - Phase-by-phase design notes live under [`docs/specs`](docs/specs).
