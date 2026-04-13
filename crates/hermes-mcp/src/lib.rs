@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    io,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -11,6 +12,7 @@ use std::{
 
 use anyhow::Context as _;
 use async_trait::async_trait;
+use bytes::Bytes;
 use hermes_config::config::{McpServerConfig, McpTransportKind};
 use hermes_core::{
     error::{HermesError, Result},
@@ -29,12 +31,15 @@ use tokio::{
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     sync::{Mutex, oneshot, watch},
 };
+use tokio_stream::Stream;
+use tokio_util::io::StreamReader;
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
 
 const JSONRPC_VERSION: &str = "2.0";
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const HTTP_NOTIFICATION_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
 
@@ -61,6 +66,7 @@ struct StdioMcpClient {
     next_id: Arc<AtomicU64>,
     capabilities: Arc<Mutex<McpCapabilities>>,
     refresh_tx: watch::Sender<u64>,
+    resource_update_tx: watch::Sender<u64>,
 }
 
 impl StdioMcpClient {
@@ -110,6 +116,7 @@ impl StdioMcpClient {
             next_id: Arc::new(AtomicU64::new(1)),
             capabilities: Arc::new(Mutex::new(McpCapabilities::default())),
             refresh_tx: watch::channel(0).0,
+            resource_update_tx: watch::channel(0).0,
         };
 
         spawn_stdout_reader(
@@ -118,6 +125,7 @@ impl StdioMcpClient {
             Arc::clone(&client.stdin),
             Arc::clone(&client.pending),
             client.refresh_tx.clone(),
+            client.resource_update_tx.clone(),
         );
         spawn_stderr_logger(config.name.clone(), stderr);
 
@@ -411,6 +419,8 @@ struct HttpMcpClient {
     negotiated_protocol: Arc<Mutex<String>>,
     capabilities: Arc<Mutex<McpCapabilities>>,
     refresh_tx: watch::Sender<u64>,
+    resource_update_tx: watch::Sender<u64>,
+    shutdown_tx: watch::Sender<bool>,
 }
 
 impl HttpMcpClient {
@@ -450,10 +460,21 @@ impl HttpMcpClient {
             negotiated_protocol: Arc::new(Mutex::new(PROTOCOL_VERSION.to_string())),
             capabilities: Arc::new(Mutex::new(McpCapabilities::default())),
             refresh_tx: watch::channel(0).0,
+            resource_update_tx: watch::channel(0).0,
+            shutdown_tx: watch::channel(false).0,
         };
 
         http.initialize().await?;
+        http.start_notification_stream();
         Ok(http)
+    }
+
+    fn start_notification_stream(&self) {
+        let client = self.clone();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            client.run_notification_stream(&mut shutdown_rx).await;
+        });
     }
 
     async fn initialize(&self) -> Result<()> {
@@ -647,61 +668,207 @@ impl HttpMcpClient {
         }
     }
 
+    async fn consume_http_sse_stream<S>(
+        &self,
+        stream: S,
+        expected_id: Option<u64>,
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) -> Result<Option<Value>>
+    where
+        S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
+    {
+        let mut sse = AsyncSseStream::new(stream);
+
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_ok() && *shutdown_rx.borrow() {
+                        return Ok(None);
+                    }
+                }
+                event = sse.next_event() => {
+                    match event {
+                        Ok(Some(event)) => {
+                            let message: Value = serde_json::from_str(&event.data).map_err(|err| {
+                                HermesError::Mcp(format!(
+                                    "failed to parse SSE payload from MCP server '{}': {err}",
+                                    self.server_name
+                                ))
+                            })?;
+
+                            if let Some(response) = self
+                                .handle_http_inbound_message(message, expected_id)
+                                .await?
+                            {
+                                return Ok(Some(response));
+                            }
+                        }
+                        Ok(None) => return Ok(None),
+                        Err(err) => {
+                            return Err(HermesError::Mcp(format!(
+                                "failed to read SSE stream from MCP server '{}': {err}",
+                                self.server_name
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_http_inbound_message(
+        &self,
+        message: Value,
+        expected_id: Option<u64>,
+    ) -> Result<Option<Value>> {
+        match classify_inbound_message(message) {
+            InboundMessage::Response { id, message } if expected_id == Some(id) => {
+                Ok(Some(message))
+            }
+            InboundMessage::Response { .. } => Ok(None),
+            InboundMessage::Request { id, method } => {
+                if is_list_changed_notification(&method) {
+                    emit_refresh_signal(&self.refresh_tx);
+                    tracing::info!(server = %self.server_name, method = %method, "received MCP list_changed notification over HTTP");
+                    return Ok(None);
+                }
+                if is_resource_updated_notification(&method) {
+                    emit_resource_update_signal(&self.resource_update_tx);
+                    tracing::info!(server = %self.server_name, method = %method, "received MCP resource update notification over HTTP");
+                    return Ok(None);
+                }
+                tracing::warn!(server = %self.server_name, method = %method, "ignoring unsupported inbound MCP method over HTTP");
+                if let Some(id) = id {
+                    self.reject_http_inbound_request(id, &method).await;
+                }
+                Ok(None)
+            }
+            InboundMessage::Other => Ok(None),
+        }
+    }
+
+    async fn reject_http_inbound_request(&self, id: Value, method: &str) {
+        let payload = json!({
+            "jsonrpc": JSONRPC_VERSION,
+            "id": id,
+            "error": {
+                "code": -32601,
+                "message": format!("unsupported inbound MCP method '{method}'"),
+            }
+        });
+        if let Err(err) = self.post_payload(&payload).await {
+            tracing::warn!(server = %self.server_name, method = %method, "failed to reject unsupported inbound MCP method over HTTP: {err}");
+        }
+    }
+
+    async fn run_notification_stream(&self, shutdown_rx: &mut watch::Receiver<bool>) {
+        if self.session_id.lock().await.is_none() {
+            tracing::debug!(server = %self.server_name, "skipping HTTP notification stream because the server did not issue an MCP session id");
+            return;
+        }
+
+        loop {
+            if *shutdown_rx.borrow() {
+                return;
+            }
+
+            let response = match self.open_notification_stream().await {
+                Ok(response) => response,
+                Err(err) => {
+                    tracing::warn!(server = %self.server_name, "failed to open HTTP notification stream: {err}");
+                    if wait_for_notification_retry(shutdown_rx).await {
+                        return;
+                    }
+                    continue;
+                }
+            };
+
+            self.maybe_store_session_id(response.headers()).await;
+
+            match classify_notification_stream_response(&self.server_name, &response) {
+                NotificationStreamDisposition::Consume => {}
+                NotificationStreamDisposition::Unsupported(reason) => {
+                    tracing::info!(server = %self.server_name, "{reason}");
+                    return;
+                }
+                NotificationStreamDisposition::Retry(reason) => {
+                    tracing::warn!(server = %self.server_name, "{reason}");
+                    if wait_for_notification_retry(shutdown_rx).await {
+                        return;
+                    }
+                    continue;
+                }
+            }
+
+            match self
+                .consume_http_sse_stream(response.bytes_stream(), None, shutdown_rx)
+                .await
+            {
+                Ok(None) if *shutdown_rx.borrow() => return,
+                Ok(None) => {
+                    tracing::info!(server = %self.server_name, "HTTP MCP notification stream closed; reconnecting");
+                    if wait_for_notification_retry(shutdown_rx).await {
+                        return;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Err(err) => {
+                    tracing::warn!(server = %self.server_name, "HTTP MCP notification stream failed: {err}");
+                    if wait_for_notification_retry(shutdown_rx).await {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn open_notification_stream(&self) -> Result<reqwest::Response> {
+        let mut request = self
+            .client
+            .get(self.endpoint.clone())
+            .header(ACCEPT, "text/event-stream");
+
+        let negotiated = self.negotiated_protocol.lock().await.clone();
+        request = request.header(MCP_PROTOCOL_VERSION_HEADER, negotiated);
+
+        if let Some(session_id) = self.session_id.lock().await.clone() {
+            request = request.header(MCP_SESSION_ID_HEADER, session_id);
+        }
+
+        request.send().await.map_err(|err| {
+            if err.is_timeout() {
+                HermesError::Mcp(format!(
+                    "MCP server '{}' timed out opening notification stream after {}s",
+                    self.server_name,
+                    MCP_REQUEST_TIMEOUT.as_secs()
+                ))
+            } else {
+                HermesError::Mcp(format!(
+                    "failed opening HTTP notification stream to MCP server '{}': {err}",
+                    self.server_name
+                ))
+            }
+        })
+    }
+
     async fn extract_response_from_sse(
         &self,
         body: &str,
         expected_id: Option<u64>,
     ) -> Result<Value> {
-        let Some(expected_id) = expected_id else {
-            return Ok(json!({ "jsonrpc": JSONRPC_VERSION, "result": {} }));
-        };
-
-        for event in parse_sse_events(body) {
-            let message: Value = serde_json::from_str(&event.data).map_err(|err| {
+        let stream = tokio_stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::copy_from_slice(
+            body.as_bytes(),
+        ))]);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        self.consume_http_sse_stream(stream, expected_id, &mut shutdown_rx)
+            .await?
+            .ok_or_else(|| {
                 HermesError::Mcp(format!(
-                    "failed to parse SSE payload from MCP server '{}': {err}",
-                    self.server_name
+                    "MCP server '{}' SSE response ended without reply to request {}",
+                    self.server_name,
+                    expected_id.unwrap_or_default()
                 ))
-            })?;
-
-            match classify_inbound_message(message) {
-                InboundMessage::Response { id, message } if id == expected_id => {
-                    return Ok(message);
-                }
-                InboundMessage::Response { .. } => continue,
-                InboundMessage::Request { id, method } => {
-                    if is_list_changed_notification(&method) {
-                        emit_refresh_signal(&self.refresh_tx);
-                        tracing::info!(server = %self.server_name, method = %method, "received MCP list_changed notification over HTTP");
-                        continue;
-                    }
-                    if is_resource_updated_notification(&method) {
-                        tracing::info!(server = %self.server_name, method = %method, "received MCP resource update notification over HTTP");
-                        continue;
-                    }
-                    tracing::warn!(server = %self.server_name, method = %method, "ignoring unsupported inbound MCP method over HTTP");
-                    if let Some(id) = id {
-                        let payload = json!({
-                            "jsonrpc": JSONRPC_VERSION,
-                            "id": id,
-                            "error": {
-                                "code": -32601,
-                                "message": format!("unsupported inbound MCP method '{method}'"),
-                            }
-                        });
-                        if let Err(err) = self.post_payload(&payload).await {
-                            tracing::warn!(server = %self.server_name, method = %method, "failed to reject unsupported inbound MCP method over HTTP: {err}");
-                        }
-                    }
-                }
-                InboundMessage::Other => {}
-            }
-        }
-
-        Err(HermesError::Mcp(format!(
-            "MCP server '{}' SSE response ended without reply to request {expected_id}",
-            self.server_name
-        )))
+            })
     }
 
     async fn maybe_store_session_id(&self, headers: &HeaderMap) {
@@ -748,7 +915,9 @@ impl HttpMcpClient {
         self.capabilities.lock().await.clone()
     }
 
-    async fn shutdown(&self) {}
+    async fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
 
     fn subscribe_refresh(&self) -> watch::Receiver<u64> {
         self.refresh_tx.subscribe()
@@ -1372,6 +1541,7 @@ fn spawn_stdout_reader(
     stdin: Arc<Mutex<ChildStdin>>,
     pending: PendingMap,
     refresh_tx: watch::Sender<u64>,
+    resource_update_tx: watch::Sender<u64>,
 ) {
     tokio::spawn(async move {
         let mut reader = BufReader::new(stdout);
@@ -1390,6 +1560,7 @@ fn spawn_stdout_reader(
                             continue;
                         }
                         if is_resource_updated_notification(&method) {
+                            emit_resource_update_signal(&resource_update_tx);
                             tracing::info!(server = %server_name, method = %method, "received MCP resource update notification");
                             continue;
                         }
@@ -1491,6 +1662,11 @@ fn emit_refresh_signal(refresh_tx: &watch::Sender<u64>) {
     let _ = refresh_tx.send(next);
 }
 
+fn emit_resource_update_signal(resource_update_tx: &watch::Sender<u64>) {
+    let next = *resource_update_tx.borrow() + 1;
+    let _ = resource_update_tx.send(next);
+}
+
 fn parse_capabilities(result: &Value) -> McpCapabilities {
     let capabilities = result
         .get("capabilities")
@@ -1519,6 +1695,54 @@ fn is_list_changed_notification(method: &str) -> bool {
 
 fn is_resource_updated_notification(method: &str) -> bool {
     matches!(method, "notifications/resources/updated")
+}
+
+enum NotificationStreamDisposition {
+    Consume,
+    Retry(String),
+    Unsupported(String),
+}
+
+fn classify_notification_stream_response(
+    server_name: &str,
+    response: &reqwest::Response,
+) -> NotificationStreamDisposition {
+    use reqwest::StatusCode;
+
+    match response.status() {
+        StatusCode::OK => {}
+        StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_FOUND | StatusCode::NOT_IMPLEMENTED => {
+            return NotificationStreamDisposition::Unsupported(format!(
+                "HTTP MCP notification stream is not supported by '{server_name}' (status {})",
+                response.status()
+            ));
+        }
+        status => {
+            return NotificationStreamDisposition::Retry(format!(
+                "HTTP MCP notification stream request failed for '{server_name}' with status {status}"
+            ));
+        }
+    }
+
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !content_type.starts_with("text/event-stream") {
+        return NotificationStreamDisposition::Unsupported(format!(
+            "HTTP MCP notification stream for '{server_name}' returned unsupported content type '{content_type}'"
+        ));
+    }
+
+    NotificationStreamDisposition::Consume
+}
+
+async fn wait_for_notification_retry(shutdown_rx: &mut watch::Receiver<bool>) -> bool {
+    tokio::select! {
+        changed = shutdown_rx.changed() => changed.is_ok() && *shutdown_rx.borrow(),
+        _ = tokio::time::sleep(HTTP_NOTIFICATION_RECONNECT_DELAY) => false,
+    }
 }
 
 fn optional_string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -1603,6 +1827,86 @@ struct SseEvent {
     data: String,
 }
 
+struct MapSseStream<S>(S);
+
+impl<S> Stream for MapSseStream<S>
+where
+    S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
+{
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<io::Result<Bytes>>> {
+        use std::pin::Pin;
+
+        Pin::new(&mut self.0)
+            .poll_next(cx)
+            .map(|opt| opt.map(|res| res.map_err(io::Error::other)))
+    }
+}
+
+struct AsyncSseStream<S>
+where
+    S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
+{
+    reader: BufReader<StreamReader<MapSseStream<S>, Bytes>>,
+    current_event: Option<String>,
+    data_buf: Vec<String>,
+}
+
+impl<S> AsyncSseStream<S>
+where
+    S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
+{
+    fn new(stream: S) -> Self {
+        Self {
+            reader: BufReader::new(StreamReader::new(MapSseStream(stream))),
+            current_event: None,
+            data_buf: Vec::new(),
+        }
+    }
+
+    async fn next_event(&mut self) -> io::Result<Option<SseEvent>> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self.reader.read_line(&mut line).await?;
+            if n == 0 {
+                return Ok(self.flush_event());
+            }
+
+            let line = line.trim_end_matches(['\n', '\r']);
+            if line.is_empty() {
+                if let Some(event) = self.flush_event() {
+                    return Ok(Some(event));
+                }
+            } else if let Some(value) = line.strip_prefix("event:") {
+                self.current_event = Some(value.trim_start().to_owned());
+            } else if let Some(value) = line.strip_prefix("data:") {
+                let value = value.trim_start();
+                if value == "[DONE]" {
+                    return Ok(None);
+                }
+                self.data_buf.push(value.to_owned());
+            }
+        }
+    }
+
+    fn flush_event(&mut self) -> Option<SseEvent> {
+        if self.data_buf.is_empty() {
+            self.current_event = None;
+            return None;
+        }
+        let event = self.current_event.take();
+        let data = self.data_buf.join("\n");
+        self.data_buf.clear();
+        Some(SseEvent { event, data })
+    }
+}
+
+#[cfg(test)]
 fn parse_sse_events(raw: &str) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let mut current_event: Option<String> = None;
@@ -1744,6 +2048,8 @@ mod tests {
             negotiated_protocol: Arc::new(Mutex::new(PROTOCOL_VERSION.to_string())),
             capabilities: Arc::new(Mutex::new(McpCapabilities::default())),
             refresh_tx: watch::channel(0).0,
+            resource_update_tx: watch::channel(0).0,
+            shutdown_tx: watch::channel(false).0,
         }
     }
 
@@ -1862,6 +2168,7 @@ mod tests {
     #[tokio::test]
     async fn http_sse_resource_updated_notification_is_accepted() {
         let client = test_http_client("docs");
+        let mut resource_update_rx = client.resource_update_tx.subscribe();
         let body = concat!(
             "event: message\n",
             "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",\"params\":{\"uri\":\"file:///tmp/doc.txt\"}}\n\n",
@@ -1875,6 +2182,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(response["result"]["ok"], true);
+        resource_update_rx.changed().await.unwrap();
+        assert_eq!(*resource_update_rx.borrow(), 1);
+    }
+
+    #[tokio::test]
+    async fn async_http_sse_stream_handles_chunked_notifications() {
+        let client = test_http_client("docs");
+        let mut refresh_rx = client.subscribe_refresh();
+        let mut resource_update_rx = client.resource_update_tx.subscribe();
+        let mut shutdown_rx = client.shutdown_tx.subscribe();
+        let stream = tokio_stream::iter(vec![
+            Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/",
+            )),
+            Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                b"list_changed\",\"params\":{}}\n\n",
+            )),
+            Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",\"params\":{\"uri\":\"file:///tmp/doc.txt\"}}\n\n",
+            )),
+            Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n",
+            )),
+        ]);
+
+        let response = client
+            .consume_http_sse_stream(stream, Some(1), &mut shutdown_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(response["result"]["ok"], true);
+        refresh_rx.changed().await.unwrap();
+        resource_update_rx.changed().await.unwrap();
+        assert_eq!(*refresh_rx.borrow(), 1);
+        assert_eq!(*resource_update_rx.borrow(), 1);
     }
 
     #[test]
