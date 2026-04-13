@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
-    sync::{Mutex, oneshot, watch},
+    sync::{Mutex, broadcast, oneshot, watch},
 };
 use tokio_stream::Stream;
 use tokio_util::io::StreamReader;
@@ -42,6 +42,14 @@ const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const HTTP_NOTIFICATION_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
+const MAX_RESOURCE_UPDATES: usize = 100;
+
+#[derive(Debug, Clone)]
+struct ResourceUpdateEvent {
+    server_name: String,
+    uri: Option<String>,
+    payload: Value,
+}
 
 #[derive(Debug, Clone)]
 enum McpClient {
@@ -66,7 +74,7 @@ struct StdioMcpClient {
     next_id: Arc<AtomicU64>,
     capabilities: Arc<Mutex<McpCapabilities>>,
     refresh_tx: watch::Sender<u64>,
-    resource_update_tx: watch::Sender<u64>,
+    resource_update_tx: broadcast::Sender<ResourceUpdateEvent>,
 }
 
 impl StdioMcpClient {
@@ -116,7 +124,7 @@ impl StdioMcpClient {
             next_id: Arc::new(AtomicU64::new(1)),
             capabilities: Arc::new(Mutex::new(McpCapabilities::default())),
             refresh_tx: watch::channel(0).0,
-            resource_update_tx: watch::channel(0).0,
+            resource_update_tx: broadcast::channel(64).0,
         };
 
         spawn_stdout_reader(
@@ -310,6 +318,10 @@ impl StdioMcpClient {
     fn subscribe_refresh(&self) -> watch::Receiver<u64> {
         self.refresh_tx.subscribe()
     }
+
+    fn subscribe_resource_updates(&self) -> broadcast::Receiver<ResourceUpdateEvent> {
+        self.resource_update_tx.subscribe()
+    }
 }
 
 impl McpClient {
@@ -408,6 +420,13 @@ impl McpClient {
             Self::Http(client) => client.subscribe_refresh(),
         }
     }
+
+    fn subscribe_resource_updates(&self) -> broadcast::Receiver<ResourceUpdateEvent> {
+        match self {
+            Self::Stdio(client) => client.subscribe_resource_updates(),
+            Self::Http(client) => client.subscribe_resource_updates(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -419,7 +438,7 @@ struct HttpMcpClient {
     negotiated_protocol: Arc<Mutex<String>>,
     capabilities: Arc<Mutex<McpCapabilities>>,
     refresh_tx: watch::Sender<u64>,
-    resource_update_tx: watch::Sender<u64>,
+    resource_update_tx: broadcast::Sender<ResourceUpdateEvent>,
     shutdown_tx: watch::Sender<bool>,
 }
 
@@ -460,7 +479,7 @@ impl HttpMcpClient {
             negotiated_protocol: Arc::new(Mutex::new(PROTOCOL_VERSION.to_string())),
             capabilities: Arc::new(Mutex::new(McpCapabilities::default())),
             refresh_tx: watch::channel(0).0,
-            resource_update_tx: watch::channel(0).0,
+            resource_update_tx: broadcast::channel(64).0,
             shutdown_tx: watch::channel(false).0,
         };
 
@@ -721,6 +740,7 @@ impl HttpMcpClient {
         message: Value,
         expected_id: Option<u64>,
     ) -> Result<Option<Value>> {
+        let original = message.clone();
         match classify_inbound_message(message) {
             InboundMessage::Response { id, message } if expected_id == Some(id) => {
                 Ok(Some(message))
@@ -733,7 +753,10 @@ impl HttpMcpClient {
                     return Ok(None);
                 }
                 if is_resource_updated_notification(&method) {
-                    emit_resource_update_signal(&self.resource_update_tx);
+                    emit_resource_update_signal(
+                        &self.resource_update_tx,
+                        resource_update_event(&self.server_name, &original),
+                    );
                     tracing::info!(server = %self.server_name, method = %method, "received MCP resource update notification over HTTP");
                     return Ok(None);
                 }
@@ -922,6 +945,10 @@ impl HttpMcpClient {
     fn subscribe_refresh(&self) -> watch::Receiver<u64> {
         self.refresh_tx.subscribe()
     }
+
+    fn subscribe_resource_updates(&self) -> broadcast::Receiver<ResourceUpdateEvent> {
+        self.resource_update_tx.subscribe()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -947,6 +974,7 @@ struct McpServerEntry {
 struct McpRuntime {
     entries: HashMap<String, McpServerEntry>,
     tool_cache: Mutex<HashMap<String, Vec<McpToolDescriptor>>>,
+    resource_updates: Arc<Mutex<Vec<ResourceUpdateEvent>>>,
 }
 
 impl McpServerDirectory {
@@ -1127,6 +1155,11 @@ struct McpResourceSubscribeTool {
 #[derive(Debug, Clone)]
 struct McpResourceUnsubscribeTool {
     servers: McpServerDirectory,
+}
+
+#[derive(Debug, Clone)]
+struct McpResourceUpdatesTool {
+    updates: Arc<Mutex<Vec<ResourceUpdateEvent>>>,
 }
 
 #[async_trait]
@@ -1376,6 +1409,84 @@ impl Tool for McpResourceUnsubscribeTool {
     }
 }
 
+#[async_trait]
+impl Tool for McpResourceUpdatesTool {
+    fn name(&self) -> &str {
+        "mcp_resource_updates"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "mcp_resource_updates".to_string(),
+            description:
+                "List recent MCP resource update notifications received from configured servers."
+                    .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "server": {"type": "string", "description": "Optional MCP server name filter."},
+                    "limit": {"type": "integer", "description": "Maximum number of recent updates to return. Defaults to 20."},
+                    "clear": {"type": "boolean", "description": "When true, remove the returned updates from the in-memory buffer."}
+                }
+            }),
+        }
+    }
+
+    fn toolset(&self) -> &str {
+        "mcp"
+    }
+
+    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+        let server = optional_string_arg(&args, "server");
+        let limit = args
+            .get("limit")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(20)
+            .min(MAX_RESOURCE_UPDATES as u64) as usize;
+        let clear = args
+            .get("clear")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+
+        let mut updates = self.updates.lock().await;
+        let matching_indices = updates
+            .iter()
+            .enumerate()
+            .filter(|(_, update)| server.is_none_or(|requested| update.server_name == requested))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+
+        let selected_indices = matching_indices
+            .into_iter()
+            .rev()
+            .take(limit)
+            .collect::<Vec<_>>();
+
+        let selected = selected_indices
+            .iter()
+            .rev()
+            .map(|index| updates[*index].clone())
+            .collect::<Vec<_>>();
+
+        if clear {
+            for index in selected_indices.into_iter().rev() {
+                updates.remove(index);
+            }
+        }
+
+        let count = selected.len();
+        let result = json!({
+            "updates": selected.into_iter().map(resource_update_to_json).collect::<Vec<_>>(),
+            "count": count,
+        });
+        Ok(ToolResult::ok(
+            serde_json::to_string_pretty(&result).map_err(|err| {
+                HermesError::Mcp(format!("failed to render resource updates JSON: {err}"))
+            })?,
+        ))
+    }
+}
+
 impl McpRuntime {
     async fn connect(configs: &[McpServerConfig]) -> Self {
         let mut entries: HashMap<String, McpServerEntry> = HashMap::new();
@@ -1428,6 +1539,7 @@ impl McpRuntime {
         Self {
             entries,
             tool_cache: Mutex::new(tool_cache),
+            resource_updates: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1471,6 +1583,15 @@ impl McpRuntime {
             }));
             tools.push(Box::new(McpResourceUnsubscribeTool {
                 servers: server_directory,
+            }));
+        }
+        if self
+            .entries
+            .values()
+            .any(|entry| entry.capabilities.resources)
+        {
+            tools.push(Box::new(McpResourceUpdatesTool {
+                updates: Arc::clone(&self.resource_updates),
             }));
         }
 
@@ -1521,13 +1642,45 @@ impl McpRuntime {
             });
         }
     }
+
+    fn spawn_resource_update_tasks(self: Arc<Self>) {
+        for entry in self.entries.values() {
+            if !entry.capabilities.resources {
+                continue;
+            }
+
+            let runtime = Arc::clone(&self);
+            let mut updates_rx = entry.client.subscribe_resource_updates();
+            tokio::spawn(async move {
+                loop {
+                    match updates_rx.recv().await {
+                        Ok(update) => runtime.record_resource_update(update).await,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "lagged while receiving MCP resource updates");
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    async fn record_resource_update(&self, update: ResourceUpdateEvent) {
+        let mut updates = self.resource_updates.lock().await;
+        updates.push(update);
+        if updates.len() > MAX_RESOURCE_UPDATES {
+            let overflow = updates.len() - MAX_RESOURCE_UPDATES;
+            updates.drain(0..overflow);
+        }
+    }
 }
 
 pub async fn populate_registry(registry: Arc<ToolRegistry>, configs: &[McpServerConfig]) {
     let runtime = Arc::new(McpRuntime::connect(configs).await);
     let mcp_tools = runtime.build_mcp_tools().await;
     registry.replace_toolset("mcp", mcp_tools);
-    runtime.spawn_refresh_tasks(registry);
+    Arc::clone(&runtime).spawn_refresh_tasks(registry);
+    runtime.spawn_resource_update_tasks();
 }
 
 pub async fn discover_tools(configs: &[McpServerConfig]) -> Vec<Box<dyn Tool>> {
@@ -1541,50 +1694,56 @@ fn spawn_stdout_reader(
     stdin: Arc<Mutex<ChildStdin>>,
     pending: PendingMap,
     refresh_tx: watch::Sender<u64>,
-    resource_update_tx: watch::Sender<u64>,
+    resource_update_tx: broadcast::Sender<ResourceUpdateEvent>,
 ) {
     tokio::spawn(async move {
         let mut reader = BufReader::new(stdout);
         loop {
             match read_stdio_message(&mut reader).await {
-                Ok(Some(message)) => match classify_inbound_message(message) {
-                    InboundMessage::Response { id, message } => {
-                        if let Some(tx) = pending.lock().await.remove(&id) {
-                            let _ = tx.send(message);
-                        }
-                    }
-                    InboundMessage::Request { id, method } => {
-                        if is_list_changed_notification(&method) {
-                            emit_refresh_signal(&refresh_tx);
-                            tracing::info!(server = %server_name, method = %method, "received MCP list_changed notification");
-                            continue;
-                        }
-                        if is_resource_updated_notification(&method) {
-                            emit_resource_update_signal(&resource_update_tx);
-                            tracing::info!(server = %server_name, method = %method, "received MCP resource update notification");
-                            continue;
-                        }
-                        tracing::warn!(server = %server_name, method = %method, "ignoring unsupported inbound MCP method");
-                        if let Some(id) = id {
-                            let payload = json!({
-                                "jsonrpc": JSONRPC_VERSION,
-                                "id": id,
-                                "error": {
-                                    "code": -32601,
-                                    "message": format!("unsupported inbound MCP method '{method}'"),
-                                }
-                            });
-                            if let Err(err) =
-                                write_framed_message(&server_name, &stdin, &payload).await
-                            {
-                                tracing::warn!(server = %server_name, method = %method, "failed to reject unsupported inbound MCP method: {err}");
+                Ok(Some(message)) => {
+                    let original = message.clone();
+                    match classify_inbound_message(message) {
+                        InboundMessage::Response { id, message } => {
+                            if let Some(tx) = pending.lock().await.remove(&id) {
+                                let _ = tx.send(message);
                             }
                         }
+                        InboundMessage::Request { id, method } => {
+                            if is_list_changed_notification(&method) {
+                                emit_refresh_signal(&refresh_tx);
+                                tracing::info!(server = %server_name, method = %method, "received MCP list_changed notification");
+                                continue;
+                            }
+                            if is_resource_updated_notification(&method) {
+                                emit_resource_update_signal(
+                                    &resource_update_tx,
+                                    resource_update_event(&server_name, &original),
+                                );
+                                tracing::info!(server = %server_name, method = %method, "received MCP resource update notification");
+                                continue;
+                            }
+                            tracing::warn!(server = %server_name, method = %method, "ignoring unsupported inbound MCP method");
+                            if let Some(id) = id {
+                                let payload = json!({
+                                    "jsonrpc": JSONRPC_VERSION,
+                                    "id": id,
+                                    "error": {
+                                        "code": -32601,
+                                        "message": format!("unsupported inbound MCP method '{method}'"),
+                                    }
+                                });
+                                if let Err(err) =
+                                    write_framed_message(&server_name, &stdin, &payload).await
+                                {
+                                    tracing::warn!(server = %server_name, method = %method, "failed to reject unsupported inbound MCP method: {err}");
+                                }
+                            }
+                        }
+                        InboundMessage::Other => {
+                            tracing::debug!(server = %server_name, "ignoring non-response MCP message");
+                        }
                     }
-                    InboundMessage::Other => {
-                        tracing::debug!(server = %server_name, "ignoring non-response MCP message");
-                    }
-                },
+                }
                 Ok(None) => {
                     tracing::info!(server = %server_name, "MCP stdout closed");
                     pending.lock().await.clear();
@@ -1662,9 +1821,13 @@ fn emit_refresh_signal(refresh_tx: &watch::Sender<u64>) {
     let _ = refresh_tx.send(next);
 }
 
-fn emit_resource_update_signal(resource_update_tx: &watch::Sender<u64>) {
-    let next = *resource_update_tx.borrow() + 1;
-    let _ = resource_update_tx.send(next);
+fn emit_resource_update_signal(
+    resource_update_tx: &broadcast::Sender<ResourceUpdateEvent>,
+    update: Option<ResourceUpdateEvent>,
+) {
+    if let Some(update) = update {
+        let _ = resource_update_tx.send(update);
+    }
 }
 
 fn parse_capabilities(result: &Value) -> McpCapabilities {
@@ -1695,6 +1858,36 @@ fn is_list_changed_notification(method: &str) -> bool {
 
 fn is_resource_updated_notification(method: &str) -> bool {
     matches!(method, "notifications/resources/updated")
+}
+
+fn resource_update_event(server_name: &str, message: &Value) -> Option<ResourceUpdateEvent> {
+    if !matches!(
+        message.get("method").and_then(|value| value.as_str()),
+        Some("notifications/resources/updated")
+    ) {
+        return None;
+    }
+
+    let payload = message.get("params").cloned().unwrap_or_else(|| json!({}));
+    let uri = payload
+        .get("uri")
+        .or_else(|| payload.get("resource").and_then(|value| value.get("uri")))
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+
+    Some(ResourceUpdateEvent {
+        server_name: server_name.to_string(),
+        uri,
+        payload,
+    })
+}
+
+fn resource_update_to_json(update: ResourceUpdateEvent) -> Value {
+    json!({
+        "server": update.server_name,
+        "uri": update.uri,
+        "params": update.payload,
+    })
 }
 
 enum NotificationStreamDisposition {
@@ -2048,7 +2241,7 @@ mod tests {
             negotiated_protocol: Arc::new(Mutex::new(PROTOCOL_VERSION.to_string())),
             capabilities: Arc::new(Mutex::new(McpCapabilities::default())),
             refresh_tx: watch::channel(0).0,
-            resource_update_tx: watch::channel(0).0,
+            resource_update_tx: broadcast::channel(64).0,
             shutdown_tx: watch::channel(false).0,
         }
     }
@@ -2182,8 +2375,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response["result"]["ok"], true);
-        resource_update_rx.changed().await.unwrap();
-        assert_eq!(*resource_update_rx.borrow(), 1);
+        let update = resource_update_rx.recv().await.unwrap();
+        assert_eq!(update.server_name, "docs");
+        assert_eq!(update.uri.as_deref(), Some("file:///tmp/doc.txt"));
     }
 
     #[tokio::test]
@@ -2215,9 +2409,23 @@ mod tests {
 
         assert_eq!(response["result"]["ok"], true);
         refresh_rx.changed().await.unwrap();
-        resource_update_rx.changed().await.unwrap();
+        let update = resource_update_rx.recv().await.unwrap();
         assert_eq!(*refresh_rx.borrow(), 1);
-        assert_eq!(*resource_update_rx.borrow(), 1);
+        assert_eq!(update.uri.as_deref(), Some("file:///tmp/doc.txt"));
+    }
+
+    #[test]
+    fn resource_update_event_extracts_uri_from_params() {
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/resources/updated",
+            "params": {"uri": "file:///tmp/doc.txt"}
+        });
+
+        let update = resource_update_event("docs", &message).unwrap();
+
+        assert_eq!(update.server_name, "docs");
+        assert_eq!(update.uri.as_deref(), Some("file:///tmp/doc.txt"));
     }
 
     #[test]
