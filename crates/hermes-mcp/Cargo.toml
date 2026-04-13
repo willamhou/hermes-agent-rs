@@ -17,3 +17,6 @@ anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
+bytes.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
