@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     io,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -13,7 +14,10 @@ use std::{
 use anyhow::Context as _;
 use async_trait::async_trait;
 use bytes::Bytes;
-use hermes_config::config::{McpServerConfig, McpTransportKind};
+use hermes_config::{
+    config::{McpServerConfig, McpTransportKind},
+    hermes_home,
+};
 use hermes_core::{
     error::{HermesError, Result},
     message::ToolResult,
@@ -24,7 +28,7 @@ use reqwest::{
     Client,
     header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
@@ -44,7 +48,7 @@ const MCP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
 const MAX_RESOURCE_UPDATES: usize = 100;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct ResourceUpdateEvent {
     server_name: String,
     uri: Option<String>,
@@ -975,6 +979,7 @@ struct McpRuntime {
     entries: HashMap<String, McpServerEntry>,
     tool_cache: Mutex<HashMap<String, Vec<McpToolDescriptor>>>,
     resource_updates: Arc<Mutex<Vec<ResourceUpdateEvent>>>,
+    resource_updates_path: PathBuf,
 }
 
 impl McpServerDirectory {
@@ -1160,6 +1165,7 @@ struct McpResourceUnsubscribeTool {
 #[derive(Debug, Clone)]
 struct McpResourceUpdatesTool {
     updates: Arc<Mutex<Vec<ResourceUpdateEvent>>>,
+    updates_path: PathBuf,
 }
 
 #[async_trait]
@@ -1449,6 +1455,7 @@ impl Tool for McpResourceUpdatesTool {
             .unwrap_or(false);
 
         let mut updates = self.updates.lock().await;
+        let total_before = updates.len();
         let matching_indices = updates
             .iter()
             .enumerate()
@@ -1472,12 +1479,14 @@ impl Tool for McpResourceUpdatesTool {
             for index in selected_indices.into_iter().rev() {
                 updates.remove(index);
             }
+            persist_resource_updates(&self.updates_path, &updates).await?;
         }
 
         let count = selected.len();
         let result = json!({
             "updates": selected.into_iter().map(resource_update_to_json).collect::<Vec<_>>(),
             "count": count,
+            "total_buffered": total_before,
         });
         Ok(ToolResult::ok(
             serde_json::to_string_pretty(&result).map_err(|err| {
@@ -1491,6 +1500,7 @@ impl McpRuntime {
     async fn connect(configs: &[McpServerConfig]) -> Self {
         let mut entries: HashMap<String, McpServerEntry> = HashMap::new();
         let mut tool_cache: HashMap<String, Vec<McpToolDescriptor>> = HashMap::new();
+        let resource_updates_path = hermes_home().join("mcp-resource-updates.json");
 
         for config in configs.iter().filter(|config| config.enabled) {
             match McpClient::connect(config).await {
@@ -1539,7 +1549,12 @@ impl McpRuntime {
         Self {
             entries,
             tool_cache: Mutex::new(tool_cache),
-            resource_updates: Arc::new(Mutex::new(Vec::new())),
+            resource_updates: Arc::new(Mutex::new(
+                load_resource_updates(&resource_updates_path)
+                    .await
+                    .unwrap_or_default(),
+            )),
+            resource_updates_path,
         }
     }
 
@@ -1592,6 +1607,7 @@ impl McpRuntime {
         {
             tools.push(Box::new(McpResourceUpdatesTool {
                 updates: Arc::clone(&self.resource_updates),
+                updates_path: self.resource_updates_path.clone(),
             }));
         }
 
@@ -1671,6 +1687,12 @@ impl McpRuntime {
         if updates.len() > MAX_RESOURCE_UPDATES {
             let overflow = updates.len() - MAX_RESOURCE_UPDATES;
             updates.drain(0..overflow);
+        }
+        if let Err(err) = persist_resource_updates(&self.resource_updates_path, &updates).await {
+            tracing::warn!(
+                path = %self.resource_updates_path.display(),
+                "failed to persist MCP resource updates: {err}"
+            );
         }
     }
 }
@@ -1887,6 +1909,51 @@ fn resource_update_to_json(update: ResourceUpdateEvent) -> Value {
         "server": update.server_name,
         "uri": update.uri,
         "params": update.payload,
+    })
+}
+
+async fn load_resource_updates(path: &PathBuf) -> Result<Vec<ResourceUpdateEvent>> {
+    let contents = match tokio::fs::read_to_string(path).await {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(HermesError::Mcp(format!(
+                "failed to read MCP resource updates from '{}': {err}",
+                path.display()
+            )));
+        }
+    };
+
+    serde_json::from_str(&contents).map_err(|err| {
+        HermesError::Mcp(format!(
+            "failed to parse MCP resource updates from '{}': {err}",
+            path.display()
+        ))
+    })
+}
+
+async fn persist_resource_updates(path: &PathBuf, updates: &[ResourceUpdateEvent]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|err| {
+            HermesError::Mcp(format!(
+                "failed to create MCP resource update directory '{}': {err}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let encoded = serde_json::to_vec_pretty(updates).map_err(|err| {
+        HermesError::Mcp(format!(
+            "failed to serialize MCP resource updates for '{}': {err}",
+            path.display()
+        ))
+    })?;
+
+    tokio::fs::write(path, encoded).await.map_err(|err| {
+        HermesError::Mcp(format!(
+            "failed to write MCP resource updates to '{}': {err}",
+            path.display()
+        ))
     })
 }
 
@@ -2231,6 +2298,7 @@ struct ToolCallResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     fn test_http_client(server_name: &str) -> HttpMcpClient {
         HttpMcpClient {
@@ -2426,6 +2494,22 @@ mod tests {
 
         assert_eq!(update.server_name, "docs");
         assert_eq!(update.uri.as_deref(), Some("file:///tmp/doc.txt"));
+    }
+
+    #[tokio::test]
+    async fn persist_and_load_resource_updates_roundtrip() {
+        let tempdir = TempDir::new().unwrap();
+        let path = tempdir.path().join("mcp-resource-updates.json");
+        let updates = vec![ResourceUpdateEvent {
+            server_name: "docs".to_string(),
+            uri: Some("file:///tmp/doc.txt".to_string()),
+            payload: json!({"uri": "file:///tmp/doc.txt"}),
+        }];
+
+        persist_resource_updates(&path, &updates).await.unwrap();
+        let loaded = load_resource_updates(&path).await.unwrap();
+
+        assert_eq!(loaded, updates);
     }
 
     #[test]
