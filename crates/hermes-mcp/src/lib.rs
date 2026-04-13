@@ -49,6 +49,7 @@ struct McpCapabilities {
     tools: bool,
     prompts: bool,
     resources: bool,
+    resource_subscribe: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -376,6 +377,16 @@ impl McpClient {
             .await
     }
 
+    async fn subscribe_resource(&self, uri: &str) -> Result<Value> {
+        self.call_method("resources/subscribe", json!({ "uri": uri }))
+            .await
+    }
+
+    async fn unsubscribe_resource(&self, uri: &str) -> Result<Value> {
+        self.call_method("resources/unsubscribe", json!({ "uri": uri }))
+            .await
+    }
+
     async fn shutdown(&self) {
         match self {
             Self::Stdio(client) => client.shutdown().await,
@@ -664,6 +675,10 @@ impl HttpMcpClient {
                         tracing::info!(server = %self.server_name, method = %method, "received MCP list_changed notification over HTTP");
                         continue;
                     }
+                    if is_resource_updated_notification(&method) {
+                        tracing::info!(server = %self.server_name, method = %method, "received MCP resource update notification over HTTP");
+                        continue;
+                    }
                     tracing::warn!(server = %self.server_name, method = %method, "ignoring unsupported inbound MCP method over HTTP");
                     if let Some(id) = id {
                         let payload = json!({
@@ -783,6 +798,12 @@ impl McpServerDirectory {
             .any(|entry| entry.capabilities.resources)
     }
 
+    fn has_resource_subscription_support(&self) -> bool {
+        self.entries
+            .values()
+            .any(|entry| entry.capabilities.resource_subscribe)
+    }
+
     fn resolve_prompt_server(&self, requested: Option<&str>) -> Result<(String, McpClient)> {
         self.resolve_capability(requested, |capabilities| capabilities.prompts, "prompts")
     }
@@ -792,6 +813,17 @@ impl McpServerDirectory {
             requested,
             |capabilities| capabilities.resources,
             "resources",
+        )
+    }
+
+    fn resolve_resource_subscription_server(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<(String, McpClient)> {
+        self.resolve_capability(
+            requested,
+            |capabilities| capabilities.resource_subscribe,
+            "resource subscriptions",
         )
     }
 
@@ -916,6 +948,16 @@ struct McpResourceTemplateListTool {
 
 #[derive(Debug, Clone)]
 struct McpResourceReadTool {
+    servers: McpServerDirectory,
+}
+
+#[derive(Debug, Clone)]
+struct McpResourceSubscribeTool {
+    servers: McpServerDirectory,
+}
+
+#[derive(Debug, Clone)]
+struct McpResourceUnsubscribeTool {
     servers: McpServerDirectory,
 }
 
@@ -1096,6 +1138,76 @@ impl Tool for McpResourceReadTool {
     }
 }
 
+#[async_trait]
+impl Tool for McpResourceSubscribeTool {
+    fn name(&self) -> &str {
+        "mcp_resource_subscribe"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "mcp_resource_subscribe".to_string(),
+            description: "Subscribe to update notifications for one MCP resource.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "server": {"type": "string", "description": "MCP server name. Required when multiple MCP servers are configured."},
+                    "uri": {"type": "string", "description": "Resource URI to subscribe to."}
+                },
+                "required": ["uri"]
+            }),
+        }
+    }
+
+    fn toolset(&self) -> &str {
+        "mcp"
+    }
+
+    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+        let (server_name, client) = self
+            .servers
+            .resolve_resource_subscription_server(optional_string_arg(&args, "server"))?;
+        let uri = required_string_arg(&args, "uri")?;
+        let result = client.subscribe_resource(uri).await?;
+        pretty_json_result(server_name, result)
+    }
+}
+
+#[async_trait]
+impl Tool for McpResourceUnsubscribeTool {
+    fn name(&self) -> &str {
+        "mcp_resource_unsubscribe"
+    }
+
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "mcp_resource_unsubscribe".to_string(),
+            description: "Stop update notifications for one MCP resource.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "server": {"type": "string", "description": "MCP server name. Required when multiple MCP servers are configured."},
+                    "uri": {"type": "string", "description": "Resource URI to unsubscribe from."}
+                },
+                "required": ["uri"]
+            }),
+        }
+    }
+
+    fn toolset(&self) -> &str {
+        "mcp"
+    }
+
+    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+        let (server_name, client) = self
+            .servers
+            .resolve_resource_subscription_server(optional_string_arg(&args, "server"))?;
+        let uri = required_string_arg(&args, "uri")?;
+        let result = client.unsubscribe_resource(uri).await?;
+        pretty_json_result(server_name, result)
+    }
+}
+
 impl McpRuntime {
     async fn connect(configs: &[McpServerConfig]) -> Self {
         let mut entries: HashMap<String, McpServerEntry> = HashMap::new();
@@ -1181,6 +1293,14 @@ impl McpRuntime {
                 servers: server_directory.clone(),
             }));
             tools.push(Box::new(McpResourceReadTool {
+                servers: server_directory.clone(),
+            }));
+        }
+        if server_directory.has_resource_subscription_support() {
+            tools.push(Box::new(McpResourceSubscribeTool {
+                servers: server_directory.clone(),
+            }));
+            tools.push(Box::new(McpResourceUnsubscribeTool {
                 servers: server_directory,
             }));
         }
@@ -1267,6 +1387,10 @@ fn spawn_stdout_reader(
                         if is_list_changed_notification(&method) {
                             emit_refresh_signal(&refresh_tx);
                             tracing::info!(server = %server_name, method = %method, "received MCP list_changed notification");
+                            continue;
+                        }
+                        if is_resource_updated_notification(&method) {
+                            tracing::info!(server = %server_name, method = %method, "received MCP resource update notification");
                             continue;
                         }
                         tracing::warn!(server = %server_name, method = %method, "ignoring unsupported inbound MCP method");
@@ -1376,6 +1500,11 @@ fn parse_capabilities(result: &Value) -> McpCapabilities {
         tools: capabilities.is_some_and(|caps| caps.contains_key("tools")),
         prompts: capabilities.is_some_and(|caps| caps.contains_key("prompts")),
         resources: capabilities.is_some_and(|caps| caps.contains_key("resources")),
+        resource_subscribe: capabilities
+            .and_then(|caps| caps.get("resources"))
+            .and_then(|value| value.get("subscribe"))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
     }
 }
 
@@ -1386,6 +1515,10 @@ fn is_list_changed_notification(method: &str) -> bool {
             | "notifications/prompts/list_changed"
             | "notifications/resources/list_changed"
     )
+}
+
+fn is_resource_updated_notification(method: &str) -> bool {
+    matches!(method, "notifications/resources/updated")
 }
 
 fn optional_string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -1726,6 +1859,24 @@ mod tests {
         assert_eq!(*refresh_rx.borrow(), 1);
     }
 
+    #[tokio::test]
+    async fn http_sse_resource_updated_notification_is_accepted() {
+        let client = test_http_client("docs");
+        let body = concat!(
+            "event: message\n",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",\"params\":{\"uri\":\"file:///tmp/doc.txt\"}}\n\n",
+            "event: message\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n",
+        );
+
+        let response = client
+            .extract_response_from_sse(body, Some(1))
+            .await
+            .unwrap();
+
+        assert_eq!(response["result"]["ok"], true);
+    }
+
     #[test]
     fn server_directory_requires_server_when_multiple() {
         let directory = McpServerDirectory::new(HashMap::from([
@@ -1778,6 +1929,26 @@ mod tests {
     }
 
     #[test]
+    fn server_directory_resolves_resource_subscription_support() {
+        let directory = McpServerDirectory::new(HashMap::from([(
+            "docs".to_string(),
+            McpServerEntry {
+                client: McpClient::Http(test_http_client("docs")),
+                capabilities: McpCapabilities {
+                    resources: true,
+                    resource_subscribe: true,
+                    ..McpCapabilities::default()
+                },
+            },
+        )]));
+
+        let (name, _) = directory
+            .resolve_resource_subscription_server(None)
+            .unwrap();
+        assert_eq!(name, "docs");
+    }
+
+    #[test]
     fn parse_capabilities_reads_prompt_and_resource_flags() {
         let payload = json!({
             "capabilities": {
@@ -1790,5 +1961,6 @@ mod tests {
         assert!(!parsed.tools);
         assert!(parsed.prompts);
         assert!(parsed.resources);
+        assert!(parsed.resource_subscribe);
     }
 }
