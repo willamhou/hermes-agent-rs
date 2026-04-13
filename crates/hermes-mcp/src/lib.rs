@@ -770,6 +770,7 @@ struct McpServerDirectory {
 #[derive(Debug, Clone)]
 struct McpServerEntry {
     client: McpClient,
+    transport: McpTransportKind,
     capabilities: McpCapabilities,
 }
 
@@ -799,21 +800,17 @@ impl McpServerDirectory {
     }
 
     fn has_resource_subscription_support(&self) -> bool {
-        self.entries
-            .values()
-            .any(|entry| entry.capabilities.resource_subscribe)
+        self.entries.values().any(|entry| {
+            entry.capabilities.resource_subscribe && entry.transport == McpTransportKind::Stdio
+        })
     }
 
     fn resolve_prompt_server(&self, requested: Option<&str>) -> Result<(String, McpClient)> {
-        self.resolve_capability(requested, |capabilities| capabilities.prompts, "prompts")
+        self.resolve_capability(requested, |entry| entry.capabilities.prompts, "prompts")
     }
 
     fn resolve_resource_server(&self, requested: Option<&str>) -> Result<(String, McpClient)> {
-        self.resolve_capability(
-            requested,
-            |capabilities| capabilities.resources,
-            "resources",
-        )
+        self.resolve_capability(requested, |entry| entry.capabilities.resources, "resources")
     }
 
     fn resolve_resource_subscription_server(
@@ -822,7 +819,9 @@ impl McpServerDirectory {
     ) -> Result<(String, McpClient)> {
         self.resolve_capability(
             requested,
-            |capabilities| capabilities.resource_subscribe,
+            |entry| {
+                entry.capabilities.resource_subscribe && entry.transport == McpTransportKind::Stdio
+            },
             "resource subscriptions",
         )
     }
@@ -834,13 +833,13 @@ impl McpServerDirectory {
         capability_name: &str,
     ) -> Result<(String, McpClient)>
     where
-        F: Fn(&McpCapabilities) -> bool,
+        F: Fn(&McpServerEntry) -> bool,
     {
         if let Some(server) = requested {
             return self
                 .entries
                 .get(server)
-                .filter(|entry| supports(&entry.capabilities))
+                .filter(|entry| supports(entry))
                 .cloned()
                 .map(|entry| (server.to_string(), entry.client))
                 .ok_or_else(|| {
@@ -869,12 +868,12 @@ impl McpServerDirectory {
 
     fn supporting_entries<F>(&self, supports: &F) -> Vec<(String, McpServerEntry)>
     where
-        F: Fn(&McpCapabilities) -> bool,
+        F: Fn(&McpServerEntry) -> bool,
     {
         let mut entries = self
             .entries
             .iter()
-            .filter(|(_, entry)| supports(&entry.capabilities))
+            .filter(|(_, entry)| supports(entry))
             .map(|(name, entry)| (name.clone(), entry.clone()))
             .collect::<Vec<_>>();
         entries.sort_by(|(left, _), (right, _)| left.cmp(right));
@@ -883,7 +882,7 @@ impl McpServerDirectory {
 
     fn supporting_server_names<F>(&self, supports: &F) -> Vec<String>
     where
-        F: Fn(&McpCapabilities) -> bool,
+        F: Fn(&McpServerEntry) -> bool,
     {
         self.supporting_entries(supports)
             .into_iter()
@@ -1242,6 +1241,7 @@ impl McpRuntime {
                             config.name.clone(),
                             McpServerEntry {
                                 client: client.clone(),
+                                transport: config.transport.clone(),
                                 capabilities,
                             },
                         );
@@ -1884,6 +1884,7 @@ mod tests {
                 "docs".to_string(),
                 McpServerEntry {
                     client: McpClient::Http(test_http_client("docs")),
+                    transport: McpTransportKind::Http,
                     capabilities: McpCapabilities {
                         prompts: true,
                         ..McpCapabilities::default()
@@ -1894,6 +1895,7 @@ mod tests {
                 "files".to_string(),
                 McpServerEntry {
                     client: McpClient::Http(test_http_client("files")),
+                    transport: McpTransportKind::Http,
                     capabilities: McpCapabilities {
                         prompts: true,
                         ..McpCapabilities::default()
@@ -1917,6 +1919,7 @@ mod tests {
             "docs".to_string(),
             McpServerEntry {
                 client: McpClient::Http(test_http_client("docs")),
+                transport: McpTransportKind::Http,
                 capabilities: McpCapabilities {
                     prompts: true,
                     ..McpCapabilities::default()
@@ -1934,6 +1937,7 @@ mod tests {
             "docs".to_string(),
             McpServerEntry {
                 client: McpClient::Http(test_http_client("docs")),
+                transport: McpTransportKind::Stdio,
                 capabilities: McpCapabilities {
                     resources: true,
                     resource_subscribe: true,
@@ -1946,6 +1950,29 @@ mod tests {
             .resolve_resource_subscription_server(None)
             .unwrap();
         assert_eq!(name, "docs");
+    }
+
+    #[test]
+    fn resource_subscription_support_ignores_http_servers() {
+        let directory = McpServerDirectory::new(HashMap::from([(
+            "docs".to_string(),
+            McpServerEntry {
+                client: McpClient::Http(test_http_client("docs")),
+                transport: McpTransportKind::Http,
+                capabilities: McpCapabilities {
+                    resources: true,
+                    resource_subscribe: true,
+                    ..McpCapabilities::default()
+                },
+            },
+        )]));
+
+        assert!(!directory.has_resource_subscription_support());
+        assert!(
+            directory
+                .resolve_resource_subscription_server(None)
+                .is_err()
+        );
     }
 
     #[test]
