@@ -166,7 +166,7 @@ async fn test_agent_writes_and_reads_file() {
     let workspace = tempfile::TempDir::new().unwrap();
     let file_path = workspace.path().join("test.txt");
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(Box::new(WriteFileTool));
     registry.register(Box::new(ReadFileTool));
 
@@ -237,7 +237,7 @@ async fn test_agent_writes_and_reads_file() {
 async fn test_agent_terminal_execution() {
     let workspace = tempfile::TempDir::new().unwrap();
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(Box::new(TerminalTool));
 
     let provider = MockProvider::new(vec![
@@ -347,7 +347,7 @@ async fn test_agent_parallel_read_files() {
     let a_path = workspace.path().join("a.txt");
     let b_path = workspace.path().join("b.txt");
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(Box::new(ReadFileTool));
 
     let provider = MockProvider::new(vec![
@@ -413,7 +413,7 @@ async fn test_agent_parallel_read_files() {
 async fn test_agent_terminal_not_parallel() {
     let workspace = tempfile::TempDir::new().unwrap();
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(Box::new(TerminalTool));
 
     let provider = MockProvider::new(vec![
@@ -479,7 +479,7 @@ async fn test_agent_terminal_not_parallel() {
 async fn test_agent_dangerous_command_denied() {
     let workspace = tempfile::TempDir::new().unwrap();
 
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(Box::new(TerminalTool));
 
     let provider = MockProvider::new(vec![
