@@ -17,6 +17,7 @@ use hermes_core::{
     message::ToolResult,
     tool::{Tool, ToolContext, ToolSchema},
 };
+use hermes_tools::registry::ToolRegistry;
 use reqwest::{
     Client,
     header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
@@ -26,7 +27,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
-    sync::{Mutex, oneshot},
+    sync::{Mutex, oneshot, watch},
 };
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
@@ -58,6 +59,7 @@ struct StdioMcpClient {
     pending: PendingMap,
     next_id: Arc<AtomicU64>,
     capabilities: Arc<Mutex<McpCapabilities>>,
+    refresh_tx: watch::Sender<u64>,
 }
 
 impl StdioMcpClient {
@@ -106,6 +108,7 @@ impl StdioMcpClient {
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             capabilities: Arc::new(Mutex::new(McpCapabilities::default())),
+            refresh_tx: watch::channel(0).0,
         };
 
         spawn_stdout_reader(
@@ -113,6 +116,7 @@ impl StdioMcpClient {
             stdout,
             Arc::clone(&client.stdin),
             Arc::clone(&client.pending),
+            client.refresh_tx.clone(),
         );
         spawn_stderr_logger(config.name.clone(), stderr);
 
@@ -293,6 +297,10 @@ impl StdioMcpClient {
     async fn capabilities(&self) -> McpCapabilities {
         self.capabilities.lock().await.clone()
     }
+
+    fn subscribe_refresh(&self) -> watch::Receiver<u64> {
+        self.refresh_tx.subscribe()
+    }
 }
 
 impl McpClient {
@@ -374,6 +382,13 @@ impl McpClient {
             Self::Http(client) => client.shutdown().await,
         }
     }
+
+    fn subscribe_refresh(&self) -> watch::Receiver<u64> {
+        match self {
+            Self::Stdio(client) => client.subscribe_refresh(),
+            Self::Http(client) => client.subscribe_refresh(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -384,6 +399,7 @@ struct HttpMcpClient {
     session_id: Arc<Mutex<Option<String>>>,
     negotiated_protocol: Arc<Mutex<String>>,
     capabilities: Arc<Mutex<McpCapabilities>>,
+    refresh_tx: watch::Sender<u64>,
 }
 
 impl HttpMcpClient {
@@ -422,6 +438,7 @@ impl HttpMcpClient {
             session_id: Arc::new(Mutex::new(None)),
             negotiated_protocol: Arc::new(Mutex::new(PROTOCOL_VERSION.to_string())),
             capabilities: Arc::new(Mutex::new(McpCapabilities::default())),
+            refresh_tx: watch::channel(0).0,
         };
 
         http.initialize().await?;
@@ -642,6 +659,11 @@ impl HttpMcpClient {
                 }
                 InboundMessage::Response { .. } => continue,
                 InboundMessage::Request { id, method } => {
+                    if is_list_changed_notification(&method) {
+                        emit_refresh_signal(&self.refresh_tx);
+                        tracing::info!(server = %self.server_name, method = %method, "received MCP list_changed notification over HTTP");
+                        continue;
+                    }
                     tracing::warn!(server = %self.server_name, method = %method, "ignoring unsupported inbound MCP method over HTTP");
                     if let Some(id) = id {
                         let payload = json!({
@@ -712,6 +734,10 @@ impl HttpMcpClient {
     }
 
     async fn shutdown(&self) {}
+
+    fn subscribe_refresh(&self) -> watch::Receiver<u64> {
+        self.refresh_tx.subscribe()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -730,6 +756,12 @@ struct McpServerDirectory {
 struct McpServerEntry {
     client: McpClient,
     capabilities: McpCapabilities,
+}
+
+#[derive(Debug)]
+struct McpRuntime {
+    entries: HashMap<String, McpServerEntry>,
+    tool_cache: Mutex<HashMap<String, Vec<McpToolDescriptor>>>,
 }
 
 impl McpServerDirectory {
@@ -1064,83 +1096,154 @@ impl Tool for McpResourceReadTool {
     }
 }
 
-pub async fn discover_tools(configs: &[McpServerConfig]) -> Vec<Box<dyn Tool>> {
-    let mut tools: Vec<Box<dyn Tool>> = Vec::new();
-    let mut servers: HashMap<String, McpServerEntry> = HashMap::new();
+impl McpRuntime {
+    async fn connect(configs: &[McpServerConfig]) -> Self {
+        let mut entries: HashMap<String, McpServerEntry> = HashMap::new();
+        let mut tool_cache: HashMap<String, Vec<McpToolDescriptor>> = HashMap::new();
 
-    for config in configs.iter().filter(|config| config.enabled) {
-        match McpClient::connect(config).await {
-            Ok(client) => {
-                let capabilities = client.capabilities().await;
-                let mut keep_server = capabilities.prompts || capabilities.resources;
-                let mut registered_model_tools = false;
+        for config in configs.iter().filter(|config| config.enabled) {
+            match McpClient::connect(config).await {
+                Ok(client) => {
+                    let capabilities = client.capabilities().await;
+                    let keep_server =
+                        capabilities.prompts || capabilities.resources || capabilities.tools;
+                    let mut descriptors = Vec::new();
 
-                if capabilities.tools {
-                    match client.list_tools().await {
-                        Ok(descriptors) => {
-                            if descriptors.is_empty() {
-                                tracing::info!(server = %config.name, "MCP server reported no model-callable tools");
+                    if capabilities.tools {
+                        match client.list_tools().await {
+                            Ok(found) => {
+                                if found.is_empty() {
+                                    tracing::info!(server = %config.name, "MCP server reported no model-callable tools");
+                                }
+                                descriptors = found;
                             }
-                            for descriptor in descriptors {
-                                tools.push(Box::new(McpToolAdapter {
-                                    server_name: config.name.clone(),
-                                    descriptor,
-                                    client: client.clone(),
-                                }) as Box<dyn Tool>);
+                            Err(err) => {
+                                tracing::warn!(server = %config.name, "failed to list MCP tools: {err}");
                             }
-                            registered_model_tools = true;
                         }
-                        Err(err) => {
-                            tracing::warn!(server = %config.name, "failed to list MCP tools: {err}");
-                            keep_server = false;
-                        }
+                    } else {
+                        tracing::info!(server = %config.name, "MCP server does not advertise model-callable tools");
                     }
-                } else {
-                    tracing::info!(server = %config.name, "MCP server does not advertise model-callable tools");
-                }
 
-                if keep_server {
-                    servers.insert(
-                        config.name.clone(),
-                        McpServerEntry {
-                            client: client.clone(),
-                            capabilities,
-                        },
-                    );
+                    if keep_server {
+                        entries.insert(
+                            config.name.clone(),
+                            McpServerEntry {
+                                client: client.clone(),
+                                capabilities,
+                            },
+                        );
+                        tool_cache.insert(config.name.clone(), descriptors);
+                    } else {
+                        client.shutdown().await;
+                    }
                 }
-
-                if !keep_server && !registered_model_tools {
-                    client.shutdown().await;
+                Err(err) => {
+                    tracing::warn!(server = %config.name, "failed to connect MCP server: {err}");
                 }
             }
-            Err(err) => {
-                tracing::warn!(server = %config.name, "failed to connect MCP server: {err}");
-            }
+        }
+
+        Self {
+            entries,
+            tool_cache: Mutex::new(tool_cache),
         }
     }
 
-    let server_directory = McpServerDirectory::new(servers);
-    if server_directory.has_prompt_support() {
-        tools.push(Box::new(McpPromptListTool {
-            servers: server_directory.clone(),
-        }));
-        tools.push(Box::new(McpPromptGetTool {
-            servers: server_directory.clone(),
-        }));
-    }
-    if server_directory.has_resource_support() {
-        tools.push(Box::new(McpResourceListTool {
-            servers: server_directory.clone(),
-        }));
-        tools.push(Box::new(McpResourceTemplateListTool {
-            servers: server_directory.clone(),
-        }));
-        tools.push(Box::new(McpResourceReadTool {
-            servers: server_directory,
-        }));
+    async fn build_mcp_tools(&self) -> Vec<Box<dyn Tool>> {
+        let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+        let cache = self.tool_cache.lock().await.clone();
+
+        for (server_name, entry) in &self.entries {
+            for descriptor in cache.get(server_name).cloned().unwrap_or_default() {
+                tools.push(Box::new(McpToolAdapter {
+                    server_name: server_name.clone(),
+                    descriptor,
+                    client: entry.client.clone(),
+                }) as Box<dyn Tool>);
+            }
+        }
+
+        let server_directory = McpServerDirectory::new(self.entries.clone());
+        if server_directory.has_prompt_support() {
+            tools.push(Box::new(McpPromptListTool {
+                servers: server_directory.clone(),
+            }));
+            tools.push(Box::new(McpPromptGetTool {
+                servers: server_directory.clone(),
+            }));
+        }
+        if server_directory.has_resource_support() {
+            tools.push(Box::new(McpResourceListTool {
+                servers: server_directory.clone(),
+            }));
+            tools.push(Box::new(McpResourceTemplateListTool {
+                servers: server_directory.clone(),
+            }));
+            tools.push(Box::new(McpResourceReadTool {
+                servers: server_directory,
+            }));
+        }
+
+        tools
     }
 
-    tools
+    async fn refresh_server(&self, server_name: &str) -> Result<()> {
+        let Some(entry) = self.entries.get(server_name) else {
+            return Ok(());
+        };
+
+        if !entry.capabilities.tools {
+            return Ok(());
+        }
+
+        let descriptors = entry.client.list_tools().await?;
+        self.tool_cache
+            .lock()
+            .await
+            .insert(server_name.to_string(), descriptors);
+        Ok(())
+    }
+
+    fn spawn_refresh_tasks(self: Arc<Self>, registry: Arc<ToolRegistry>) {
+        for (server_name, entry) in &self.entries {
+            if !entry.capabilities.tools {
+                continue;
+            }
+
+            let server_name = server_name.clone();
+            let mut refresh_rx = entry.client.subscribe_refresh();
+            let runtime = Arc::clone(&self);
+            let registry = Arc::clone(&registry);
+
+            tokio::spawn(async move {
+                while refresh_rx.changed().await.is_ok() {
+                    tracing::info!(server = %server_name, "refreshing MCP tool registry after notification");
+                    match runtime.refresh_server(&server_name).await {
+                        Ok(()) => {
+                            let mcp_tools = runtime.build_mcp_tools().await;
+                            registry.replace_toolset("mcp", mcp_tools);
+                        }
+                        Err(err) => {
+                            tracing::warn!(server = %server_name, "failed to refresh MCP tools: {err}");
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
+pub async fn populate_registry(registry: Arc<ToolRegistry>, configs: &[McpServerConfig]) {
+    let runtime = Arc::new(McpRuntime::connect(configs).await);
+    let mcp_tools = runtime.build_mcp_tools().await;
+    registry.replace_toolset("mcp", mcp_tools);
+    runtime.spawn_refresh_tasks(registry);
+}
+
+pub async fn discover_tools(configs: &[McpServerConfig]) -> Vec<Box<dyn Tool>> {
+    let runtime = McpRuntime::connect(configs).await;
+    runtime.build_mcp_tools().await
 }
 
 fn spawn_stdout_reader(
@@ -1148,6 +1251,7 @@ fn spawn_stdout_reader(
     stdout: ChildStdout,
     stdin: Arc<Mutex<ChildStdin>>,
     pending: PendingMap,
+    refresh_tx: watch::Sender<u64>,
 ) {
     tokio::spawn(async move {
         let mut reader = BufReader::new(stdout);
@@ -1160,6 +1264,11 @@ fn spawn_stdout_reader(
                         }
                     }
                     InboundMessage::Request { id, method } => {
+                        if is_list_changed_notification(&method) {
+                            emit_refresh_signal(&refresh_tx);
+                            tracing::info!(server = %server_name, method = %method, "received MCP list_changed notification");
+                            continue;
+                        }
                         tracing::warn!(server = %server_name, method = %method, "ignoring unsupported inbound MCP method");
                         if let Some(id) = id {
                             let payload = json!({
@@ -1253,6 +1362,11 @@ fn random_request_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+fn emit_refresh_signal(refresh_tx: &watch::Sender<u64>) {
+    let next = *refresh_tx.borrow() + 1;
+    let _ = refresh_tx.send(next);
+}
+
 fn parse_capabilities(result: &Value) -> McpCapabilities {
     let capabilities = result
         .get("capabilities")
@@ -1263,6 +1377,15 @@ fn parse_capabilities(result: &Value) -> McpCapabilities {
         prompts: capabilities.is_some_and(|caps| caps.contains_key("prompts")),
         resources: capabilities.is_some_and(|caps| caps.contains_key("resources")),
     }
+}
+
+fn is_list_changed_notification(method: &str) -> bool {
+    matches!(
+        method,
+        "notifications/tools/list_changed"
+            | "notifications/prompts/list_changed"
+            | "notifications/resources/list_changed"
+    )
 }
 
 fn optional_string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -1479,6 +1602,18 @@ struct ToolCallResult {
 mod tests {
     use super::*;
 
+    fn test_http_client(server_name: &str) -> HttpMcpClient {
+        HttpMcpClient {
+            server_name: server_name.to_string(),
+            endpoint: reqwest::Url::parse("https://example.com/mcp").unwrap(),
+            client: Client::new(),
+            session_id: Arc::new(Mutex::new(None)),
+            negotiated_protocol: Arc::new(Mutex::new(PROTOCOL_VERSION.to_string())),
+            capabilities: Arc::new(Mutex::new(McpCapabilities::default())),
+            refresh_tx: watch::channel(0).0,
+        }
+    }
+
     #[tokio::test]
     async fn read_stdio_message_parses_content_length_frame() {
         let frame =
@@ -1570,20 +1705,34 @@ mod tests {
         assert_eq!(events[0].data, "{\"jsonrpc\":\"2.0\",\n\"id\":1}");
     }
 
+    #[tokio::test]
+    async fn http_sse_list_changed_notification_triggers_refresh() {
+        let client = test_http_client("docs");
+        let mut refresh_rx = client.subscribe_refresh();
+        let body = concat!(
+            "event: message\n",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\",\"params\":{}}\n\n",
+            "event: message\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n",
+        );
+
+        let response = client
+            .extract_response_from_sse(body, Some(1))
+            .await
+            .unwrap();
+
+        assert_eq!(response["result"]["ok"], true);
+        refresh_rx.changed().await.unwrap();
+        assert_eq!(*refresh_rx.borrow(), 1);
+    }
+
     #[test]
     fn server_directory_requires_server_when_multiple() {
         let directory = McpServerDirectory::new(HashMap::from([
             (
                 "docs".to_string(),
                 McpServerEntry {
-                    client: McpClient::Http(HttpMcpClient {
-                        server_name: "docs".to_string(),
-                        endpoint: reqwest::Url::parse("https://example.com/mcp").unwrap(),
-                        client: Client::new(),
-                        session_id: Arc::new(Mutex::new(None)),
-                        negotiated_protocol: Arc::new(Mutex::new(PROTOCOL_VERSION.to_string())),
-                        capabilities: Arc::new(Mutex::new(McpCapabilities::default())),
-                    }),
+                    client: McpClient::Http(test_http_client("docs")),
                     capabilities: McpCapabilities {
                         prompts: true,
                         ..McpCapabilities::default()
@@ -1593,14 +1742,7 @@ mod tests {
             (
                 "files".to_string(),
                 McpServerEntry {
-                    client: McpClient::Http(HttpMcpClient {
-                        server_name: "files".to_string(),
-                        endpoint: reqwest::Url::parse("https://example.org/mcp").unwrap(),
-                        client: Client::new(),
-                        session_id: Arc::new(Mutex::new(None)),
-                        negotiated_protocol: Arc::new(Mutex::new(PROTOCOL_VERSION.to_string())),
-                        capabilities: Arc::new(Mutex::new(McpCapabilities::default())),
-                    }),
+                    client: McpClient::Http(test_http_client("files")),
                     capabilities: McpCapabilities {
                         prompts: true,
                         ..McpCapabilities::default()
@@ -1623,14 +1765,7 @@ mod tests {
         let directory = McpServerDirectory::new(HashMap::from([(
             "docs".to_string(),
             McpServerEntry {
-                client: McpClient::Http(HttpMcpClient {
-                    server_name: "docs".to_string(),
-                    endpoint: reqwest::Url::parse("https://example.com/mcp").unwrap(),
-                    client: Client::new(),
-                    session_id: Arc::new(Mutex::new(None)),
-                    negotiated_protocol: Arc::new(Mutex::new(PROTOCOL_VERSION.to_string())),
-                    capabilities: Arc::new(Mutex::new(McpCapabilities::default())),
-                }),
+                client: McpClient::Http(test_http_client("docs")),
                 capabilities: McpCapabilities {
                     prompts: true,
                     ..McpCapabilities::default()

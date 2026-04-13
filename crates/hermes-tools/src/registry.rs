@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use hermes_core::tool::Tool;
 
@@ -11,13 +14,13 @@ inventory::collect!(ToolRegistration);
 
 /// Runtime registry that holds named tool instances.
 pub struct ToolRegistry {
-    tools: HashMap<String, Box<dyn Tool>>,
+    tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
 }
 
 impl ToolRegistry {
     /// Build a registry from all `ToolRegistration` entries submitted to `inventory`.
     pub fn from_inventory() -> Self {
-        let mut registry = Self::new();
+        let registry = Self::new();
         for reg in inventory::iter::<ToolRegistration> {
             let tool = (reg.factory)();
             registry.register(tool);
@@ -28,23 +31,32 @@ impl ToolRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self {
-            tools: HashMap::new(),
+            tools: RwLock::new(HashMap::new()),
         }
     }
 
     /// Insert a tool, keyed by its `name()`.
-    pub fn register(&mut self, tool: Box<dyn Tool>) {
-        self.tools.insert(tool.name().to_string(), tool);
+    pub fn register(&self, tool: Box<dyn Tool>) {
+        self.tools
+            .write()
+            .expect("tool registry write lock poisoned")
+            .insert(tool.name().to_string(), Arc::from(tool));
     }
 
     /// Look up a tool by name.
-    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.get(name).map(|t| t.as_ref())
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools
+            .read()
+            .expect("tool registry read lock poisoned")
+            .get(name)
+            .cloned()
     }
 
     /// Return schemas for all currently-available tools (`is_available() == true`).
     pub fn available_schemas(&self) -> Vec<hermes_core::tool::ToolSchema> {
         self.tools
+            .read()
+            .expect("tool registry read lock poisoned")
             .values()
             .filter(|t| t.is_available())
             .map(|t| t.schema())
@@ -52,18 +64,46 @@ impl ToolRegistry {
     }
 
     /// Return names of all registered tools.
-    pub fn tool_names(&self) -> Vec<&str> {
-        self.tools.keys().map(|s| s.as_str()).collect()
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tools
+            .read()
+            .expect("tool registry read lock poisoned")
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// Number of registered tools.
     pub fn len(&self) -> usize {
-        self.tools.len()
+        self.tools
+            .read()
+            .expect("tool registry read lock poisoned")
+            .len()
     }
 
     /// True when the registry contains no tools.
     pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
+        self.tools
+            .read()
+            .expect("tool registry read lock poisoned")
+            .is_empty()
+    }
+
+    /// Replace every tool with the given toolset, keeping all other toolsets intact.
+    pub fn replace_toolset(&self, toolset: &str, tools: Vec<Box<dyn Tool>>) {
+        let mut guard = self
+            .tools
+            .write()
+            .expect("tool registry write lock poisoned");
+        guard.retain(|_, tool| tool.toolset() != toolset);
+        for tool in tools {
+            let tool_name = tool.name().to_string();
+            if guard.contains_key(&tool_name) {
+                tracing::warn!(tool = %tool_name, toolset = %toolset, "skipping toolset replacement due to name collision");
+                continue;
+            }
+            guard.insert(tool_name, Arc::from(tool));
+        }
     }
 }
 
@@ -179,7 +219,7 @@ mod tests {
 
     #[test]
     fn test_manual_register_and_lookup() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(Box::new(EchoTool));
 
         assert_eq!(registry.len(), 1);
@@ -194,7 +234,7 @@ mod tests {
 
     #[test]
     fn test_available_schemas() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(Box::new(EchoTool));
         registry.register(Box::new(UnavailableTool));
 
@@ -206,18 +246,18 @@ mod tests {
 
     #[test]
     fn test_tool_names() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(Box::new(EchoTool));
         registry.register(Box::new(UnavailableTool));
 
         let mut names = registry.tool_names();
         names.sort_unstable();
-        assert_eq!(names, vec!["echo", "unavailable"]);
+        assert_eq!(names, vec!["echo".to_string(), "unavailable".to_string()]);
     }
 
     #[tokio::test]
     async fn test_tool_execute() {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(Box::new(EchoTool));
 
         let (ctx, _approval_rx, _delta_rx) = make_ctx();
