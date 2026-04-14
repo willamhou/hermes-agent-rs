@@ -3,7 +3,10 @@
 //! These tests use a MockProvider that returns scripted ChatResponses and a
 //! ToolRegistry loaded with real ReadFileTool, WriteFileTool, and TerminalTool.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use hermes_agent::{
@@ -15,14 +18,18 @@ use hermes_core::{
     message::{Content, Role, ToolCall},
     provider::{ChatRequest, ChatResponse, FinishReason, ModelInfo, ModelPricing, TokenUsage},
     stream::StreamDelta,
-    tool::{ApprovalDecision, ApprovalRequest, ToolConfig},
+    tool::{ApprovalDecision, ApprovalRequest, BrowserToolConfig, ToolConfig},
 };
 use hermes_memory::MemoryManager;
 use hermes_tools::{
-    file_read::ReadFileTool, file_write::WriteFileTool, registry::ToolRegistry,
-    terminal::TerminalTool,
+    browser::BrowserTool, file_read::ReadFileTool, file_write::WriteFileTool,
+    registry::ToolRegistry, terminal::TerminalTool,
 };
-use tokio::sync::mpsc;
+use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    net::TcpListener,
+    sync::mpsc,
+};
 
 // ── MockProvider ──────────────────────────────────────────────────────────────
 
@@ -129,6 +136,28 @@ fn make_agent_with_approval<F>(
 where
     F: Fn(ApprovalRequest) + Send + 'static,
 {
+    make_agent_with_tool_config(
+        provider,
+        registry,
+        workspace,
+        ToolConfig {
+            workspace_root: workspace.path().to_path_buf(),
+            ..ToolConfig::default()
+        },
+        approval_handler,
+    )
+}
+
+fn make_agent_with_tool_config<F>(
+    provider: MockProvider,
+    registry: ToolRegistry,
+    workspace: &tempfile::TempDir,
+    tool_config: ToolConfig,
+    approval_handler: F,
+) -> Agent
+where
+    F: Fn(ApprovalRequest) + Send + 'static,
+{
     let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(16);
 
     tokio::spawn(async move {
@@ -148,14 +177,106 @@ where
         session_id: "e2e-test".to_string(),
         working_dir: workspace_path.clone(),
         approval_tx,
-        tool_config: Arc::new(ToolConfig {
-            workspace_root: workspace_path,
-            ..ToolConfig::default()
-        }),
+        tool_config: Arc::new(tool_config),
         memory,
         skills: None,
         compression: CompressionConfig::default(),
     })
+}
+
+fn browser_executable() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("HERMES_BROWSER_EXECUTABLE") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    let candidates = [
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    ];
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.exists())
+}
+
+async fn spawn_browser_test_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 4096];
+                let Ok(read) = stream.read(&mut buffer).await else {
+                    return;
+                };
+                if read == 0 {
+                    return;
+                }
+
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+
+                let body = match path {
+                    "/" => {
+                        r#"<!doctype html>
+<html>
+  <body>
+    <h1>Browser Test</h1>
+    <label for="name">Name</label>
+    <input id="name" />
+    <button id="go" onclick="window.location.href='/hello?name=' + encodeURIComponent(document.getElementById('name').value)">Go</button>
+  </body>
+</html>"#
+                            .to_string()
+                    }
+                    p if p.starts_with("/hello") => {
+                        let name = p
+                            .split("?name=")
+                            .nth(1)
+                            .map(|value| value.replace("%20", " "))
+                            .unwrap_or_else(|| "unknown".to_string());
+                        if name == "Hermes" {
+                            r#"<!doctype html><html><body><h1 id="message">Hello, Hermes!</h1></body></html>"#.to_string()
+                        } else {
+                            format!(
+                                "<!doctype html><html><body><h1 id=\"message\">Hello, {}!</h1></body></html>",
+                                name
+                            )
+                        }
+                    }
+                    _ => {
+                        r#"<!doctype html><html><body><h1>Not found</h1></body></html>"#.to_string()
+                    }
+                };
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+
+    (base_url, handle)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -471,6 +592,121 @@ async fn test_agent_terminal_not_parallel() {
     }
 
     assert_eq!(result, "Both commands ran.");
+}
+
+#[tokio::test]
+async fn test_agent_browser_tool_real_page_flow() {
+    let Some(executable) = browser_executable() else {
+        eprintln!("skipping browser e2e: no Chromium executable found");
+        return;
+    };
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    let (base_url, server_handle) = spawn_browser_test_server().await;
+
+    let registry = ToolRegistry::new();
+    registry.register(Box::new(BrowserTool::new()));
+
+    let provider = MockProvider::new(vec![
+        tool_response(
+            "Open the page.",
+            vec![make_call(
+                "browser_1",
+                "browser",
+                serde_json::json!({ "action": "navigate", "url": base_url }),
+            )],
+        ),
+        tool_response(
+            "Type the name.",
+            vec![make_call(
+                "browser_2",
+                "browser",
+                serde_json::json!({
+                    "action": "type",
+                    "selector": "#name",
+                    "text": "Hermes",
+                    "clear": true
+                }),
+            )],
+        ),
+        tool_response(
+            "Submit the form.",
+            vec![make_call(
+                "browser_3",
+                "browser",
+                serde_json::json!({
+                    "action": "click",
+                    "selector": "#go",
+                    "wait_for_navigation": true
+                }),
+            )],
+        ),
+        tool_response(
+            "Read the page.",
+            vec![make_call(
+                "browser_4",
+                "browser",
+                serde_json::json!({
+                    "action": "extract_text",
+                    "selector": "#message"
+                }),
+            )],
+        ),
+        tool_response(
+            "Close the session.",
+            vec![make_call(
+                "browser_5",
+                "browser",
+                serde_json::json!({ "action": "close" }),
+            )],
+        ),
+        stop_response("The page says: Hello, Hermes!"),
+    ]);
+
+    let tool_config = ToolConfig {
+        browser: BrowserToolConfig {
+            executable: Some(executable),
+            sandbox: false,
+            action_timeout_secs: 10,
+            launch_timeout_secs: 20,
+            ..BrowserToolConfig::default()
+        },
+        workspace_root: workspace.path().to_path_buf(),
+        ..ToolConfig::default()
+    };
+
+    let mut agent =
+        make_agent_with_tool_config(provider, registry, &workspace, tool_config, |req| {
+            let _ = req.response_tx.send(ApprovalDecision::Allow);
+        });
+
+    let (tx, _rx) = mpsc::channel(64);
+    let mut history = vec![];
+    let result = agent
+        .run_conversation("fill the browser page", &mut history, tx)
+        .await
+        .unwrap();
+
+    server_handle.abort();
+
+    assert_eq!(result, "The page says: Hello, Hermes!");
+    assert_eq!(history.len(), 12, "expected 12 messages: {history:#?}");
+
+    let extract_result = match &history[8].content {
+        Content::Text(s) => s.clone(),
+        _ => panic!("expected text content"),
+    };
+    let parsed: serde_json::Value =
+        serde_json::from_str(&extract_result).expect("browser extract result should be valid JSON");
+    assert_eq!(parsed["content"].as_str(), Some("Hello, Hermes!"));
+
+    let close_result = match &history[10].content {
+        Content::Text(s) => s.clone(),
+        _ => panic!("expected text content"),
+    };
+    let close_parsed: serde_json::Value =
+        serde_json::from_str(&close_result).expect("browser close result should be valid JSON");
+    assert_eq!(close_parsed["closed"].as_bool(), Some(true));
 }
 
 /// When the approval handler denies a dangerous command (rm -rf /), the tool
