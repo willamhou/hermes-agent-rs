@@ -642,6 +642,18 @@ async fn test_agent_browser_tool_real_page_flow() {
             )],
         ),
         tool_response(
+            "Wait for the greeting.",
+            vec![make_call(
+                "browser_3b",
+                "browser",
+                serde_json::json!({
+                    "action": "wait",
+                    "selector": "#message",
+                    "timeout_ms": 5000
+                }),
+            )],
+        ),
+        tool_response(
             "Read the page.",
             vec![make_call(
                 "browser_4",
@@ -690,9 +702,9 @@ async fn test_agent_browser_tool_real_page_flow() {
     server_handle.abort();
 
     assert_eq!(result, "The page says: Hello, Hermes!");
-    assert_eq!(history.len(), 12, "expected 12 messages: {history:#?}");
+    assert_eq!(history.len(), 14, "expected 14 messages: {history:#?}");
 
-    let extract_result = match &history[8].content {
+    let extract_result = match &history[10].content {
         Content::Text(s) => s.clone(),
         _ => panic!("expected text content"),
     };
@@ -700,7 +712,7 @@ async fn test_agent_browser_tool_real_page_flow() {
         serde_json::from_str(&extract_result).expect("browser extract result should be valid JSON");
     assert_eq!(parsed["content"].as_str(), Some("Hello, Hermes!"));
 
-    let close_result = match &history[10].content {
+    let close_result = match &history[12].content {
         Content::Text(s) => s.clone(),
         _ => panic!("expected text content"),
     };
