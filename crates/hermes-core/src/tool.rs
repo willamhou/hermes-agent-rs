@@ -19,6 +19,7 @@ pub struct ToolSchema {
 pub struct ToolConfig {
     pub terminal: TerminalToolConfig,
     pub file: FileToolConfig,
+    pub browser: BrowserToolConfig,
     pub workspace_root: PathBuf,
 }
 
@@ -36,11 +37,24 @@ pub struct FileToolConfig {
     pub blocked_prefixes: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone)]
+pub struct BrowserToolConfig {
+    pub headless: bool,
+    pub sandbox: bool,
+    pub launch_timeout_secs: u64,
+    pub action_timeout_secs: u64,
+    pub output_max_chars: usize,
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+    pub executable: Option<PathBuf>,
+}
+
 impl Default for ToolConfig {
     fn default() -> Self {
         Self {
             terminal: TerminalToolConfig::default(),
             file: FileToolConfig::default(),
+            browser: BrowserToolConfig::default(),
             workspace_root: PathBuf::from("."),
         }
     }
@@ -66,6 +80,21 @@ impl Default for FileToolConfig {
                 PathBuf::from("/boot/"),
                 PathBuf::from("/usr/lib/systemd/"),
             ],
+        }
+    }
+}
+
+impl Default for BrowserToolConfig {
+    fn default() -> Self {
+        Self {
+            headless: true,
+            sandbox: true,
+            launch_timeout_secs: 20,
+            action_timeout_secs: 30,
+            output_max_chars: 50_000,
+            viewport_width: 1280,
+            viewport_height: 720,
+            executable: None,
         }
     }
 }
