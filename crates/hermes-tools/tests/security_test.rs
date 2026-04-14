@@ -4,7 +4,10 @@ use tempfile::TempDir;
 
 use hermes_core::{
     stream::StreamDelta,
-    tool::{ApprovalRequest, FileToolConfig, TerminalToolConfig, Tool, ToolConfig, ToolContext},
+    tool::{
+        ApprovalRequest, BrowserToolConfig, FileToolConfig, TerminalToolConfig, Tool, ToolConfig,
+        ToolContext,
+    },
 };
 
 fn make_test_ctx(workspace: &Path) -> ToolContext {
@@ -18,6 +21,7 @@ fn make_test_ctx(workspace: &Path) -> ToolContext {
         tool_config: Arc::new(ToolConfig {
             terminal: TerminalToolConfig::default(),
             file: FileToolConfig::default(),
+            browser: BrowserToolConfig::default(),
             workspace_root: workspace.to_path_buf(),
         }),
         memory: None,
@@ -290,6 +294,7 @@ async fn test_write_file_etc_blocked() {
         tool_config: Arc::new(ToolConfig {
             terminal: TerminalToolConfig::default(),
             file: FileToolConfig::default(),
+            browser: BrowserToolConfig::default(),
             workspace_root: std::path::PathBuf::from("/tmp"),
         }),
         memory: None,

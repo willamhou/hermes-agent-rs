@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use hermes_core::tool::{FileToolConfig, TerminalToolConfig, ToolConfig};
+use hermes_core::tool::{BrowserToolConfig, FileToolConfig, TerminalToolConfig, ToolConfig};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -85,6 +85,71 @@ impl Default for FileConfigYaml {
     }
 }
 
+// ─── Browser config ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserConfigYaml {
+    #[serde(default = "default_browser_headless")]
+    pub headless: bool,
+    #[serde(default = "default_browser_sandbox")]
+    pub sandbox: bool,
+    #[serde(default = "default_browser_launch_timeout_secs")]
+    pub launch_timeout_secs: u64,
+    #[serde(default = "default_browser_action_timeout_secs")]
+    pub action_timeout_secs: u64,
+    #[serde(default = "default_browser_output_max_chars")]
+    pub output_max_chars: usize,
+    #[serde(default = "default_browser_viewport_width")]
+    pub viewport_width: u32,
+    #[serde(default = "default_browser_viewport_height")]
+    pub viewport_height: u32,
+    #[serde(default)]
+    pub executable: Option<PathBuf>,
+}
+
+fn default_browser_headless() -> bool {
+    true
+}
+
+fn default_browser_sandbox() -> bool {
+    true
+}
+
+fn default_browser_launch_timeout_secs() -> u64 {
+    20
+}
+
+fn default_browser_action_timeout_secs() -> u64 {
+    30
+}
+
+fn default_browser_output_max_chars() -> usize {
+    50_000
+}
+
+fn default_browser_viewport_width() -> u32 {
+    1280
+}
+
+fn default_browser_viewport_height() -> u32 {
+    720
+}
+
+impl Default for BrowserConfigYaml {
+    fn default() -> Self {
+        Self {
+            headless: default_browser_headless(),
+            sandbox: default_browser_sandbox(),
+            launch_timeout_secs: default_browser_launch_timeout_secs(),
+            action_timeout_secs: default_browser_action_timeout_secs(),
+            output_max_chars: default_browser_output_max_chars(),
+            viewport_width: default_browser_viewport_width(),
+            viewport_height: default_browser_viewport_height(),
+            executable: None,
+        }
+    }
+}
+
 // ─── MCP config ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -162,6 +227,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub file: FileConfigYaml,
 
+    /// Browser automation tool configuration.
+    #[serde(default)]
+    pub browser: BrowserConfigYaml,
+
     /// Dangerous tool approval behavior.
     #[serde(default)]
     pub approval: ApprovalConfigYaml,
@@ -191,6 +260,7 @@ impl Default for AppConfig {
             temperature: default_temperature(),
             terminal: TerminalConfigYaml::default(),
             file: FileConfigYaml::default(),
+            browser: BrowserConfigYaml::default(),
             approval: ApprovalConfigYaml::default(),
             mcp_servers: vec![],
         }
@@ -283,6 +353,16 @@ impl AppConfig {
                     PathBuf::from("/usr/lib/systemd/"),
                 ],
             },
+            browser: BrowserToolConfig {
+                headless: self.browser.headless,
+                sandbox: self.browser.sandbox,
+                launch_timeout_secs: self.browser.launch_timeout_secs,
+                action_timeout_secs: self.browser.action_timeout_secs,
+                output_max_chars: self.browser.output_max_chars,
+                viewport_width: self.browser.viewport_width,
+                viewport_height: self.browser.viewport_height,
+                executable: self.browser.executable.clone(),
+            },
             workspace_root,
         }
     }
@@ -314,6 +394,7 @@ mod tests {
             temperature: 0.5,
             terminal: TerminalConfigYaml::default(),
             file: FileConfigYaml::default(),
+            browser: BrowserConfigYaml::default(),
             approval: ApprovalConfigYaml::default(),
             mcp_servers: vec![],
         };
@@ -408,8 +489,41 @@ model: openai/gpt-4o
         assert_eq!(cfg.terminal.output_max_chars, 50_000);
         assert_eq!(cfg.file.read_max_chars, 100_000);
         assert_eq!(cfg.file.read_max_lines, 2000);
+        assert!(cfg.browser.headless);
+        assert!(cfg.browser.sandbox);
+        assert_eq!(cfg.browser.launch_timeout_secs, 20);
+        assert_eq!(cfg.browser.action_timeout_secs, 30);
+        assert_eq!(cfg.browser.output_max_chars, 50_000);
         assert_eq!(cfg.approval.policy, ApprovalPolicy::Ask);
         assert!(cfg.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn config_with_browser_section() {
+        let yaml = r#"
+model: openai/gpt-4o
+browser:
+  headless: false
+  sandbox: false
+  launch_timeout_secs: 45
+  action_timeout_secs: 15
+  output_max_chars: 12000
+  viewport_width: 1440
+  viewport_height: 900
+  executable: /usr/bin/chromium
+"#;
+        let cfg: AppConfig = serde_yaml_ng::from_str(yaml).expect("deserialize failed");
+        assert!(!cfg.browser.headless);
+        assert!(!cfg.browser.sandbox);
+        assert_eq!(cfg.browser.launch_timeout_secs, 45);
+        assert_eq!(cfg.browser.action_timeout_secs, 15);
+        assert_eq!(cfg.browser.output_max_chars, 12_000);
+        assert_eq!(cfg.browser.viewport_width, 1440);
+        assert_eq!(cfg.browser.viewport_height, 900);
+        assert_eq!(
+            cfg.browser.executable,
+            Some(PathBuf::from("/usr/bin/chromium"))
+        );
     }
 
     #[test]
@@ -477,6 +591,11 @@ mcp_servers:
         assert_eq!(tc.terminal.output_max_chars, 50_000);
         assert_eq!(tc.file.read_max_chars, 100_000);
         assert_eq!(tc.file.read_max_lines, 2000);
+        assert!(tc.browser.headless);
+        assert!(tc.browser.sandbox);
+        assert_eq!(tc.browser.launch_timeout_secs, 20);
+        assert_eq!(tc.browser.action_timeout_secs, 30);
+        assert_eq!(tc.browser.output_max_chars, 50_000);
         assert_eq!(tc.workspace_root, root);
         assert!(tc.file.blocked_prefixes.contains(&PathBuf::from("/etc/")));
     }
