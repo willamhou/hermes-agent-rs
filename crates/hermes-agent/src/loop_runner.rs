@@ -287,6 +287,54 @@ impl Agent {
     pub fn refund_budget(&mut self, n: u32) {
         self.budget.refund(n);
     }
+
+    /// Borrow the tool registry.
+    pub fn registry(&self) -> &ToolRegistry {
+        &self.registry
+    }
+
+    /// Manually trigger context compression from the CLI.
+    pub async fn manual_compress(
+        &mut self,
+        history: &mut Vec<Message>,
+    ) -> hermes_core::error::Result<()> {
+        // Rebuild full system prompt with memory blocks (same as run_conversation)
+        let memory_block = self.memory.system_prompt_blocks();
+        let full_system = if memory_block.is_empty() {
+            self.system_prompt.clone()
+        } else {
+            format!("{}\n\n{}", self.system_prompt, memory_block)
+        };
+
+        let tool_count = self.registry.available_schemas().len();
+        if !self
+            .compressor
+            .should_compress(&full_system, history, tool_count)
+        {
+            println!("No compression needed.");
+            return Ok(());
+        }
+
+        let contrib = self.memory.on_pre_compress(history).await;
+        match self
+            .compressor
+            .compress(history, self.provider.as_ref(), contrib.as_deref())
+            .await
+        {
+            Ok(CompressionResult::Compressed {
+                before_tokens,
+                after_tokens,
+                ..
+            }) => {
+                println!("Compressed: {before_tokens} → {after_tokens} tokens");
+                self.cache_manager.invalidate();
+                let _ = self.memory.refresh_snapshot();
+            }
+            Ok(CompressionResult::NotNeeded) => println!("No compression needed."),
+            Err(e) => eprintln!("Compression failed: {e}"),
+        }
+        Ok(())
+    }
 }
 
 async fn inject_active_skills_into_history(

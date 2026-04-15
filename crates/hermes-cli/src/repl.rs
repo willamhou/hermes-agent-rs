@@ -12,6 +12,7 @@ use hermes_config::{
     config::{AppConfig, hermes_home},
 };
 use hermes_core::{
+    clarify::ClarifyRequest,
     message::Message,
     session::{SessionMeta, SessionStore as _},
     stream::StreamDelta,
@@ -27,6 +28,7 @@ use uuid::Uuid;
 use crate::approval::{ApprovalManager, is_interactive_terminal};
 use crate::render::render_stream;
 use crate::tooling::build_registry;
+use crate::{commands, handlers};
 
 /// Start the interactive REPL.
 pub async fn run_repl() -> Result<()> {
@@ -67,6 +69,9 @@ pub async fn run_repl() -> Result<()> {
         SkillManager::new(vec![skills_dir]).context("failed to initialize skills")?,
     ));
 
+    let (clarify_tx, clarify_rx) = mpsc::channel::<ClarifyRequest>(4);
+    spawn_clarify_handler(clarify_rx);
+
     let agent_config = AgentConfig {
         provider,
         registry,
@@ -80,7 +85,7 @@ pub async fn run_repl() -> Result<()> {
         skills: Some(skills),
         compression: CompressionConfig::default(),
         delegation_depth: 0,
-        clarify_tx: None,
+        clarify_tx: Some(clarify_tx),
     };
     let mut agent = Agent::new(agent_config);
     let mut history: Vec<Message> = Vec::new();
@@ -181,6 +186,9 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
         SkillManager::new(vec![skills_dir]).context("failed to initialize skills")?,
     ));
 
+    let (clarify_tx, clarify_rx) = mpsc::channel::<ClarifyRequest>(4);
+    spawn_clarify_handler(clarify_rx);
+
     let mut agent = Agent::new(AgentConfig {
         provider,
         registry,
@@ -194,7 +202,7 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
         skills: Some(skills),
         compression: CompressionConfig::default(),
         delegation_depth: 0,
-        clarify_tx: None,
+        clarify_tx: Some(clarify_tx),
     });
 
     println!("Hermes — model: {model}");
@@ -213,67 +221,153 @@ async fn repl_loop(
     history: &mut Vec<Message>,
     store: &SqliteSessionStore,
     session_id: &str,
-    _config: &AppConfig,
+    config: &AppConfig,
 ) -> Result<()> {
     let history_path = hermes_home().join("cli_history.txt");
 
     // ── Main async loop ───────────────────────────────────────────────────────
     loop {
         let input = read_repl_input(history_path.clone()).await?;
-        match input.as_str() {
-            "" => continue,
-            "/quit" | "/exit" => {
-                println!("Goodbye.");
-                break;
-            }
-            "/new" => {
-                // End current session and start fresh (caller will create new session if needed)
-                let _ = store.end_session(session_id).await;
-                history.clear();
-                println!("Conversation reset.");
-                continue;
-            }
-            "/help" => {
-                println!("/quit — exit");
-                println!("/new  — reset conversation history");
-                println!("/help — show this message");
-                continue;
-            }
-            _ => {}
+
+        if input.is_empty() {
+            continue;
         }
 
-        // Regular user message — persist user message, then stream the response.
-        let user_msg = Message::user(&input);
-        let _ = store.append_message(session_id, &user_msg).await;
-
-        // Track how many messages exist before this turn so we can persist new ones.
-        let pre_len = history.len();
-
-        let (delta_tx, delta_rx) = mpsc::channel::<StreamDelta>(64);
-        let render_handle = tokio::spawn(render_stream(delta_rx));
-
-        let result = agent.run_conversation(&input, history, delta_tx).await;
-
-        // Await renderer (it terminates when the sender is dropped, which
-        // happens as `delta_tx` goes out of scope above when run_conversation
-        // returns; drop explicitly to be clear).
-        let _ = render_handle.await;
-
-        // Persist all messages added during this turn regardless of success/failure,
-        // skipping the user message at pre_len (already persisted above).
-        // This ensures tool-result messages are not lost when an error occurs.
-        // Clamp the start index: compression can shrink history below pre_len + 1.
-        let persist_start = (pre_len + 1).min(history.len());
-        for msg in &history[persist_start..] {
-            let _ = store.append_message(session_id, msg).await;
+        // ── Command dispatch ─────────────────────────────────────────────────
+        if input.starts_with('/') {
+            match commands::resolve_command(&input) {
+                Some(cmd) => {
+                    match cmd.name {
+                        "quit" => {
+                            println!("Goodbye.");
+                            let _ = store.end_session(session_id).await;
+                            break;
+                        }
+                        "new" => {
+                            let _ = store.end_session(session_id).await;
+                            history.clear();
+                            println!("Conversation reset.");
+                        }
+                        "help" => handlers::handle_help(),
+                        "clear" => handlers::handle_clear(),
+                        "model" => handlers::handle_model(&config.model),
+                        "tools" => handlers::handle_tools(agent.registry()),
+                        "status" => handlers::handle_status(
+                            session_id,
+                            &config.model,
+                            history,
+                            agent.remaining_budget(),
+                        ),
+                        "retry" => {
+                            if let Some(msg) = handlers::handle_retry(history) {
+                                run_message(agent, history, store, session_id, &msg).await;
+                            } else {
+                                println!("Nothing to retry.");
+                            }
+                        }
+                        "undo" => handlers::handle_undo(history),
+                        "compress" => {
+                            println!("Compressing context...");
+                            if let Err(e) = agent.manual_compress(history).await {
+                                eprintln!("Compression error: {e:#}");
+                            }
+                        }
+                        "skills" => handlers::handle_skills_list(),
+                        "save" => {
+                            let args = input.split_whitespace().nth(1);
+                            handlers::handle_save(history, args);
+                        }
+                        "cron" => handlers::handle_cron(),
+                        _ => {}
+                    }
+                    continue;
+                }
+                None => {
+                    println!("Unknown command. Type /help for list.");
+                    continue;
+                }
+            }
         }
 
-        if let Err(e) = result {
-            eprintln!("Error: {e:#}");
-        }
+        // ── Regular user message ─────────────────────────────────────────────
+        run_message(agent, history, store, session_id, &input).await;
     }
 
     Ok(())
+}
+
+/// Send `message` to the agent, stream the response, and persist new history entries.
+async fn run_message(
+    agent: &mut Agent,
+    history: &mut Vec<Message>,
+    store: &SqliteSessionStore,
+    session_id: &str,
+    message: &str,
+) {
+    let user_msg = Message::user(message);
+    let _ = store.append_message(session_id, &user_msg).await;
+
+    let pre_len = history.len();
+
+    let (delta_tx, delta_rx) = mpsc::channel::<StreamDelta>(64);
+    let render_handle = tokio::spawn(render_stream(delta_rx));
+
+    let result = agent.run_conversation(message, history, delta_tx).await;
+
+    let _ = render_handle.await;
+
+    // Persist messages added this turn (skip the user message, already persisted).
+    // Clamp: compression may shrink history below pre_len + 1.
+    let persist_start = (pre_len + 1).min(history.len());
+    for msg in &history[persist_start..] {
+        let _ = store.append_message(session_id, msg).await;
+    }
+
+    if let Err(e) = result {
+        eprintln!("Error: {e:#}");
+    }
+}
+
+/// Spawn a task that receives `ClarifyRequest`s and prompts the user via stdin.
+fn spawn_clarify_handler(mut clarify_rx: mpsc::Receiver<ClarifyRequest>) {
+    tokio::spawn(async move {
+        while let Some(req) = clarify_rx.recv().await {
+            println!("\n--- Agent asks: ---");
+            println!("{}", req.question);
+            if !req.choices.is_empty() {
+                for (i, choice) in req.choices.iter().enumerate() {
+                    println!("  {}) {choice}", i + 1);
+                }
+                println!("  {}) Other (type your answer)", req.choices.len() + 1);
+            }
+            print!("> ");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+
+            let choices = req.choices.clone();
+            let choices_len = choices.len();
+            let answer = tokio::task::spawn_blocking(move || {
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input).ok();
+                let trimmed = input.trim().to_string();
+                // If user typed a number selecting a listed choice, expand it
+                if let Ok(n) = trimmed.parse::<usize>() {
+                    if n >= 1 && n <= choices_len {
+                        return choices[n - 1].clone();
+                    }
+                }
+                trimmed
+            })
+            .await
+            .unwrap_or_default();
+
+            let response = if answer.is_empty() {
+                hermes_core::clarify::ClarifyResponse::Timeout
+            } else {
+                hermes_core::clarify::ClarifyResponse::Answer(answer)
+            };
+            let _ = req.response_tx.send(response);
+        }
+    });
 }
 
 async fn read_repl_input(history_path: PathBuf) -> Result<String> {
