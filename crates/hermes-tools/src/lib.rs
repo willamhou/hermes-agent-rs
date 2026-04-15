@@ -2,6 +2,7 @@
 
 mod approval_key;
 pub mod browser;
+pub mod clarify;
 pub mod execute_code;
 pub mod file_read;
 pub mod file_search;
