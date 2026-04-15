@@ -8,8 +8,9 @@ use hermes_tools::registry::ToolRegistry;
 pub async fn build_registry(config: &AppConfig) -> Arc<ToolRegistry> {
     let registry = ToolRegistry::from_inventory();
 
-    // Register DelegationTool manually (lives in hermes-agent, not hermes-tools,
-    // so it cannot use inventory::submit!).
+    // DelegationTool registered manually (not via inventory) so child agents
+    // built with from_inventory() won't have it. See delegate.rs.
+    // Lives in hermes-agent (not hermes-tools), so inventory::submit! is unavailable.
     let memory_dir = hermes_home().join("memories").join("delegation");
     registry.register(Box::new(DelegationTool::new(memory_dir)));
 

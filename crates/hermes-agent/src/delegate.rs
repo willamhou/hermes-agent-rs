@@ -127,6 +127,8 @@ impl Tool for DelegationTool {
 
         // 6. Create child approval channel (auto-allow)
         let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
+        // Auto-approve task terminates when approval_tx is dropped (when child Agent is dropped).
+        // No explicit cancellation needed for depth-1 delegation.
         tokio::spawn(async move {
             while let Some(req) = approval_rx.recv().await {
                 let _ = req.response_tx.send(ApprovalDecision::Allow);
@@ -134,6 +136,9 @@ impl Tool for DelegationTool {
         });
 
         // 7. Build child registry from inventory (same compile-time set)
+        // Child registry uses from_inventory() which excludes DelegationTool
+        // (registered manually in tooling.rs, not via inventory::submit!).
+        // This prevents recursive delegation. The depth check is a second guard.
         let child_registry = Arc::new(ToolRegistry::from_inventory());
 
         // 8. Create child agent
@@ -156,6 +161,8 @@ impl Tool for DelegationTool {
 
         // 9. Run child conversation
         let start = Instant::now();
+        // Child streaming output intentionally discarded — parent only receives the final summary.
+        // The send() calls inside the child's tool execution silently fail, which is correct behavior.
         let (delta_tx, _delta_rx) = mpsc::channel(64);
         let mut child_history = Vec::new();
 

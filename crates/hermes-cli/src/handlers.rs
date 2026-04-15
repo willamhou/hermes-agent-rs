@@ -55,6 +55,10 @@ pub fn handle_status(session_id: &str, model: &str, history: &[Message], budget_
 
 /// Pop the last user message and all subsequent messages, returning the user
 /// message text so the caller can re-send it.
+///
+/// Note: `as_text_lossy()` drops non-text content (images, etc.) from multimodal
+/// messages. This is acceptable for Phase 4 since the CLI does not support
+/// multimodal input.
 pub fn handle_retry(history: &mut Vec<Message>) -> Option<String> {
     let last_user_idx = history.iter().rposition(|m| m.role == Role::User)?;
     let user_msg = history[last_user_idx].content.as_text_lossy();

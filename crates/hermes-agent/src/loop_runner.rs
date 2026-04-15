@@ -294,10 +294,13 @@ impl Agent {
     }
 
     /// Manually trigger context compression from the CLI.
+    ///
+    /// Returns a `CompressionResult` so callers can report outcomes without
+    /// coupling this library code to stdout/stderr.
     pub async fn manual_compress(
         &mut self,
         history: &mut Vec<Message>,
-    ) -> hermes_core::error::Result<()> {
+    ) -> hermes_core::error::Result<CompressionResult> {
         // Rebuild full system prompt with memory blocks (same as run_conversation)
         let memory_block = self.memory.system_prompt_blocks();
         let full_system = if memory_block.is_empty() {
@@ -311,29 +314,22 @@ impl Agent {
             .compressor
             .should_compress(&full_system, history, tool_count)
         {
-            println!("No compression needed.");
-            return Ok(());
+            return Ok(CompressionResult::NotNeeded);
         }
 
         let contrib = self.memory.on_pre_compress(history).await;
-        match self
+        let result = self
             .compressor
             .compress(history, self.provider.as_ref(), contrib.as_deref())
-            .await
-        {
-            Ok(CompressionResult::Compressed {
-                before_tokens,
-                after_tokens,
-                ..
-            }) => {
-                println!("Compressed: {before_tokens} → {after_tokens} tokens");
-                self.cache_manager.invalidate();
-                let _ = self.memory.refresh_snapshot();
-            }
-            Ok(CompressionResult::NotNeeded) => println!("No compression needed."),
-            Err(e) => eprintln!("Compression failed: {e}"),
+            .await?;
+
+        if matches!(&result, CompressionResult::Compressed { .. }) {
+            tracing::info!("manual compression complete");
+            self.cache_manager.invalidate();
+            let _ = self.memory.refresh_snapshot();
         }
-        Ok(())
+
+        Ok(result)
     }
 }
 

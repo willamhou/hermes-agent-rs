@@ -1,6 +1,10 @@
 //! Interactive REPL loop for the Hermes CLI.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use anyhow::{Context as _, Result};
 use hermes_agent::{
@@ -70,7 +74,13 @@ pub async fn run_repl() -> Result<()> {
     ));
 
     let (clarify_tx, clarify_rx) = mpsc::channel::<ClarifyRequest>(4);
-    spawn_clarify_handler(clarify_rx);
+    // Shared flag: clarify handler sets this while reading stdin so the readline
+    // loop (in read_repl_input) knows to pause. Although the current repl_loop
+    // design serializes readline and run_message (so there is no concurrent
+    // stdin read in normal flow), this guard makes the invariant explicit and
+    // protects against future refactors that might introduce concurrency.
+    let clarify_active = Arc::new(AtomicBool::new(false));
+    spawn_clarify_handler(clarify_rx, Arc::clone(&clarify_active));
 
     let agent_config = AgentConfig {
         provider,
@@ -116,7 +126,15 @@ pub async fn run_repl() -> Result<()> {
     println!("Session: {session_id}");
     println!("Type /help for commands, /quit to exit.\n");
 
-    repl_loop(&mut agent, &mut history, &store, &session_id, &config).await?;
+    repl_loop(
+        &mut agent,
+        &mut history,
+        &store,
+        &session_id,
+        &config,
+        clarify_active,
+    )
+    .await?;
 
     let _ = store.end_session(&session_id).await;
 
@@ -187,7 +205,8 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
     ));
 
     let (clarify_tx, clarify_rx) = mpsc::channel::<ClarifyRequest>(4);
-    spawn_clarify_handler(clarify_rx);
+    let clarify_active = Arc::new(AtomicBool::new(false));
+    spawn_clarify_handler(clarify_rx, Arc::clone(&clarify_active));
 
     let mut agent = Agent::new(AgentConfig {
         provider,
@@ -208,7 +227,15 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
     println!("Hermes — model: {model}");
     println!("Type /help for commands, /quit to exit.\n");
 
-    repl_loop(&mut agent, &mut history, &store, &session_id, &config).await?;
+    repl_loop(
+        &mut agent,
+        &mut history,
+        &store,
+        &session_id,
+        &config,
+        clarify_active,
+    )
+    .await?;
 
     let _ = store.end_session(&session_id).await;
 
@@ -222,12 +249,13 @@ async fn repl_loop(
     store: &SqliteSessionStore,
     session_id: &str,
     config: &AppConfig,
+    clarify_active: Arc<AtomicBool>,
 ) -> Result<()> {
     let history_path = hermes_home().join("cli_history.txt");
 
     // ── Main async loop ───────────────────────────────────────────────────────
     loop {
-        let input = read_repl_input(history_path.clone()).await?;
+        let input = read_repl_input(history_path.clone(), Arc::clone(&clarify_active)).await?;
 
         if input.is_empty() {
             continue;
@@ -268,8 +296,18 @@ async fn repl_loop(
                         "undo" => handlers::handle_undo(history),
                         "compress" => {
                             println!("Compressing context...");
-                            if let Err(e) = agent.manual_compress(history).await {
-                                eprintln!("Compression error: {e:#}");
+                            match agent.manual_compress(history).await {
+                                Ok(hermes_agent::compressor::CompressionResult::NotNeeded) => {
+                                    println!("No compression needed.");
+                                }
+                                Ok(hermes_agent::compressor::CompressionResult::Compressed {
+                                    before_tokens,
+                                    after_tokens,
+                                    ..
+                                }) => {
+                                    println!("Compressed: {before_tokens} → {after_tokens} tokens");
+                                }
+                                Err(e) => eprintln!("Compression failed: {e:#}"),
                             }
                         }
                         "skills" => handlers::handle_skills_list(),
@@ -297,6 +335,10 @@ async fn repl_loop(
 }
 
 /// Send `message` to the agent, stream the response, and persist new history entries.
+///
+/// Persistence happens AFTER the agent run completes so that an error mid-turn
+/// leaves no orphaned messages in the DB. The trade-off is that a crash during
+/// execution loses the entire turn, but that is preferable to inconsistent state.
 async fn run_message(
     agent: &mut Agent,
     history: &mut Vec<Message>,
@@ -304,32 +346,45 @@ async fn run_message(
     session_id: &str,
     message: &str,
 ) {
-    let user_msg = Message::user(message);
-    let _ = store.append_message(session_id, &user_msg).await;
-
     let pre_len = history.len();
 
     let (delta_tx, delta_rx) = mpsc::channel::<StreamDelta>(64);
     let render_handle = tokio::spawn(render_stream(delta_rx));
 
+    // run_conversation pushes the user message onto history before calling the provider.
     let result = agent.run_conversation(message, history, delta_tx).await;
 
     let _ = render_handle.await;
 
-    // Persist messages added this turn (skip the user message, already persisted).
-    // Clamp: compression may shrink history below pre_len + 1.
-    let persist_start = (pre_len + 1).min(history.len());
-    for msg in &history[persist_start..] {
-        let _ = store.append_message(session_id, msg).await;
+    if let Err(ref e) = result {
+        eprintln!("Error: {e:#}");
+        // Do not persist messages from a failed turn.
+        return;
     }
 
-    if let Err(e) = result {
-        eprintln!("Error: {e:#}");
+    // Persist ALL messages added this turn (user message + assistant/tool turns).
+    // Clamp: compression may shrink history below pre_len.
+    // TODO: After compression fires mid-turn, the DB retains pre-compression messages
+    // while in-memory history has been compressed. Session resume will load the full
+    // uncompressed history. This is acceptable for Phase 4 — compression will re-trigger
+    // naturally on the resumed session when the token count exceeds the threshold again.
+    let persist_start = pre_len.min(history.len());
+    for msg in &history[persist_start..] {
+        let _ = store.append_message(session_id, msg).await;
     }
 }
 
 /// Spawn a task that receives `ClarifyRequest`s and prompts the user via stdin.
-fn spawn_clarify_handler(mut clarify_rx: mpsc::Receiver<ClarifyRequest>) {
+///
+/// `clarify_active` is set to `true` while stdin is being read so that the
+/// readline loop in `read_repl_input` knows to pause. Although the current
+/// repl_loop design serializes readline and agent execution (so there is no
+/// truly concurrent stdin read in normal flow), this guard makes the invariant
+/// explicit and protects against future refactors that might introduce concurrency.
+fn spawn_clarify_handler(
+    mut clarify_rx: mpsc::Receiver<ClarifyRequest>,
+    clarify_active: Arc<AtomicBool>,
+) {
     tokio::spawn(async move {
         while let Some(req) = clarify_rx.recv().await {
             println!("\n--- Agent asks: ---");
@@ -345,9 +400,12 @@ fn spawn_clarify_handler(mut clarify_rx: mpsc::Receiver<ClarifyRequest>) {
 
             let choices = req.choices.clone();
             let choices_len = choices.len();
+            let flag = Arc::clone(&clarify_active);
             let answer = tokio::task::spawn_blocking(move || {
+                flag.store(true, Ordering::Relaxed);
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input).ok();
+                flag.store(false, Ordering::Relaxed);
                 let trimmed = input.trim().to_string();
                 // If user typed a number selecting a listed choice, expand it
                 if let Ok(n) = trimmed.parse::<usize>() {
@@ -370,8 +428,13 @@ fn spawn_clarify_handler(mut clarify_rx: mpsc::Receiver<ClarifyRequest>) {
     });
 }
 
-async fn read_repl_input(history_path: PathBuf) -> Result<String> {
+async fn read_repl_input(history_path: PathBuf, clarify_active: Arc<AtomicBool>) -> Result<String> {
     tokio::task::spawn_blocking(move || -> Result<String> {
+        // Wait while the clarify handler is reading stdin to avoid concurrent access.
+        while clarify_active.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
         let mut rl =
             rustyline::DefaultEditor::new().context("failed to initialise readline editor")?;
 
