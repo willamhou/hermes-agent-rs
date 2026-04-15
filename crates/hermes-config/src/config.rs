@@ -202,6 +202,68 @@ pub struct ApprovalConfigYaml {
     pub policy: ApprovalPolicy,
 }
 
+// ─── Gateway config ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayConfig {
+    #[serde(default)]
+    pub telegram: Option<TelegramGatewayConfig>,
+    #[serde(default)]
+    pub api_server: Option<ApiServerGatewayConfig>,
+    #[serde(default = "default_session_idle_timeout")]
+    pub session_idle_timeout_secs: u64,
+    #[serde(default = "default_max_sessions")]
+    pub max_concurrent_sessions: usize,
+}
+
+fn default_session_idle_timeout() -> u64 {
+    1800
+}
+fn default_max_sessions() -> usize {
+    100
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            telegram: None,
+            api_server: None,
+            session_idle_timeout_secs: default_session_idle_timeout(),
+            max_concurrent_sessions: default_max_sessions(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramGatewayConfig {
+    pub token: String,
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    #[serde(default)]
+    pub allow_all: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiServerGatewayConfig {
+    #[serde(default = "default_bind_addr")]
+    pub bind_addr: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+fn default_bind_addr() -> String {
+    "0.0.0.0:8080".into()
+}
+
+impl Default for ApiServerGatewayConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: default_bind_addr(),
+            api_key: None,
+        }
+    }
+}
+
 // ─── Config struct ────────────────────────────────────────────────────────────
 
 /// Top-level application configuration.
@@ -238,6 +300,10 @@ pub struct AppConfig {
     /// External MCP servers discovered at startup.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+
+    /// Gateway configuration (Telegram, API server, etc.).
+    #[serde(default)]
+    pub gateway: Option<GatewayConfig>,
 }
 
 fn default_model() -> String {
@@ -263,6 +329,7 @@ impl Default for AppConfig {
             browser: BrowserConfigYaml::default(),
             approval: ApprovalConfigYaml::default(),
             mcp_servers: vec![],
+            gateway: None,
         }
     }
 }
@@ -397,6 +464,7 @@ mod tests {
             browser: BrowserConfigYaml::default(),
             approval: ApprovalConfigYaml::default(),
             mcp_servers: vec![],
+            gateway: None,
         };
         let yaml = serde_yaml_ng::to_string(&original).expect("serialize failed");
         let restored: AppConfig = serde_yaml_ng::from_str(&yaml).expect("deserialize failed");
@@ -579,6 +647,30 @@ mcp_servers:
             Some("Bearer test-token")
         );
         assert!(cfg.mcp_servers[0].command.is_empty());
+    }
+
+    #[test]
+    fn gateway_config_parsing() {
+        let yaml = r#"
+model: "openai/gpt-4o"
+gateway:
+  session_idle_timeout_secs: 3600
+  telegram:
+    token: "test-token"
+    allow_all: true
+  api_server:
+    bind_addr: "127.0.0.1:9090"
+    api_key: "secret"
+"#;
+        let cfg: AppConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let gw = cfg.gateway.unwrap();
+        assert_eq!(gw.session_idle_timeout_secs, 3600);
+        let tg = gw.telegram.unwrap();
+        assert_eq!(tg.token, "test-token");
+        assert!(tg.allow_all);
+        let api = gw.api_server.unwrap();
+        assert_eq!(api.bind_addr, "127.0.0.1:9090");
+        assert_eq!(api.api_key, Some("secret".into()));
     }
 
     #[test]

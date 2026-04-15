@@ -40,6 +40,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 
 # HTTP
 reqwest = { version = "0.12", features = ["json", "stream"] }
+axum = "0.8"
 bytes = "1"
 base64 = "0.22"
 chromiumoxide = "0.7"
