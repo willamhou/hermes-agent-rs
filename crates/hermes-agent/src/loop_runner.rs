@@ -160,6 +160,8 @@ impl Agent {
                     Arc::new(hermes_skills::SharedSkillManager::new(Arc::clone(skills)))
                         as Arc<dyn SkillAccess>
                 }),
+                delegation_depth: 0,
+                clarify_tx: None,
             };
 
             let tool_results = if should_parallelize(&response.tool_calls, &self.registry) {

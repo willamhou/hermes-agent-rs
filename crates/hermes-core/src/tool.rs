@@ -4,6 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
+use crate::clarify::ClarifyRequest;
 use crate::error::Result;
 use crate::message::Message;
 use crate::message::ToolResult;
@@ -109,6 +110,8 @@ pub struct ToolContext {
     pub memory: Option<Arc<dyn MemoryAccess>>,
     pub aux_provider: Option<Arc<dyn crate::provider::Provider>>,
     pub skills: Option<Arc<dyn SkillAccess>>,
+    pub delegation_depth: u32,
+    pub clarify_tx: Option<mpsc::Sender<ClarifyRequest>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

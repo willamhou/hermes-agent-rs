@@ -1,3 +1,4 @@
+pub mod clarify;
 pub mod error;
 pub mod memory;
 pub mod message;

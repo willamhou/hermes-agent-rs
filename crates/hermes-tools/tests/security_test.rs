@@ -27,6 +27,8 @@ fn make_test_ctx(workspace: &Path) -> ToolContext {
         memory: None,
         aux_provider: None,
         skills: None,
+        delegation_depth: 0,
+        clarify_tx: None,
     }
 }
 
@@ -300,6 +302,8 @@ async fn test_write_file_etc_blocked() {
         memory: None,
         aux_provider: None,
         skills: None,
+        delegation_depth: 0,
+        clarify_tx: None,
     };
 
     let tool = hermes_tools::file_write::WriteFileTool;

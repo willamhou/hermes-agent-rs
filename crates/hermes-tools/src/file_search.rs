@@ -355,6 +355,8 @@ mod tests {
             memory: None,
             aux_provider: None,
             skills: None,
+            delegation_depth: 0,
+            clarify_tx: None,
         }
     }
 
