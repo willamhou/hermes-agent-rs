@@ -13,6 +13,7 @@ hermes-provider.workspace = true
 hermes-tools.workspace = true
 hermes-config.workspace = true
 hermes-memory.workspace = true
+hermes-skills.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true

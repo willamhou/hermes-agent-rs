@@ -1,17 +1,14 @@
-use std::sync::Arc;
-use async_trait::async_trait;
-use tokio::sync::mpsc;
 use crate::error::Result;
+use async_trait::async_trait;
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ChatType {
+    #[default]
     DirectMessage,
     Group,
     Channel,
-}
-
-impl Default for ChatType {
-    fn default() -> Self { Self::DirectMessage }
 }
 
 #[derive(Debug, Clone)]
