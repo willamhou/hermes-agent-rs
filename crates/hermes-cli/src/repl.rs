@@ -79,6 +79,8 @@ pub async fn run_repl() -> Result<()> {
         memory,
         skills: Some(skills),
         compression: CompressionConfig::default(),
+        delegation_depth: 0,
+        clarify_tx: None,
     };
     let mut agent = Agent::new(agent_config);
     let mut history: Vec<Message> = Vec::new();
@@ -191,6 +193,8 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
         memory,
         skills: Some(skills),
         compression: CompressionConfig::default(),
+        delegation_depth: 0,
+        clarify_tx: None,
     });
 
     println!("Hermes — model: {model}");

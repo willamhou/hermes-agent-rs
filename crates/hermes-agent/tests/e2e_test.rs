@@ -155,6 +155,8 @@ where
         memory,
         skills: None,
         compression: CompressionConfig::default(),
+        delegation_depth: 0,
+        clarify_tx: None,
     })
 }
 

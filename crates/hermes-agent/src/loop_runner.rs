@@ -3,6 +3,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use hermes_core::{
+    clarify::ClarifyRequest,
     error::Result,
     message::{Content, Message, Role},
     provider::{ChatRequest, Provider},
@@ -32,6 +33,10 @@ pub struct AgentConfig {
     pub memory: hermes_memory::MemoryManager,
     pub skills: Option<Arc<RwLock<hermes_skills::SkillManager>>>,
     pub compression: CompressionConfig,
+    /// Delegation depth: 0 for root agents, incremented for each child.
+    pub delegation_depth: u32,
+    /// Channel for clarify requests to the UI. Children get `None`.
+    pub clarify_tx: Option<mpsc::Sender<ClarifyRequest>>,
 }
 
 /// Stateful agent that drives a conversation loop.
@@ -48,6 +53,8 @@ pub struct Agent {
     skills: Option<Arc<RwLock<hermes_skills::SkillManager>>>,
     cache_manager: PromptCacheManager,
     compressor: ContextCompressor,
+    delegation_depth: u32,
+    clarify_tx: Option<mpsc::Sender<ClarifyRequest>>,
 }
 
 impl Agent {
@@ -66,6 +73,8 @@ impl Agent {
             skills: config.skills,
             cache_manager: PromptCacheManager::new(),
             compressor: ContextCompressor::new(config.compression),
+            delegation_depth: config.delegation_depth,
+            clarify_tx: config.clarify_tx,
         }
     }
 
@@ -160,8 +169,8 @@ impl Agent {
                     Arc::new(hermes_skills::SharedSkillManager::new(Arc::clone(skills)))
                         as Arc<dyn SkillAccess>
                 }),
-                delegation_depth: 0,
-                clarify_tx: None,
+                delegation_depth: self.delegation_depth,
+                clarify_tx: self.clarify_tx.clone(),
             };
 
             let tool_results = if should_parallelize(&response.tool_calls, &self.registry) {
@@ -443,6 +452,8 @@ mod tests {
             memory,
             skills,
             compression,
+            delegation_depth: 0,
+            clarify_tx: None,
         });
         (agent, approval_rx)
     }

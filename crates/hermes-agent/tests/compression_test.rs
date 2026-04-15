@@ -125,6 +125,8 @@ fn make_agent(
         memory,
         skills: None,
         compression,
+        delegation_depth: 0,
+        clarify_tx: None,
     });
 
     (agent, approval_rx)
