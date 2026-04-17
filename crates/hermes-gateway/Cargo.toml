@@ -28,3 +28,6 @@ axum.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
