@@ -8,13 +8,16 @@ mod render;
 mod repl;
 mod tooling;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use hermes_core::session::SessionStore as _;
 
 /// Hermes — AI agent CLI
 #[derive(Parser, Debug)]
 #[command(name = "hermes", about = "Interactive AI agent powered by Hermes")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// Send a single message and print the response (non-interactive).
     #[arg(short, long)]
     message: Option<String>,
@@ -36,6 +39,12 @@ struct Cli {
     list_sessions: bool,
 }
 
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Start the gateway server (Telegram, API)
+    Gateway,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -47,6 +56,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    if let Some(Commands::Gateway) = cli.command {
+        return run_gateway().await;
+    }
 
     if cli.list_sessions {
         return list_sessions_cmd().await;
@@ -62,6 +75,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     repl::run_repl().await
+}
+
+async fn run_gateway() -> anyhow::Result<()> {
+    let config = hermes_config::config::AppConfig::load();
+    let gateway_config = config.gateway.clone().unwrap_or_default();
+
+    if gateway_config.telegram.is_none() && gateway_config.api_server.is_none() {
+        anyhow::bail!(
+            "No gateway adapters configured.\n\
+             Add [gateway.telegram] or [gateway.api_server] to ~/.hermes/config.yaml"
+        );
+    }
+
+    let runner = hermes_gateway::GatewayRunner::new(gateway_config, config);
+    runner.run().await
 }
 
 async fn list_sessions_cmd() -> anyhow::Result<()> {
