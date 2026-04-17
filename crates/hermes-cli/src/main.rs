@@ -84,7 +84,7 @@ async fn run_gateway() -> anyhow::Result<()> {
     if gateway_config.telegram.is_none() && gateway_config.api_server.is_none() {
         anyhow::bail!(
             "No gateway adapters configured.\n\
-             Add [gateway.telegram] or [gateway.api_server] to ~/.hermes/config.yaml"
+             Add 'gateway.telegram' or 'gateway.api_server' section to ~/.hermes/config.yaml"
         );
     }
 

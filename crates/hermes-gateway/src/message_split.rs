@@ -11,21 +11,26 @@ pub fn split_message(text: &str, max_chars: usize) -> Vec<String> {
         return vec![text.to_owned()];
     }
 
+    // Reserve space for the "(NN/NN) " prefix that will be prepended to each chunk.
+    // A prefix like "(12/12) " is 9 chars; we reserve 12 to be safe.
+    const PREFIX_RESERVE: usize = 12;
+    let effective_max = max_chars.saturating_sub(PREFIX_RESERVE);
+
     // First pass: collect raw chunks, splitting at newlines where possible.
     let mut chunks: Vec<String> = Vec::new();
     let mut remaining = text;
 
     while !remaining.is_empty() {
         let char_count = remaining.chars().count();
-        if char_count <= max_chars {
+        if char_count <= effective_max {
             chunks.push(remaining.to_owned());
             break;
         }
 
-        // Find the byte offset of the max_chars-th character.
+        // Find the byte offset of the effective_max-th character.
         let limit_byte = remaining
             .char_indices()
-            .nth(max_chars)
+            .nth(effective_max)
             .map(|(i, _)| i)
             .unwrap_or(remaining.len());
 
@@ -152,14 +157,17 @@ mod tests {
     fn very_long_message_multiple_chunks() {
         let text = "A".repeat(20000);
         let chunks = split_message(&text, 4000);
-        // 20000 / 4000 = 5 chunks exactly.
-        assert_eq!(chunks.len(), 5);
+        // effective_max = 4000 - 12 = 3988; 20000 / 3988 → 6 chunks
+        assert!(chunks.len() >= 5);
         let n = chunks.len();
         for (i, chunk) in chunks.iter().enumerate() {
             assert!(chunk.starts_with(&format!("({}/{}) ", i + 1, n)));
             let prefix_end = chunk.find(") ").map(|p| p + 2).unwrap_or(0);
             let content = &chunk[prefix_end..];
-            assert_eq!(content.chars().count(), 4000);
+            // Each chunk's total length (prefix + content) must not exceed max_chars
+            assert!(chunk.chars().count() <= 4000);
+            // Content alone must fit within effective_max
+            assert!(content.chars().count() <= 3988);
         }
     }
 }

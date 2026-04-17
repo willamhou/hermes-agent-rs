@@ -45,15 +45,22 @@ pub struct SessionRouter {
     sessions: Arc<DashMap<String, SessionHandle>>,
     shared: Arc<SharedState>,
     idle_timeout_secs: u64,
+    max_sessions: usize,
     app_config: AppConfig,
 }
 
 impl SessionRouter {
-    pub fn new(shared: Arc<SharedState>, idle_timeout_secs: u64, app_config: AppConfig) -> Self {
+    pub fn new(
+        shared: Arc<SharedState>,
+        idle_timeout_secs: u64,
+        max_sessions: usize,
+        app_config: AppConfig,
+    ) -> Self {
         Self {
             sessions: Arc::new(DashMap::new()),
             shared,
             idle_timeout_secs,
+            max_sessions,
             app_config,
         }
     }
@@ -66,34 +73,43 @@ impl SessionRouter {
         // Create response channel
         let (response_tx, response_rx) = oneshot::channel();
 
-        // Get or create session
-        let msg_tx = {
-            let entry = self.sessions.entry(key.clone());
-            let handle = entry.or_insert_with(|| {
+        // Get or create session using Vacant/Occupied entry API to avoid TOCTOU
+        let msg_tx = match self.sessions.entry(key.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(e) => {
+                e.get().last_active.store(epoch_secs(), Ordering::Relaxed);
+                e.get().msg_tx.clone()
+            }
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                if self.sessions.len() >= self.max_sessions {
+                    return "Error: maximum concurrent sessions reached".into();
+                }
+                let agent = match build_session_agent(&key, &self.shared, &self.app_config) {
+                    Ok(a) => a,
+                    Err(err) => return format!("Error: failed to create session: {err}"),
+                };
                 let (tx, rx) = mpsc::channel::<RoutedMessage>(32);
                 let last_active = Arc::new(AtomicU64::new(epoch_secs()));
                 let shared = Arc::clone(&self.shared);
-                let app_config = self.app_config.clone();
                 let la = Arc::clone(&last_active);
-                let sid = key.clone();
 
                 tokio::spawn(async move {
-                    session_task(sid, rx, shared, app_config, la).await;
+                    session_task_with_agent(agent, rx, shared, la).await;
                 });
 
-                SessionHandle {
+                let handle = e.insert(SessionHandle {
                     msg_tx: tx,
                     last_active,
-                }
-            });
-            handle.last_active.store(epoch_secs(), Ordering::Relaxed);
-            handle.msg_tx.clone()
+                });
+                handle.msg_tx.clone()
+            }
         };
 
         // Send message to session
         let routed = RoutedMessage { event, response_tx };
         if msg_tx.send(routed).await.is_err() {
-            return "Session error: task not running".into();
+            // Session task died; remove stale handle so next message recreates it
+            self.sessions.remove(&key);
+            return "Session error: task not running, session removed".into();
         }
 
         // Wait for response
@@ -137,14 +153,13 @@ pub fn session_key(event: &MessageEvent) -> String {
 
 // ─── Session task ─────────────────────────────────────────────────────────────
 
-async fn session_task(
-    session_id: String,
+/// Run a session task given an already-constructed Agent.
+async fn session_task_with_agent(
+    mut agent: hermes_agent::loop_runner::Agent,
     mut msg_rx: mpsc::Receiver<RoutedMessage>,
     shared: Arc<SharedState>,
-    app_config: AppConfig,
     last_active: Arc<AtomicU64>,
 ) {
-    let mut agent = build_session_agent(&session_id, &shared, &app_config);
     let mut history = Vec::new();
 
     while let Some(routed) = msg_rx.recv().await {
@@ -163,14 +178,25 @@ async fn session_task(
 
         // Send response to originating platform
         if let Some(adapter) = shared.adapters.get(&routed.event.platform) {
-            let _ = adapter.send_response(&routed.event, &response).await;
+            if let Err(e) = adapter.send_response(&routed.event, &response).await {
+                tracing::warn!(
+                    platform = %routed.event.platform,
+                    "send_response failed: {e}"
+                );
+            }
+        } else {
+            tracing::warn!(
+                platform = %routed.event.platform,
+                "no adapter found for platform"
+            );
         }
 
         // Send sync response (for API server oneshot)
         let _ = routed.response_tx.send(response);
     }
 
-    tracing::debug!(session_id, "session task ended");
+    tracing::debug!("session task ended");
+    // Note: approval_rx closes when Agent drops here, ending the approval task.
 }
 
 // ─── Agent construction ───────────────────────────────────────────────────────
@@ -179,7 +205,7 @@ fn build_session_agent(
     session_id: &str,
     shared: &SharedState,
     app_config: &AppConfig,
-) -> hermes_agent::loop_runner::Agent {
+) -> hermes_core::error::Result<hermes_agent::loop_runner::Agent> {
     use hermes_agent::{
         compressor::CompressionConfig,
         loop_runner::{Agent, AgentConfig},
@@ -187,9 +213,12 @@ fn build_session_agent(
     use hermes_memory::MemoryManager;
 
     let memory_dir = hermes_config::config::hermes_home().join("memories");
-    let memory = MemoryManager::new(memory_dir, None).expect("failed to create memory");
+    let memory = MemoryManager::new(memory_dir, None).map_err(|e| {
+        hermes_core::error::HermesError::Config(format!("failed to create memory: {e}"))
+    })?;
 
-    // Gateway: auto-allow all tool approvals (no interactive UI)
+    // Gateway: auto-allow all tool approvals (no interactive UI).
+    // The approval task ends naturally when approval_rx closes (Agent drop).
     let (approval_tx, mut approval_rx) = mpsc::channel::<hermes_core::tool::ApprovalRequest>(8);
     tokio::spawn(async move {
         while let Some(req) = approval_rx.recv().await {
@@ -197,7 +226,7 @@ fn build_session_agent(
         }
     });
 
-    Agent::new(AgentConfig {
+    Ok(Agent::new(AgentConfig {
         provider: Arc::clone(&shared.provider),
         registry: Arc::clone(&shared.registry),
         max_iterations: app_config.max_iterations,
@@ -211,7 +240,7 @@ fn build_session_agent(
         compression: CompressionConfig::default(),
         delegation_depth: 0,
         clarify_tx: None,
-    })
+    }))
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

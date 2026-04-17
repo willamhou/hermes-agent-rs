@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
 };
@@ -43,8 +43,6 @@ impl ApiServerAdapter {
 struct ApiState {
     event_tx: mpsc::Sender<PlatformEvent>,
     pending: Arc<DashMap<String, oneshot::Sender<String>>>,
-    // Reserved for future request authentication — stored but not yet checked.
-    #[allow(dead_code)]
     api_key: Option<String>,
 }
 
@@ -131,8 +129,27 @@ async fn handle_health() -> impl IntoResponse {
 
 async fn handle_chat(
     State(state): State<ApiState>,
+    headers: HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> impl IntoResponse {
+    // API key authentication
+    if let Some(ref expected_key) = state.api_key {
+        let provided = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        match provided {
+            Some(key) if key == expected_key => {}
+            _ => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": "unauthorized"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     let request_id = uuid::Uuid::new_v4().to_string();
     let session_id = req
         .session_id

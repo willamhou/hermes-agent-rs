@@ -103,6 +103,7 @@ impl GatewayRunner {
         let router = SessionRouter::new(
             shared,
             self.gateway_config.session_idle_timeout_secs,
+            self.gateway_config.max_concurrent_sessions,
             self.app_config.clone(),
         );
 

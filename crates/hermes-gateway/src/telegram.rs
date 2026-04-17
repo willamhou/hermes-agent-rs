@@ -6,8 +6,9 @@ use hermes_core::{
     error::Result,
     platform::{ChatType, MessageEvent, PlatformAdapter, PlatformEvent},
 };
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -52,7 +53,7 @@ struct TgChat {
 // ─── Adapter ─────────────────────────────────────────────────────────────────
 
 pub struct TelegramAdapter {
-    token: String,
+    token: SecretString,
     client: reqwest::Client,
     allowed_users: HashSet<String>,
     allow_all: bool,
@@ -60,16 +61,25 @@ pub struct TelegramAdapter {
 
 impl TelegramAdapter {
     pub fn new(token: String, allowed_users: Vec<String>, allow_all: bool) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("reqwest client");
         Self {
-            token,
-            client: reqwest::Client::new(),
+            token: SecretString::new(token.into()),
+            client,
             allowed_users: allowed_users.into_iter().collect(),
             allow_all,
         }
     }
 
     fn api_url(&self, method: &str) -> String {
-        format!("https://api.telegram.org/bot{}/{}", self.token, method)
+        format!(
+            "https://api.telegram.org/bot{}/{}",
+            self.token.expose_secret(),
+            method
+        )
     }
 
     fn is_authorized(&self, user: &TgUser) -> bool {
@@ -116,8 +126,7 @@ impl PlatformAdapter for TelegramAdapter {
             let mut req = self
                 .client
                 .get(self.api_url("getUpdates"))
-                .query(&[("timeout", "30")])
-                .query(&[("allowed_updates", "[\"message\"]")]);
+                .query(&[("timeout", "30")]);
 
             if let Some(off) = offset {
                 req = req.query(&[("offset", off.to_string())]);

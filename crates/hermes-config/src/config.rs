@@ -252,7 +252,7 @@ pub struct ApiServerGatewayConfig {
 }
 
 fn default_bind_addr() -> String {
-    "0.0.0.0:8080".into()
+    "127.0.0.1:8080".into()
 }
 
 impl Default for ApiServerGatewayConfig {
