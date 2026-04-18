@@ -171,10 +171,13 @@ impl Tool for CronTool {
                         message: format!("job {job_id} not found"),
                     })?;
                 job.enabled = false;
-                store.update(job).map_err(|e| HermesError::Tool {
+                let found = store.update(job).map_err(|e| HermesError::Tool {
                     name: "cron".into(),
                     message: e.to_string(),
                 })?;
+                if !found {
+                    tracing::warn!(job_id = %job_id, "pause: job disappeared from store");
+                }
                 Ok(ToolResult::ok(
                     json!({"paused": true, "job_id": job_id}).to_string(),
                 ))
@@ -200,10 +203,13 @@ impl Tool for CronTool {
                 // Recompute next_run
                 let now = chrono::Utc::now();
                 job.next_run_at = compute_next_run(&job.schedule, &now).map(|dt| dt.to_rfc3339());
-                store.update(job).map_err(|e| HermesError::Tool {
+                let found = store.update(job).map_err(|e| HermesError::Tool {
                     name: "cron".into(),
                     message: e.to_string(),
                 })?;
+                if !found {
+                    tracing::warn!(job_id = %job_id, "resume: job disappeared from store");
+                }
                 Ok(ToolResult::ok(
                     json!({"resumed": true, "job_id": job_id}).to_string(),
                 ))
@@ -227,10 +233,13 @@ impl Tool for CronTool {
                     })?;
                 job.next_run_at = Some(chrono::Utc::now().to_rfc3339());
                 job.enabled = true;
-                store.update(job).map_err(|e| HermesError::Tool {
+                let found = store.update(job).map_err(|e| HermesError::Tool {
                     name: "cron".into(),
                     message: e.to_string(),
                 })?;
+                if !found {
+                    tracing::warn!(job_id = %job_id, "trigger: job disappeared from store");
+                }
                 Ok(ToolResult::ok(
                     json!({"triggered": true, "job_id": job_id}).to_string(),
                 ))

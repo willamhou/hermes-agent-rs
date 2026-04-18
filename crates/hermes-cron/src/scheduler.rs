@@ -34,6 +34,8 @@ pub struct JobRunResult {
     pub status: String,
     pub response: String,
     pub duration: Duration,
+    /// Wall-clock time at which the job started running (RFC 3339).
+    pub started_at: String,
 }
 
 // ─── impl CronScheduler ───────────────────────────────────────────────────────
@@ -101,9 +103,11 @@ impl CronScheduler {
                 .map(|dt| dt.with_timezone(&chrono::Utc));
 
             match next {
-                Some(dt) if dt > now => continue, // not due yet
-                None => continue,                 // no next_run scheduled
-                _ => {}                           // due!
+                // dt > now: still in the future — not due yet.
+                // Fires on the tick where now >= dt (i.e. the condition is false).
+                Some(dt) if dt > now => continue,
+                None => continue, // no next_run scheduled
+                _ => {}           // due!
             }
 
             tracing::info!(job_id = %job.id, name = %job.name, "executing cron job");
@@ -120,6 +124,7 @@ impl CronScheduler {
     /// Build and run a fresh isolated Agent for the given job.
     async fn run_job(&self, job: &CronJob) -> JobRunResult {
         let start = std::time::Instant::now();
+        let started_at = chrono::Utc::now().to_rfc3339();
 
         // Build provider from config
         let api_key = match self.app_config.api_key() {
@@ -131,6 +136,7 @@ impl CronScheduler {
                     status: "failed".into(),
                     response: "No API key configured".into(),
                     duration: start.elapsed(),
+                    started_at,
                 };
             }
         };
@@ -148,6 +154,7 @@ impl CronScheduler {
                     status: "failed".into(),
                     response: format!("Provider error: {e}"),
                     duration: start.elapsed(),
+                    started_at,
                 };
             }
         };
@@ -177,6 +184,7 @@ impl CronScheduler {
                             status: "failed".into(),
                             response: format!("Memory init failed: {e}"),
                             duration: start.elapsed(),
+                            started_at,
                         };
                     }
                 }
@@ -231,6 +239,7 @@ impl CronScheduler {
                 status: "success".into(),
                 response,
                 duration,
+                started_at,
             },
             Err(e) => JobRunResult {
                 job_id: job.id.clone(),
@@ -238,6 +247,7 @@ impl CronScheduler {
                 status: "failed".into(),
                 response: e.to_string(),
                 duration,
+                started_at,
             },
         }
     }
@@ -247,7 +257,11 @@ impl CronScheduler {
         let dir = self.output_dir.join(&job.id);
         std::fs::create_dir_all(&dir)?;
 
-        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+        // Include milliseconds in the filename to prevent collision when two jobs
+        // complete within the same second.
+        let timestamp = chrono::DateTime::parse_from_rfc3339(&result.started_at)
+            .map(|dt| dt.format("%Y%m%d_%H%M%S%.3f").to_string())
+            .unwrap_or_else(|_| chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f").to_string());
         let path = dir.join(format!("{timestamp}.md"));
 
         let content = format!(
@@ -260,7 +274,7 @@ impl CronScheduler {
              ## Response\n{response}\n",
             name = job.name,
             id = job.id,
-            ran_at = chrono::Utc::now().to_rfc3339(),
+            ran_at = result.started_at,
             duration = result.duration.as_secs_f64(),
             status = result.status,
             prompt = job.prompt,
@@ -282,17 +296,32 @@ impl CronScheduler {
             None
         };
 
-        // Compute next run
+        // Compute next run.
+        // For Interval schedules use the original scheduled time as the base to
+        // prevent drift: if a job was supposed to run at T but finished at T+2min,
+        // the next interval still starts from T, not T+2min.
         let now = chrono::Utc::now();
+        let base_time = match &job.schedule {
+            crate::job::JobSchedule::Interval { .. } => job
+                .next_run_at
+                .as_ref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or(now),
+            _ => now,
+        };
         updated.next_run_at =
-            crate::job::compute_next_run(&job.schedule, &now).map(|dt| dt.to_rfc3339());
+            crate::job::compute_next_run(&job.schedule, &base_time).map(|dt| dt.to_rfc3339());
 
         // Once jobs: disable after completion
         if matches!(job.schedule, crate::job::JobSchedule::Once { .. }) {
             updated.enabled = false;
         }
 
-        self.store.update(updated)?;
+        let found = self.store.update(updated)?;
+        if !found {
+            tracing::warn!(job_id = %job.id, "mark_completed: job not found in store");
+        }
         Ok(())
     }
 }
@@ -383,6 +412,7 @@ mod tests {
             status: "success".into(),
             response: "all good".into(),
             duration: Duration::from_millis(42),
+            started_at: chrono::Utc::now().to_rfc3339(),
         };
 
         scheduler.save_output(&job, &result).unwrap();
@@ -419,6 +449,7 @@ mod tests {
             status: "success".into(),
             response: "done".into(),
             duration: Duration::from_secs(1),
+            started_at: chrono::Utc::now().to_rfc3339(),
         };
 
         scheduler.mark_completed(&job, &result).unwrap();
@@ -461,6 +492,7 @@ mod tests {
             status: "success".into(),
             response: "once done".into(),
             duration: Duration::from_millis(100),
+            started_at: chrono::Utc::now().to_rfc3339(),
         };
 
         scheduler.mark_completed(&job, &result).unwrap();

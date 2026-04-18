@@ -66,12 +66,18 @@ impl JobStore {
         self.write(jobs)
     }
 
-    pub fn update(&self, job: CronJob) -> anyhow::Result<()> {
+    pub fn update(&self, job: CronJob) -> anyhow::Result<bool> {
         let mut jobs = self.list()?;
-        if let Some(existing) = jobs.iter_mut().find(|j| j.id == job.id) {
+        let found = if let Some(existing) = jobs.iter_mut().find(|j| j.id == job.id) {
             *existing = job;
+            true
+        } else {
+            false
+        };
+        if found {
+            self.write(jobs)?;
         }
-        self.write(jobs)
+        Ok(found)
     }
 
     pub fn remove(&self, id: &str) -> anyhow::Result<bool> {
@@ -163,7 +169,7 @@ mod tests {
         let mut job = make_job("gamma");
         store.create(job.clone()).unwrap();
         job.name = "gamma-updated".to_string();
-        store.update(job.clone()).unwrap();
+        assert!(store.update(job.clone()).unwrap());
         let found = store.get(&job.id).unwrap().unwrap();
         assert_eq!(found.name, "gamma-updated");
     }

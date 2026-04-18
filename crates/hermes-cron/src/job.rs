@@ -107,7 +107,7 @@ pub fn compute_next_run(schedule: &JobSchedule, after: &DateTime<Utc>) -> Option
 
 impl CronJob {
     pub fn new(name: String, prompt: String, schedule: JobSchedule, deliver: String) -> Self {
-        let id = uuid::Uuid::new_v4().to_string()[..12].to_string();
+        let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
         let now = Utc::now();
         let next = compute_next_run(&schedule, &now);
         Self {
