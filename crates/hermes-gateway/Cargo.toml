@@ -12,6 +12,7 @@ hermes-agent.workspace = true
 hermes-provider.workspace = true
 hermes-tools.workspace = true
 hermes-config.workspace = true
+hermes-cron.workspace = true
 hermes-memory.workspace = true
 hermes-skills.workspace = true
 serde.workspace = true

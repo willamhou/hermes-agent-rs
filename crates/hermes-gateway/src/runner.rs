@@ -117,6 +117,29 @@ impl GatewayRunner {
             }
         });
 
+        // Spawn cron scheduler tick loop
+        let cron_store_path = hermes_config::config::hermes_home()
+            .join("cron")
+            .join("jobs.json");
+        if let Ok(cron_store) = hermes_cron::store::JobStore::open(cron_store_path) {
+            let output_dir = hermes_config::config::hermes_home()
+                .join("cron")
+                .join("output");
+            let cron_config = self.app_config.clone();
+            tokio::spawn(async move {
+                let scheduler =
+                    hermes_cron::scheduler::CronScheduler::new(cron_store, output_dir, cron_config);
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = scheduler.tick().await {
+                        tracing::warn!("cron tick error: {e}");
+                    }
+                }
+            });
+            tracing::info!("cron scheduler enabled (60s tick)");
+        }
+
         // 5. Main event loop
         tracing::info!("gateway started — waiting for messages");
         while let Some(event) = event_rx.recv().await {

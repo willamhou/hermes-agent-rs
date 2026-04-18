@@ -95,5 +95,29 @@ pub fn handle_skills_list() {
 }
 
 pub fn handle_cron() {
-    println!("Cron scheduling not yet implemented.");
+    let store_path = hermes_config::config::hermes_home()
+        .join("cron")
+        .join("jobs.json");
+    match hermes_cron::store::JobStore::open(store_path) {
+        Ok(store) => match store.list() {
+            Ok(jobs) if jobs.is_empty() => {
+                println!("No scheduled jobs. Use the cron tool to create one.")
+            }
+            Ok(jobs) => {
+                println!("\nScheduled jobs ({}):", jobs.len());
+                for j in &jobs {
+                    let status = j.last_status.as_deref().unwrap_or("-");
+                    let next = j
+                        .next_run_at
+                        .as_deref()
+                        .map(|s| &s[..s.len().min(19)])
+                        .unwrap_or("-");
+                    println!("  {} | {} | {} | next: {}", j.id, j.name, status, next);
+                }
+                println!();
+            }
+            Err(e) => eprintln!("Failed to list jobs: {e}"),
+        },
+        Err(e) => eprintln!("Failed to open job store: {e}"),
+    }
 }

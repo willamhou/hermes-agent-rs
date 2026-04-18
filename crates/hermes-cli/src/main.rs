@@ -9,6 +9,7 @@ mod repl;
 mod tooling;
 
 use clap::{Parser, Subcommand};
+use hermes_config::config::{AppConfig, hermes_home};
 use hermes_core::session::SessionStore as _;
 
 /// Hermes — AI agent CLI
@@ -43,6 +44,17 @@ struct Cli {
 enum Commands {
     /// Start the gateway server (Telegram, API)
     Gateway,
+    /// Cron job management
+    #[command(subcommand)]
+    Cron(CronAction),
+}
+
+#[derive(Subcommand, Debug)]
+enum CronAction {
+    /// Run one scheduler tick (execute due jobs)
+    Tick,
+    /// List all scheduled jobs
+    List,
 }
 
 #[tokio::main]
@@ -59,6 +71,13 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(Commands::Gateway) = cli.command {
         return run_gateway().await;
+    }
+
+    if let Some(Commands::Cron(action)) = cli.command {
+        return match action {
+            CronAction::Tick => run_cron_tick().await,
+            CronAction::List => run_cron_list().await,
+        };
     }
 
     if cli.list_sessions {
@@ -90,6 +109,58 @@ async fn run_gateway() -> anyhow::Result<()> {
 
     let runner = hermes_gateway::GatewayRunner::new(gateway_config, config);
     runner.run().await
+}
+
+async fn run_cron_tick() -> anyhow::Result<()> {
+    let config = AppConfig::load();
+    let store_path = hermes_home().join("cron").join("jobs.json");
+    let store = hermes_cron::store::JobStore::open(store_path)?;
+    let output_dir = hermes_home().join("cron").join("output");
+    let scheduler = hermes_cron::scheduler::CronScheduler::new(store, output_dir, config);
+    let results = scheduler.tick().await?;
+    if results.is_empty() {
+        println!("No jobs due.");
+    } else {
+        for r in &results {
+            println!(
+                "{}: {} ({}, {:.1}s)",
+                r.job_id,
+                r.job_name,
+                r.status,
+                r.duration.as_secs_f64()
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn run_cron_list() -> anyhow::Result<()> {
+    let store_path = hermes_home().join("cron").join("jobs.json");
+    let store = hermes_cron::store::JobStore::open(store_path)?;
+    let jobs = store.list()?;
+    if jobs.is_empty() {
+        println!("No scheduled jobs.");
+        return Ok(());
+    }
+    println!(
+        "{:<14} {:<20} {:<8} {:<20} Status",
+        "ID", "Name", "Enabled", "Next Run"
+    );
+    println!("{}", "-".repeat(80));
+    for j in &jobs {
+        println!(
+            "{:<14} {:<20} {:<8} {:<20} {}",
+            j.id,
+            &j.name[..j.name.len().min(18)],
+            if j.enabled { "yes" } else { "no" },
+            j.next_run_at
+                .as_deref()
+                .map(|s| &s[..s.len().min(19)])
+                .unwrap_or("-"),
+            j.last_status.as_deref().unwrap_or("-"),
+        );
+    }
+    Ok(())
 }
 
 async fn list_sessions_cmd() -> anyhow::Result<()> {
