@@ -121,23 +121,36 @@ impl GatewayRunner {
         let cron_store_path = hermes_config::config::hermes_home()
             .join("cron")
             .join("jobs.json");
-        if let Ok(cron_store) = hermes_cron::store::JobStore::open(cron_store_path) {
-            let output_dir = hermes_config::config::hermes_home()
-                .join("cron")
-                .join("output");
-            let cron_config = self.app_config.clone();
-            tokio::spawn(async move {
-                let scheduler =
-                    hermes_cron::scheduler::CronScheduler::new(cron_store, output_dir, cron_config);
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-                loop {
-                    interval.tick().await;
-                    if let Err(e) = scheduler.tick().await {
-                        tracing::warn!("cron tick error: {e}");
+        match hermes_cron::store::JobStore::open(cron_store_path) {
+            Ok(cron_store) => {
+                let output_dir = hermes_config::config::hermes_home()
+                    .join("cron")
+                    .join("output");
+                let cron_config = self.app_config.clone();
+                tokio::spawn(async move {
+                    let scheduler = hermes_cron::scheduler::CronScheduler::new(
+                        cron_store,
+                        output_dir,
+                        cron_config,
+                    );
+                    // H4: skip the immediate first tick — start 60 s from now.
+                    let mut interval = tokio::time::interval_at(
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+                        std::time::Duration::from_secs(60),
+                    );
+                    loop {
+                        interval.tick().await;
+                        if let Err(e) = scheduler.tick().await {
+                            tracing::warn!("cron tick error: {e}");
+                        }
                     }
-                }
-            });
-            tracing::info!("cron scheduler enabled (60s tick)");
+                });
+                tracing::info!("cron scheduler enabled (60s tick)");
+            }
+            Err(e) => {
+                // H5: log the failure so operators can diagnose misconfiguration.
+                tracing::warn!("cron scheduler disabled — failed to open job store: {e}");
+            }
         }
 
         // 5. Main event loop

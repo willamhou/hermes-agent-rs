@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -20,15 +21,32 @@ impl JobStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if !path.exists() {
-            let empty = JobsFile {
-                jobs: vec![],
-                updated_at: chrono::Utc::now().to_rfc3339(),
-            };
-            let json = serde_json::to_string_pretty(&empty)?;
-            std::fs::write(&path, json)?;
+        // Use create_new so two concurrent openers don't both write the initial
+        // file — the losing process gets AlreadyExists, which is fine.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                let empty = JobsFile {
+                    jobs: vec![],
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                };
+                let json = serde_json::to_string_pretty(&empty)?;
+                f.write_all(json.as_bytes())?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Another process created it concurrently — that's fine.
+            }
+            Err(e) => return Err(e.into()),
         }
         Ok(Self { path })
+    }
+
+    /// Expose the backing file path (used by the scheduler for lock file placement).
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
     }
 
     pub fn list(&self) -> anyhow::Result<Vec<CronJob>> {
@@ -71,9 +89,16 @@ impl JobStore {
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
         let json = serde_json::to_string_pretty(&file)?;
-        // Atomic write: write to tmp, then rename.
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, &json)?;
+
+        // Keep one best-effort backup before replacing the live file.
+        let bak = self.path.with_extension("json.bak");
+        if self.path.exists() {
+            let _ = std::fs::copy(&self.path, &bak);
+        }
+
+        // Atomic rename: tmp → live.
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
     }

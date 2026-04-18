@@ -131,6 +131,9 @@ impl CronJob {
 fn strip_suffix_number(s: &str, suffix: &str) -> Option<u64> {
     let lower = s.to_lowercase();
     let stripped = lower.strip_suffix(suffix)?;
+    if stripped.is_empty() || !stripped.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
     stripped.parse::<u64>().ok()
 }
 
@@ -173,6 +176,14 @@ mod tests {
     #[test]
     fn parse_invalid_returns_error() {
         assert!(parse_schedule("not-a-schedule-xyzzy").is_err());
+    }
+
+    #[test]
+    fn parse_mixed_suffix_rejected() {
+        // "10hm" must not be parsed as 10 minutes (prefix "10h" is not all digits).
+        assert!(parse_schedule("10hm").is_err());
+        // "1.5h" must not parse (non-digit in prefix).
+        assert!(parse_schedule("1.5h").is_err());
     }
 
     #[test]

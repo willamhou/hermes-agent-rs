@@ -23,6 +23,7 @@ anyhow.workspace = true
 tokio.workspace = true
 secrecy.workspace = true
 async-trait.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

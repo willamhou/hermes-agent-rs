@@ -1,5 +1,6 @@
 //! CronScheduler: ticks every call, finds due jobs, spawns fresh Agent per job, saves output.
 
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,6 +9,15 @@ use hermes_config::config::AppConfig;
 
 use crate::job::CronJob;
 use crate::store::JobStore;
+
+/// Tools that must never be available to cron-spawned agents.
+/// Prevents recursive cron creation, subagent spawning, and interactive prompts.
+/// TODO: add configurable cron tool allowlist for production deployments.
+const CRON_BLOCKED_TOOLS: &[&str] = &[
+    "cron",          // prevent recursive cron creation
+    "delegate_task", // no subagent spawning from cron
+    "clarify",       // no user interaction
+];
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -38,7 +48,42 @@ impl CronScheduler {
     }
 
     /// Tick: find all due jobs, execute them, save output, update store.
+    ///
+    /// A per-process file lock prevents two concurrent ticks from running at the
+    /// same time (e.g. if a tick takes longer than 60 s and the next fires before
+    /// it finishes).
     pub async fn tick(&self) -> anyhow::Result<Vec<JobRunResult>> {
+        // ── C1: exclusive file lock — one tick at a time ──────────────────────
+        let lock_path = self
+            .store
+            .path()
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join(".tick.lock");
+        let lock_file = File::create(&lock_path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = lock_file.as_raw_fd();
+            // SAFETY: fd is valid for the duration of this function; flock is safe
+            // to call on a valid file descriptor.
+            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if ret != 0 {
+                tracing::debug!("cron tick skipped — another tick is already running");
+                return Ok(vec![]);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // On non-Unix platforms the file is created but not locked; just keep
+            // it alive until end of tick so callers can see the file is in use.
+            let _ = &lock_file;
+            tracing::warn!(
+                "file locking not available on this platform — concurrent ticks possible"
+            );
+        }
+
         let jobs = self.store.list()?;
         let now = chrono::Utc::now();
         let mut results = Vec::new();
@@ -107,12 +152,36 @@ impl CronScheduler {
             }
         };
 
-        let registry = Arc::new(hermes_tools::ToolRegistry::from_inventory());
+        // ── C3: restrict registry — block tools that must not run in cron context ──
+        let registry = hermes_tools::ToolRegistry::from_inventory();
+        for blocked in CRON_BLOCKED_TOOLS {
+            registry.remove(blocked);
+        }
+        let registry = Arc::new(registry);
+
+        // ── H2: no unwrap on memory fallback ─────────────────────────────────
         let memory_dir = hermes_config::config::hermes_home().join("cron-memory");
-        let memory = hermes_memory::MemoryManager::new(memory_dir, None).unwrap_or_else(|_| {
-            hermes_memory::MemoryManager::new(std::env::temp_dir().join("hermes-cron-mem"), None)
-                .unwrap()
-        });
+        let memory = match hermes_memory::MemoryManager::new(memory_dir, None) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("primary cron memory unavailable ({e}), falling back to temp dir");
+                match hermes_memory::MemoryManager::new(
+                    std::env::temp_dir().join("hermes-cron-mem"),
+                    None,
+                ) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        return JobRunResult {
+                            job_id: job.id.clone(),
+                            job_name: job.name.clone(),
+                            status: "failed".into(),
+                            response: format!("Memory init failed: {e}"),
+                            duration: start.elapsed(),
+                        };
+                    }
+                }
+            }
+        };
 
         let (approval_tx, mut approval_rx) =
             tokio::sync::mpsc::channel::<hermes_core::tool::ApprovalRequest>(8);

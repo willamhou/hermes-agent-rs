@@ -89,6 +89,15 @@ impl ToolRegistry {
             .is_empty()
     }
 
+    /// Remove a tool by name and return whether it was present.
+    pub fn remove(&self, name: &str) -> bool {
+        self.tools
+            .write()
+            .expect("tool registry write lock poisoned")
+            .remove(name)
+            .is_some()
+    }
+
     /// Replace every tool with the given toolset, keeping all other toolsets intact.
     pub fn replace_toolset(&self, toolset: &str, tools: Vec<Box<dyn Tool>>) {
         let mut guard = self
