@@ -370,6 +370,42 @@ fn check_bearer_auth(
     }
 }
 
+/// Build a prompt string from the OpenAI messages array.
+///
+/// For a single user message, returns it directly. For multi-turn conversations,
+/// formats prior messages as context so the agent sees the full conversation history.
+fn build_oai_prompt(messages: &[OaiMessage]) -> String {
+    // Single user message — no context needed
+    if messages.len() == 1 && messages[0].role == "user" {
+        return messages[0].content.clone();
+    }
+
+    let mut parts = Vec::new();
+    let last_user_idx = messages.iter().rposition(|m| m.role == "user");
+
+    // Format prior messages as conversation context
+    let context_msgs: Vec<&OaiMessage> = match last_user_idx {
+        Some(idx) => messages[..idx].iter().collect(),
+        None => messages.iter().collect(),
+    };
+
+    if !context_msgs.is_empty() {
+        parts.push("<conversation-history>".to_string());
+        for msg in &context_msgs {
+            parts.push(format!("[{}]: {}", msg.role, msg.content));
+        }
+        parts.push("</conversation-history>".to_string());
+        parts.push(String::new());
+    }
+
+    // Append the last user message as the actual prompt
+    if let Some(idx) = last_user_idx {
+        parts.push(messages[idx].content.clone());
+    }
+
+    parts.join("\n")
+}
+
 async fn handle_oai_chat(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -379,16 +415,9 @@ async fn handle_oai_chat(
         return e.into_response();
     }
 
-    // Validate messages before checking router (better error for malformed requests)
-    let prompt = req
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.content.clone())
-        .unwrap_or_default();
-
-    if prompt.is_empty() {
+    // Validate: at least one user message required
+    let has_user_msg = req.messages.iter().any(|m| m.role == "user");
+    if !has_user_msg {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": {"message": "no user message found", "type": "invalid_request_error"}})),
@@ -404,6 +433,11 @@ async fn handle_oai_chat(
             .into_response();
     };
 
+    // Build prompt from the full conversation history.
+    // If there are prior messages (system/assistant/user turns), format them as context
+    // so the agent sees the full conversation. The last user message is the prompt.
+    let prompt = build_oai_prompt(&req.messages);
+
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     let user_id = req.user.unwrap_or_else(|| "api-user".into());
     let model_name = req.model.unwrap_or_else(|| state.model_name.clone());
@@ -413,6 +447,8 @@ async fn handle_oai_chat(
         model_name
     };
 
+    // Stateless: each OAI request gets a fresh session (unique chat_id).
+    // Sessions are cleaned up by the idle timeout.
     let event = MessageEvent {
         platform: "api".into(),
         chat_id: format!("oai-{}", uuid::Uuid::new_v4().simple()),
@@ -794,5 +830,60 @@ mod tests {
         assert_eq!(json["choices"][0]["message"]["content"], "Hello!");
         assert_eq!(json["choices"][0]["finish_reason"], "stop");
         assert_eq!(json["usage"]["total_tokens"], 15);
+    }
+
+    #[test]
+    fn test_build_oai_prompt_single_user() {
+        let msgs = vec![OaiMessage {
+            role: "user".into(),
+            content: "Hello".into(),
+        }];
+        assert_eq!(build_oai_prompt(&msgs), "Hello");
+    }
+
+    #[test]
+    fn test_build_oai_prompt_multi_turn() {
+        let msgs = vec![
+            OaiMessage {
+                role: "system".into(),
+                content: "You are helpful.".into(),
+            },
+            OaiMessage {
+                role: "user".into(),
+                content: "What is Rust?".into(),
+            },
+            OaiMessage {
+                role: "assistant".into(),
+                content: "A systems language.".into(),
+            },
+            OaiMessage {
+                role: "user".into(),
+                content: "Tell me more.".into(),
+            },
+        ];
+        let prompt = build_oai_prompt(&msgs);
+        assert!(prompt.contains("<conversation-history>"));
+        assert!(prompt.contains("[system]: You are helpful."));
+        assert!(prompt.contains("[user]: What is Rust?"));
+        assert!(prompt.contains("[assistant]: A systems language."));
+        assert!(prompt.contains("</conversation-history>"));
+        assert!(prompt.ends_with("Tell me more."));
+    }
+
+    #[test]
+    fn test_build_oai_prompt_system_only() {
+        let msgs = vec![
+            OaiMessage {
+                role: "system".into(),
+                content: "Be concise.".into(),
+            },
+            OaiMessage {
+                role: "user".into(),
+                content: "Hi".into(),
+            },
+        ];
+        let prompt = build_oai_prompt(&msgs);
+        assert!(prompt.contains("[system]: Be concise."));
+        assert!(prompt.ends_with("Hi"));
     }
 }

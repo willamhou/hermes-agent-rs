@@ -1,10 +1,13 @@
 [package]
 name = "hermes-cli"
-description = "Interactive REPL CLI for Hermes Agent"
+description = "AI agent CLI with streaming tool calling, multi-platform gateway, and OpenAI-compatible API"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+keywords = ["ai", "agent", "cli", "llm", "tools"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "hermes"

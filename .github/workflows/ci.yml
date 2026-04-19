@@ -4,11 +4,13 @@ on:
   push:
     branches:
       - main
-      - "codex/**"
   pull_request:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  rust:
+  check:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -17,6 +19,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.85"
           components: rustfmt, clippy
 
       - name: Cache Rust artifacts
@@ -30,3 +33,6 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+      - name: Build release binary
+        run: cargo build --release -p hermes-cli
