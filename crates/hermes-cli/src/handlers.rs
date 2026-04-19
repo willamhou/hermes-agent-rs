@@ -104,8 +104,9 @@ pub async fn handle_search(query: &str, store: &hermes_config::SqliteSessionStor
         Ok(hits) => {
             println!("\nSearch results ({}):\n", hits.len());
             for hit in &hits {
-                let content_preview = if hit.content.len() > 100 {
-                    format!("{}...", &hit.content[..100])
+                let content_preview = if hit.content.chars().count() > 100 {
+                    let truncated: String = hit.content.chars().take(100).collect();
+                    format!("{truncated}...")
                 } else {
                     hit.content.clone()
                 };

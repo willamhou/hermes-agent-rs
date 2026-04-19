@@ -138,7 +138,7 @@ pub const COMMANDS: &[CommandDef] = &[
         name: "background",
         aliases: &["bg"],
         description: "Background processes",
-        usage: "/bg [read|kill <id>]",
+        usage: "/bg [read|kill|clean]",
     },
 ];
 

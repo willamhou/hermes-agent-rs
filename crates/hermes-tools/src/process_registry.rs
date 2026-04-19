@@ -83,13 +83,13 @@ impl ProcessRegistry {
 
     /// Spawn a command in the background. Returns the process ID.
     pub fn spawn(&self, command: &str, workdir: &Path) -> Result<String, String> {
+        // Auto-cleanup exited processes before checking limits
+        self.remove_exited();
+
         // Check process limit
         {
             let guard = self.processes.lock().unwrap_or_else(|e| e.into_inner());
-            let running = guard
-                .values()
-                .filter(|e| e.exit_code.lock().ok().and_then(|g| *g).is_none())
-                .count();
+            let running = guard.len();
             if running >= MAX_PROCESSES {
                 return Err(format!("process limit reached ({MAX_PROCESSES} running)"));
             }
@@ -237,8 +237,13 @@ impl ProcessRegistry {
             return Err("unknown PID".to_string());
         }
         // SAFETY: sending SIGKILL to a known child pid
-        unsafe {
-            libc::kill(entry.pid as libc::pid_t, libc::SIGKILL);
+        let ret = unsafe { libc::kill(entry.pid as libc::pid_t, libc::SIGKILL) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            // ESRCH = already exited between check and kill (TOCTOU), treat as success
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                return Err(format!("kill failed: {err}"));
+            }
         }
         Ok(())
     }

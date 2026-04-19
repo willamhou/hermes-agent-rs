@@ -51,10 +51,9 @@ struct Handler {
 }
 
 impl Handler {
-    fn is_authorized(&self, user_id: &str, user_name: &str) -> bool {
-        self.allow_all
-            || self.allowed_users.contains(user_id)
-            || self.allowed_users.contains(user_name)
+    /// Check authorization by numeric user ID only (usernames are spoofable).
+    fn is_authorized(&self, user_id: &str) -> bool {
+        self.allow_all || self.allowed_users.contains(user_id)
     }
 }
 
@@ -74,7 +73,7 @@ impl EventHandler for Handler {
         let user_id = msg.author.id.to_string();
         let user_name = msg.author.name.clone();
 
-        if !self.is_authorized(&user_id, &user_name) {
+        if !self.is_authorized(&user_id) {
             warn!("Unauthorized Discord user id={user_id} name={user_name}");
             return;
         }
@@ -198,27 +197,28 @@ mod tests {
     #[test]
     fn authorization_allow_all() {
         let h = make_handler(true, vec![]);
-        assert!(h.is_authorized("999", "anyone"));
+        assert!(h.is_authorized("999"));
     }
 
     #[test]
     fn authorization_by_id() {
         let h = make_handler(false, vec!["111"]);
-        assert!(h.is_authorized("111", "alice"));
-        assert!(!h.is_authorized("222", "bob"));
+        assert!(h.is_authorized("111"));
+        assert!(!h.is_authorized("222"));
     }
 
     #[test]
-    fn authorization_by_username() {
+    fn authorization_username_not_matched() {
+        // Only numeric IDs are checked — usernames are spoofable
         let h = make_handler(false, vec!["alice"]);
-        assert!(h.is_authorized("111", "alice"));
-        assert!(!h.is_authorized("222", "bob"));
+        assert!(!h.is_authorized("111"));
+        assert!(h.is_authorized("alice")); // "alice" as an ID string, not username
     }
 
     #[test]
     fn authorization_denied() {
-        let h = make_handler(false, vec!["111", "alice"]);
-        assert!(!h.is_authorized("333", "charlie"));
+        let h = make_handler(false, vec!["111", "222"]);
+        assert!(!h.is_authorized("333"));
     }
 
     #[test]

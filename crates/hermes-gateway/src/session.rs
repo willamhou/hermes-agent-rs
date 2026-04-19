@@ -186,7 +186,10 @@ pub fn session_key(event: &MessageEvent) -> String {
                 event.platform, event.chat_id, event.user_id
             )
         }
-        ChatType::Channel => format!("{}:chan:{}", event.platform, event.chat_id),
+        ChatType::Channel => format!(
+            "{}:chan:{}:{}",
+            event.platform, event.chat_id, event.user_id
+        ),
     }
 }
 
@@ -274,7 +277,9 @@ fn build_session_agent(
         hermes_core::error::HermesError::Config(format!("failed to create memory: {e}"))
     })?;
 
-    // Gateway: non-interactive — deny dangerous commands.
+    // Gateway: non-interactive — ALWAYS deny dangerous commands.
+    // This is intentional and independent of app_config.approval.policy.
+    // The CLI /yolo toggle does NOT affect gateway sessions.
     // (Approval is only requested for commands flagged as dangerous by detect_dangerous.)
     // The approval task ends naturally when approval_rx closes (Agent drop).
     let (approval_tx, mut approval_rx) = mpsc::channel::<hermes_core::tool::ApprovalRequest>(8);
@@ -354,7 +359,7 @@ mod tests {
     #[test]
     fn test_session_key_channel() {
         let event = make_event("tg", "chat1", "user1", ChatType::Channel);
-        assert_eq!(session_key(&event), "tg:chan:chat1");
+        assert_eq!(session_key(&event), "tg:chan:chat1:user1");
     }
 
     #[test]
