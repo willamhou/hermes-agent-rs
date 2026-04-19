@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use hermes_core::tool::{BrowserToolConfig, FileToolConfig, TerminalToolConfig, ToolConfig};
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -375,7 +376,7 @@ impl AppConfig {
     /// - `openrouter` → `OPENROUTER_API_KEY`
     ///
     /// Falls back to `HERMES_API_KEY` if the provider-specific var is absent.
-    pub fn api_key(&self) -> Option<String> {
+    pub fn api_key(&self) -> Option<SecretString> {
         let provider = self
             .model
             .split('/')
@@ -393,7 +394,7 @@ impl AppConfig {
         if let Some(var) = provider_var {
             if let Ok(key) = std::env::var(var) {
                 if !key.is_empty() {
-                    return Some(key);
+                    return Some(SecretString::new(key.into()));
                 }
             }
         }
@@ -401,6 +402,7 @@ impl AppConfig {
         std::env::var("HERMES_API_KEY")
             .ok()
             .filter(|k| !k.is_empty())
+            .map(|k| SecretString::new(k.into()))
     }
 
     /// Convert this config into a [`ToolConfig`] for the given workspace root.

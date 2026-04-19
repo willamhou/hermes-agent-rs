@@ -12,7 +12,6 @@ use hermes_core::{message::Message, stream::StreamDelta, tool::ApprovalRequest};
 use hermes_memory::MemoryManager;
 use hermes_provider::create_provider;
 use hermes_skills::SkillManager;
-use secrecy::SecretString;
 use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
@@ -39,8 +38,8 @@ pub async fn run_oneshot(
         )
     })?;
 
-    let provider = create_provider(model, SecretString::new(api_key.into()), base_url_override)
-        .context("failed to create provider")?;
+    let provider =
+        create_provider(model, api_key, base_url_override).context("failed to create provider")?;
 
     let registry = build_registry(&config).await;
     let working_dir = std::env::current_dir().context("failed to get current directory")?;

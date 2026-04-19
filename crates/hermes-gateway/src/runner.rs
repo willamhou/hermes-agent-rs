@@ -8,7 +8,6 @@ use hermes_config::config::{AppConfig, GatewayConfig, hermes_home};
 use hermes_core::platform::{PlatformAdapter, PlatformEvent};
 use hermes_provider::create_provider;
 use hermes_tools::ToolRegistry;
-use secrecy::SecretString;
 use tokio::sync::{RwLock, mpsc};
 
 use crate::api_server::ApiServerAdapter;
@@ -34,11 +33,7 @@ impl GatewayRunner {
             .app_config
             .api_key()
             .ok_or_else(|| anyhow::anyhow!("No API key configured"))?;
-        let provider = create_provider(
-            &self.app_config.model,
-            SecretString::new(api_key.into()),
-            None,
-        )?;
+        let provider = create_provider(&self.app_config.model, api_key, None)?;
 
         // Build tool registry — same tools as CLI, including inventory-registered ones
         let registry = Arc::new(ToolRegistry::from_inventory());

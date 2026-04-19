@@ -17,6 +17,7 @@ use hermes_core::{
     error::Result,
     platform::{ChatType, MessageEvent, PlatformAdapter, PlatformEvent},
 };
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
@@ -43,7 +44,7 @@ impl ApiServerAdapter {
 struct ApiState {
     event_tx: mpsc::Sender<PlatformEvent>,
     pending: Arc<DashMap<String, oneshot::Sender<String>>>,
-    api_key: Option<String>,
+    api_key: Option<SecretString>,
 }
 
 // ─── Request / response types ─────────────────────────────────────────────────
@@ -78,7 +79,11 @@ impl PlatformAdapter for ApiServerAdapter {
         let state = ApiState {
             event_tx,
             pending: Arc::clone(&self.pending),
-            api_key: self.config.api_key.clone(),
+            api_key: self
+                .config
+                .api_key
+                .as_deref()
+                .map(|k| SecretString::new(k.into())),
         };
 
         let app = Router::new()
@@ -119,6 +124,23 @@ impl PlatformAdapter for ApiServerAdapter {
     }
 }
 
+// ─── Auth helpers ─────────────────────────────────────────────────────────────
+
+/// Compare two strings in constant time to resist timing side-channel attacks.
+///
+/// The early-exit on length mismatch leaks length information, but this is
+/// acceptable for API keys where the expected length is publicly derivable from
+/// the key format.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 async fn handle_health() -> impl IntoResponse {
@@ -139,7 +161,7 @@ async fn handle_chat(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
         match provided {
-            Some(key) if key == expected_key => {}
+            Some(key) if constant_time_eq(key, expected_key.expose_secret()) => {}
             _ => {
                 return (
                     StatusCode::UNAUTHORIZED,

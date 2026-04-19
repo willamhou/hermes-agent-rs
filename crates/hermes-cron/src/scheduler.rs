@@ -141,11 +141,8 @@ impl CronScheduler {
             }
         };
 
-        let provider = match hermes_provider::create_provider(
-            &self.app_config.model,
-            secrecy::SecretString::new(api_key.into()),
-            None,
-        ) {
+        let provider = match hermes_provider::create_provider(&self.app_config.model, api_key, None)
+        {
             Ok(p) => p,
             Err(e) => {
                 return JobRunResult {
@@ -195,9 +192,14 @@ impl CronScheduler {
             tokio::sync::mpsc::channel::<hermes_core::tool::ApprovalRequest>(8);
         tokio::spawn(async move {
             while let Some(req) = approval_rx.recv().await {
+                // Non-interactive: deny dangerous commands (approval only fires for flagged commands)
+                tracing::warn!(
+                    tool = %req.tool_name,
+                    "cron: denied dangerous command in non-interactive context"
+                );
                 let _ = req
                     .response_tx
-                    .send(hermes_core::tool::ApprovalDecision::Allow);
+                    .send(hermes_core::tool::ApprovalDecision::Deny);
             }
         });
 

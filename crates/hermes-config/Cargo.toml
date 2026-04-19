@@ -19,6 +19,7 @@ tokio-rusqlite.workspace = true
 rusqlite.workspace = true
 async-trait.workspace = true
 anyhow.workspace = true
+secrecy.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
