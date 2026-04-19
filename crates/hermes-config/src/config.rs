@@ -250,6 +250,9 @@ pub struct ApiServerGatewayConfig {
     pub bind_addr: String,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Model name to report in `/v1/models` and completions responses.
+    #[serde(default)]
+    pub model_name: Option<String>,
 }
 
 fn default_bind_addr() -> String {
@@ -261,6 +264,7 @@ impl Default for ApiServerGatewayConfig {
         Self {
             bind_addr: default_bind_addr(),
             api_key: None,
+            model_name: None,
         }
     }
 }

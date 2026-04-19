@@ -77,13 +77,17 @@ impl GatewayRunner {
             tracing::info!("telegram adapter enabled");
         }
 
-        if let Some(ref api_config) = self.gateway_config.api_server {
-            let adapter = Arc::new(ApiServerAdapter::new(api_config.clone()));
+        // API server adapter — constructed here but started after router is built
+        let api_adapter = self.gateway_config.api_server.as_ref().map(|api_config| {
+            let mut cfg = api_config.clone();
+            // Populate model_name from AppConfig if not set explicitly
+            if cfg.model_name.is_none() {
+                cfg.model_name = Some(self.app_config.model.clone());
+            }
+            let adapter = Arc::new(ApiServerAdapter::new(cfg));
             adapters.insert("api".into(), adapter.clone() as Arc<dyn PlatformAdapter>);
-            let tx = event_tx.clone();
-            adapter_handles.push(tokio::spawn(async move { adapter.run(tx).await }));
-            tracing::info!(addr = %api_config.bind_addr, "api server enabled");
-        }
+            adapter
+        });
 
         drop(event_tx); // only adapters hold senders now
 
@@ -101,6 +105,30 @@ impl GatewayRunner {
             self.gateway_config.max_concurrent_sessions,
             self.app_config.clone(),
         );
+
+        // Start API server with router for streaming, plus event channel for legacy /api/chat
+        if let Some(adapter) = api_adapter {
+            adapter.set_router(router.clone());
+            let (api_event_tx, mut api_event_rx) = mpsc::channel::<PlatformEvent>(256);
+            let api_router = router.clone();
+            tokio::spawn(async move {
+                while let Some(event) = api_event_rx.recv().await {
+                    match event {
+                        PlatformEvent::Message(msg) => {
+                            let r = api_router.clone();
+                            tokio::spawn(async move {
+                                r.route(msg).await;
+                            });
+                        }
+                        PlatformEvent::Shutdown => break,
+                    }
+                }
+            });
+            adapter_handles.push(tokio::spawn(async move { adapter.run(api_event_tx).await }));
+            if let Some(ref api_config) = self.gateway_config.api_server {
+                tracing::info!(addr = %api_config.bind_addr, "api server enabled (OpenAI compatible)");
+            }
+        }
 
         // 4. Spawn idle cleanup task
         let cleanup_router = router.clone();

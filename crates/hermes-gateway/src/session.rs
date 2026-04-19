@@ -10,6 +10,7 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 
 use hermes_config::config::AppConfig;
 use hermes_core::platform::{ChatType, MessageEvent, PlatformAdapter};
+use hermes_core::stream::StreamDelta;
 use hermes_core::tool::ApprovalDecision;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
@@ -18,6 +19,8 @@ use hermes_core::tool::ApprovalDecision;
 pub struct RoutedMessage {
     pub event: MessageEvent,
     pub response_tx: oneshot::Sender<String>,
+    /// If set, stream deltas are forwarded here (for SSE streaming endpoints).
+    pub stream_tx: Option<mpsc::Sender<StreamDelta>>,
 }
 
 /// Shared state across all gateway sessions (created once at startup).
@@ -65,28 +68,22 @@ impl SessionRouter {
         }
     }
 
-    /// Route a message to the appropriate session. Creates session if needed.
-    /// Returns the agent's response text.
-    pub async fn route(&self, event: MessageEvent) -> String {
-        let key = session_key(&event);
-
-        // Create response channel
-        let (response_tx, response_rx) = oneshot::channel();
-
-        // Get or create session using Vacant/Occupied entry API to avoid TOCTOU
-        let msg_tx = match self.sessions.entry(key.clone()) {
+    /// Get or create a session's message sender. Returns Err(String) on failure.
+    async fn get_or_create_session(
+        &self,
+        key: &str,
+    ) -> std::result::Result<mpsc::Sender<RoutedMessage>, String> {
+        match self.sessions.entry(key.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(e) => {
                 e.get().last_active.store(epoch_secs(), Ordering::Relaxed);
-                e.get().msg_tx.clone()
+                Ok(e.get().msg_tx.clone())
             }
             dashmap::mapref::entry::Entry::Vacant(e) => {
                 if self.sessions.len() >= self.max_sessions {
-                    return "Error: maximum concurrent sessions reached".into();
+                    return Err("Error: maximum concurrent sessions reached".into());
                 }
-                let agent = match build_session_agent(&key, &self.shared, &self.app_config) {
-                    Ok(a) => a,
-                    Err(err) => return format!("Error: failed to create session: {err}"),
-                };
+                let agent = build_session_agent(key, &self.shared, &self.app_config)
+                    .map_err(|err| format!("Error: failed to create session: {err}"))?;
                 let (tx, rx) = mpsc::channel::<RoutedMessage>(32);
                 let last_active = Arc::new(AtomicU64::new(epoch_secs()));
                 let shared = Arc::clone(&self.shared);
@@ -100,22 +97,64 @@ impl SessionRouter {
                     msg_tx: tx,
                     last_active,
                 });
-                handle.msg_tx.clone()
+                Ok(handle.msg_tx.clone())
             }
+        }
+    }
+
+    /// Route a message to the appropriate session. Creates session if needed.
+    /// Returns the agent's response text.
+    pub async fn route(&self, event: MessageEvent) -> String {
+        let key = session_key(&event);
+
+        let msg_tx = match self.get_or_create_session(&key).await {
+            Ok(tx) => tx,
+            Err(err) => return err,
         };
 
-        // Send message to session
-        let routed = RoutedMessage { event, response_tx };
+        let (response_tx, response_rx) = oneshot::channel();
+        let routed = RoutedMessage {
+            event,
+            response_tx,
+            stream_tx: None,
+        };
         if msg_tx.send(routed).await.is_err() {
-            // Session task died; remove stale handle so next message recreates it
             self.sessions.remove(&key);
             return "Session error: task not running, session removed".into();
         }
 
-        // Wait for response
         response_rx
             .await
             .unwrap_or_else(|_| "Session error: response dropped".into())
+    }
+
+    /// Route a message with streaming. Returns a delta receiver and a response future.
+    pub async fn route_streaming(
+        &self,
+        event: MessageEvent,
+    ) -> (mpsc::Receiver<StreamDelta>, oneshot::Receiver<String>) {
+        let key = session_key(&event);
+        let (response_tx, response_rx) = oneshot::channel();
+        let (stream_tx, stream_rx) = mpsc::channel::<StreamDelta>(64);
+
+        let msg_tx = match self.get_or_create_session(&key).await {
+            Ok(tx) => tx,
+            Err(err) => {
+                let _ = response_tx.send(err);
+                return (stream_rx, response_rx);
+            }
+        };
+
+        let routed = RoutedMessage {
+            event,
+            response_tx,
+            stream_tx: Some(stream_tx),
+        };
+        if msg_tx.send(routed).await.is_err() {
+            self.sessions.remove(&key);
+        }
+
+        (stream_rx, response_rx)
     }
 
     /// Remove sessions that have been idle past the timeout.
@@ -165,12 +204,30 @@ async fn session_task_with_agent(
     while let Some(routed) = msg_rx.recv().await {
         last_active.store(epoch_secs(), Ordering::Relaxed);
 
-        // Gateway discards streaming deltas
-        let (delta_tx, _) = mpsc::channel(64);
+        let (delta_tx, mut delta_rx) = mpsc::channel(64);
+
+        // If the caller wants streaming, spawn a forwarder task
+        let fwd_handle = if let Some(stream_tx) = routed.stream_tx {
+            Some(tokio::spawn(async move {
+                while let Some(delta) = delta_rx.recv().await {
+                    if stream_tx.send(delta).await.is_err() {
+                        break; // client disconnected
+                    }
+                }
+            }))
+        } else {
+            // Drain deltas so the channel doesn't block the agent
+            tokio::spawn(async move { while delta_rx.recv().await.is_some() {} });
+            None
+        };
 
         let result = agent
             .run_conversation(&routed.event.text, &mut history, delta_tx)
             .await;
+
+        if let Some(h) = fwd_handle {
+            let _ = h.await;
+        }
         let response = match result {
             Ok(text) => text,
             Err(e) => format!("Error: {e}"),
