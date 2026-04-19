@@ -217,12 +217,18 @@ fn build_session_agent(
         hermes_core::error::HermesError::Config(format!("failed to create memory: {e}"))
     })?;
 
-    // Gateway: auto-allow all tool approvals (no interactive UI).
+    // Gateway: non-interactive — deny dangerous commands.
+    // (Approval is only requested for commands flagged as dangerous by detect_dangerous.)
     // The approval task ends naturally when approval_rx closes (Agent drop).
     let (approval_tx, mut approval_rx) = mpsc::channel::<hermes_core::tool::ApprovalRequest>(8);
     tokio::spawn(async move {
         while let Some(req) = approval_rx.recv().await {
-            let _ = req.response_tx.send(ApprovalDecision::Allow);
+            // Non-interactive: deny dangerous commands (approval only fires for flagged commands)
+            tracing::warn!(
+                tool = %req.tool_name,
+                "gateway: denied dangerous command in non-interactive context"
+            );
+            let _ = req.response_tx.send(ApprovalDecision::Deny);
         }
     });
 

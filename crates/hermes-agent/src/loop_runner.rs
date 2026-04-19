@@ -213,7 +213,7 @@ impl Agent {
                 };
             }
 
-            // Check if context compression is needed
+            // Check if context compression is needed (token-pressure based)
             let tool_count = schemas.len();
             let compression_history =
                 inject_active_skills_into_history(self.skills.as_ref(), &active_skills, history)
@@ -223,45 +223,20 @@ impl Agent {
                 .should_compress(&full_system, &compression_history, tool_count)
             {
                 tracing::info!("context compression triggered");
-                let contrib = self.memory.on_pre_compress(history).await;
-                match self
-                    .compressor
-                    .compress(history, self.provider.as_ref(), contrib.as_deref())
-                    .await
-                {
-                    Ok(CompressionResult::Compressed {
-                        before_tokens,
-                        after_tokens,
-                        ..
-                    }) => {
-                        tracing::info!(
-                            before = before_tokens,
-                            after = after_tokens,
-                            "compression complete"
-                        );
-                        // Invalidate prompt cache — system prompt context changed
-                        self.cache_manager.invalidate();
-                        // Refresh memory snapshot
-                        let _ = self.memory.refresh_snapshot();
-                        // Rebuild full_system and segments
-                        let memory_block = self.memory.system_prompt_blocks();
-                        full_system = if memory_block.is_empty() {
-                            self.system_prompt.clone()
-                        } else {
-                            format!("{}\n\n{}", self.system_prompt, memory_block)
-                        };
-                        if self.provider.supports_caching() {
-                            segments = Some(
-                                self.cache_manager
-                                    .get_or_freeze(&self.system_prompt, &memory_block),
-                            );
-                        }
-                    }
-                    Ok(CompressionResult::NotNeeded) => {}
-                    Err(e) => {
-                        tracing::warn!("compression failed: {e}");
-                    }
-                }
+                self.do_compression(history, &mut full_system, &mut segments)
+                    .await;
+            }
+
+            // Hard cap: if history exceeds max messages, force compression regardless of
+            // token count. Prevents unbounded memory growth in long-running sessions.
+            const MAX_HISTORY_MESSAGES: usize = 500;
+            if history.len() > MAX_HISTORY_MESSAGES {
+                tracing::info!(
+                    count = history.len(),
+                    "history message cap reached, forcing compression"
+                );
+                self.do_compression(history, &mut full_system, &mut segments)
+                    .await;
             }
         }
 
@@ -276,6 +251,56 @@ impl Agent {
             .queue_prefetch(&final_response, &self.session_id);
 
         Ok(final_response)
+    }
+
+    /// Run the compression pipeline and rebuild system prompt / cache segments.
+    ///
+    /// Called from both the token-pressure check and the message-count hard cap.
+    async fn do_compression(
+        &mut self,
+        history: &mut Vec<Message>,
+        full_system: &mut String,
+        segments: &mut Option<Vec<hermes_core::provider::CacheSegment>>,
+    ) {
+        let contrib = self.memory.on_pre_compress(history).await;
+        match self
+            .compressor
+            .compress(history, self.provider.as_ref(), contrib.as_deref())
+            .await
+        {
+            Ok(CompressionResult::Compressed {
+                before_tokens,
+                after_tokens,
+                ..
+            }) => {
+                tracing::info!(
+                    before = before_tokens,
+                    after = after_tokens,
+                    "compression complete"
+                );
+                // Invalidate prompt cache — system prompt context changed
+                self.cache_manager.invalidate();
+                // Refresh memory snapshot
+                let _ = self.memory.refresh_snapshot();
+                // Rebuild full_system and segments
+                let memory_block = self.memory.system_prompt_blocks();
+                *full_system = if memory_block.is_empty() {
+                    self.system_prompt.clone()
+                } else {
+                    format!("{}\n\n{}", self.system_prompt, memory_block)
+                };
+                if self.provider.supports_caching() {
+                    *segments = Some(
+                        self.cache_manager
+                            .get_or_freeze(&self.system_prompt, &memory_block),
+                    );
+                }
+            }
+            Ok(CompressionResult::NotNeeded) => {}
+            Err(e) => {
+                tracing::warn!("compression failed: {e}");
+            }
+        }
     }
 
     /// Iterations remaining in the current budget.

@@ -125,13 +125,18 @@ impl Tool for DelegationTool {
                 message: format!("failed to create child memory: {e}"),
             })?;
 
-        // 6. Create child approval channel (auto-allow)
+        // 6. Create child approval channel (deny dangerous commands — non-interactive context)
         let (approval_tx, mut approval_rx) = mpsc::channel::<ApprovalRequest>(8);
-        // Auto-approve task terminates when approval_tx is dropped (when child Agent is dropped).
+        // Approval task terminates when approval_tx is dropped (when child Agent is dropped).
         // No explicit cancellation needed for depth-1 delegation.
         tokio::spawn(async move {
             while let Some(req) = approval_rx.recv().await {
-                let _ = req.response_tx.send(ApprovalDecision::Allow);
+                // Non-interactive: deny dangerous commands (approval only fires for flagged commands)
+                tracing::warn!(
+                    tool = %req.tool_name,
+                    "delegate: denied dangerous command in non-interactive context"
+                );
+                let _ = req.response_tx.send(ApprovalDecision::Deny);
             }
         });
 
