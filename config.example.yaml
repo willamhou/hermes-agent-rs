@@ -1,0 +1,56 @@
+# Hermes Agent RS — Example Configuration
+# Copy to ~/.hermes/config.yaml and adjust as needed.
+
+# Model in "provider/model" format. Bare model name defaults to OpenAI.
+model: anthropic/claude-sonnet-4-20250514
+
+# Max agent loop iterations per message.
+max_iterations: 90
+
+# Sampling temperature (0.0 - 1.0).
+temperature: 0.7
+
+# Terminal tool settings.
+terminal:
+  timeout: 180          # Default command timeout (seconds)
+  max_timeout: 600      # Maximum allowed timeout
+  output_max_chars: 50000
+
+# File tool settings.
+file:
+  read_max_chars: 100000
+  read_max_lines: 2000
+
+# Browser automation settings.
+browser:
+  headless: true
+  sandbox: true
+  launch_timeout_secs: 20
+  action_timeout_secs: 30
+
+# Dangerous command approval policy: ask | yolo | deny
+approval:
+  policy: ask
+
+# MCP (Model Context Protocol) servers — auto-discovered at startup.
+# mcp_servers:
+#   - name: filesystem
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+#   - name: remote-docs
+#     transport: http
+#     url: https://mcp.example.com
+#     headers:
+#       Authorization: "Bearer ${MCP_TOKEN}"
+
+# Gateway configuration (for `hermes gateway` command).
+# gateway:
+#   session_idle_timeout_secs: 1800
+#   max_concurrent_sessions: 100
+#   telegram:
+#     token: "${TELEGRAM_BOT_TOKEN}"
+#     allowed_users: ["username1", "12345678"]
+#     # allow_all: true
+#   api_server:
+#     bind_addr: "127.0.0.1:8080"
+#     api_key: "${HERMES_API_KEY}"
