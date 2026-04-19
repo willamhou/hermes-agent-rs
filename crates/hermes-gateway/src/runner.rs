@@ -11,6 +11,7 @@ use hermes_tools::ToolRegistry;
 use tokio::sync::{RwLock, mpsc};
 
 use crate::api_server::ApiServerAdapter;
+use crate::discord::DiscordAdapter;
 use crate::session::{SessionRouter, SharedState};
 use crate::telegram::TelegramAdapter;
 
@@ -75,6 +76,21 @@ impl GatewayRunner {
             let tx = event_tx.clone();
             adapter_handles.push(tokio::spawn(async move { adapter.run(tx).await }));
             tracing::info!("telegram adapter enabled");
+        }
+
+        if let Some(ref dc_config) = self.gateway_config.discord {
+            let adapter = Arc::new(DiscordAdapter::new(
+                dc_config.token.clone(),
+                dc_config.allowed_users.clone(),
+                dc_config.allow_all,
+            ));
+            adapters.insert(
+                "discord".into(),
+                adapter.clone() as Arc<dyn PlatformAdapter>,
+            );
+            let tx = event_tx.clone();
+            adapter_handles.push(tokio::spawn(async move { adapter.run(tx).await }));
+            tracing::info!("discord adapter enabled");
         }
 
         // API server adapter — constructed here but started after router is built

@@ -210,6 +210,8 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub telegram: Option<TelegramGatewayConfig>,
     #[serde(default)]
+    pub discord: Option<DiscordGatewayConfig>,
+    #[serde(default)]
     pub api_server: Option<ApiServerGatewayConfig>,
     #[serde(default = "default_session_idle_timeout")]
     pub session_idle_timeout_secs: u64,
@@ -228,11 +230,21 @@ impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             telegram: None,
+            discord: None,
             api_server: None,
             session_idle_timeout_secs: default_session_idle_timeout(),
             max_concurrent_sessions: default_max_sessions(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscordGatewayConfig {
+    pub token: String,
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    #[serde(default)]
+    pub allow_all: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

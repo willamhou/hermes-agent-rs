@@ -67,6 +67,11 @@ pub fn split_telegram(text: &str) -> Vec<String> {
     split_message(text, 4000)
 }
 
+/// Split `text` for Discord (max 2000 characters per message).
+pub fn split_discord(text: &str) -> Vec<String> {
+    split_message(text, 2000)
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
