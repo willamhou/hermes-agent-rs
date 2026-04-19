@@ -269,6 +269,55 @@ pub fn handle_verbose(verbose: &Arc<std::sync::atomic::AtomicBool>) {
     }
 }
 
+pub fn handle_background(args: &str) {
+    use hermes_tools::process_registry::global_registry;
+
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    match parts.first().copied().unwrap_or("list") {
+        "list" | "" => {
+            let infos = global_registry().list();
+            if infos.is_empty() {
+                println!("No background processes.");
+            } else {
+                println!("\nBackground processes ({}):", infos.len());
+                for p in &infos {
+                    println!("  {} | {} | {}", p.id, p.status, p.command);
+                }
+                println!();
+            }
+        }
+        "read" => {
+            if let Some(id) = parts.get(1) {
+                match global_registry().read_output(id) {
+                    Some(output) if output.is_empty() => println!("(no output yet)"),
+                    Some(output) => print!("{output}"),
+                    None => println!("Process {id} not found."),
+                }
+            } else {
+                println!("Usage: /bg read <id>");
+            }
+        }
+        "kill" => {
+            if let Some(id) = parts.get(1) {
+                match global_registry().kill(id) {
+                    Ok(()) => println!("Sent SIGKILL to process {id}."),
+                    Err(e) => println!("{e}"),
+                }
+            } else {
+                println!("Usage: /bg kill <id>");
+            }
+        }
+        "clean" => {
+            global_registry().remove_exited();
+            println!("Removed exited processes.");
+        }
+        other => {
+            println!("Unknown subcommand: {other}");
+            println!("Usage: /bg [list|read <id>|kill <id>|clean]");
+        }
+    }
+}
+
 pub fn handle_cron() {
     let store_path = hermes_config::config::hermes_home()
         .join("cron")

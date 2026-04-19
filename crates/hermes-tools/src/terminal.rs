@@ -150,7 +150,8 @@ impl Tool for TerminalTool {
                 "properties": {
                     "command": {"type": "string"},
                     "timeout": {"type": "integer", "minimum": 1},
-                    "workdir": {"type": "string"}
+                    "workdir": {"type": "string"},
+                    "background": {"type": "boolean", "description": "Run in background"}
                 },
                 "required": ["command"]
             }),
@@ -216,7 +217,29 @@ impl Tool for TerminalTool {
             }
         }
 
-        // Spawn the command
+        // Background mode: spawn and return immediately
+        let background = args
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if background {
+            let registry = crate::process_registry::global_registry();
+            return match registry.spawn(&command, &workdir) {
+                Ok(id) => {
+                    let output_json = json!({
+                        "process_id": id,
+                        "status": "started",
+                        "command": command,
+                        "note": "Use /bg to check status and output"
+                    });
+                    Ok(ToolResult::ok(output_json.to_string()))
+                }
+                Err(e) => Ok(ToolResult::error(format!("background spawn failed: {e}"))),
+            };
+        }
+
+        // Spawn the command (foreground)
         let mut cmd = tokio::process::Command::new("bash");
         cmd.args(["-lc", &command]);
         cmd.current_dir(&workdir);

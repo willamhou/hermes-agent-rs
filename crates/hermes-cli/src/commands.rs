@@ -134,6 +134,12 @@ pub const COMMANDS: &[CommandDef] = &[
         description: "Toggle debug logging",
         usage: "/verbose",
     },
+    CommandDef {
+        name: "background",
+        aliases: &["bg"],
+        description: "Background processes",
+        usage: "/bg [read|kill <id>]",
+    },
 ];
 
 /// Resolve a slash command from user input.

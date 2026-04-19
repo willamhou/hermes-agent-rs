@@ -360,6 +360,7 @@ async fn repl_loop(
                         }
                         "toolsets" => handlers::handle_toolsets(agent.registry()),
                         "verbose" => handlers::handle_verbose(&state.verbose),
+                        "background" => handlers::handle_background(cmd_args(&input)),
                         "search" => {
                             let query = cmd_args(&input);
                             if query.is_empty() {

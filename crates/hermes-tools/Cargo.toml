@@ -24,6 +24,8 @@ base64.workspace = true
 sha2.workspace = true
 chromiumoxide.workspace = true
 tokio-stream.workspace = true
+chrono.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

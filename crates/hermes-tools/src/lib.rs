@@ -11,6 +11,7 @@ pub mod memory_tools;
 pub mod net_utils;
 pub mod patch;
 pub mod path_utils;
+pub mod process_registry;
 pub mod registry;
 pub mod terminal;
 pub mod vision;
