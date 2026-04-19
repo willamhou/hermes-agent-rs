@@ -86,6 +86,12 @@ pub const COMMANDS: &[CommandDef] = &[
         description: "Scheduled jobs",
         usage: "/cron",
     },
+    CommandDef {
+        name: "search",
+        aliases: &["se"],
+        description: "Search past conversations",
+        usage: "/search <query>",
+    },
 ];
 
 /// Resolve a slash command from user input.

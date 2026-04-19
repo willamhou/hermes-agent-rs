@@ -7,7 +7,7 @@ use hermes_core::{
     error::{HermesError, Result},
     message::{Content, Message, Role, ToolCall},
     provider::TokenUsage,
-    session::{SessionMeta, SessionStore},
+    session::{SearchHit, SessionMeta, SessionStore},
 };
 use tokio_rusqlite::Connection;
 
@@ -47,6 +47,20 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content,
+    content=messages,
+    content_rowid=id
+);
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+END;
 ";
 
 // ─── Store struct ─────────────────────────────────────────────────────────────
@@ -78,6 +92,47 @@ impl SqliteSessionStore {
         .await?;
 
         Ok(Self { conn })
+    }
+
+    /// Search message content across all sessions using FTS5.
+    ///
+    /// Uses the `messages_fts` virtual table. Results are ordered by relevance
+    /// (lower FTS5 rank = more relevant). The query uses FTS5 MATCH syntax.
+    pub async fn search_messages(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> hermes_core::error::Result<Vec<SearchHit>> {
+        let query = query.to_string();
+        self.conn
+            .call(move |conn| -> rusqlite::Result<Vec<SearchHit>> {
+                let mut stmt = conn.prepare(
+                    "SELECT m.id, m.session_id, m.role, m.content, m.created_at, \
+                            messages_fts.rank \
+                     FROM messages_fts \
+                     JOIN messages m ON messages_fts.rowid = m.id \
+                     WHERE messages_fts MATCH ?1 \
+                     ORDER BY messages_fts.rank \
+                     LIMIT ?2",
+                )?;
+
+                let hits = stmt
+                    .query_map(rusqlite::params![query, limit as i64], |row| {
+                        Ok(SearchHit {
+                            message_id: row.get(0)?,
+                            session_id: row.get(1)?,
+                            role: row.get(2)?,
+                            content: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                            created_at: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                            rank: row.get(5)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+
+                Ok(hits)
+            })
+            .await
+            .map_err(|e| hermes_core::error::HermesError::Config(format!("search error: {e}")))
     }
 }
 

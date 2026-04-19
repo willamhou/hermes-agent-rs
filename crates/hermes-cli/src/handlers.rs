@@ -94,6 +94,32 @@ pub fn handle_skills_list() {
     println!("Place skill files in ~/.hermes/skills/");
 }
 
+pub async fn handle_search(query: &str, store: &hermes_config::SqliteSessionStore) {
+    match store.search_messages(query, 20).await {
+        Ok(hits) if hits.is_empty() => println!("No results found."),
+        Ok(hits) => {
+            println!("\nSearch results ({}):\n", hits.len());
+            for hit in &hits {
+                let content_preview = if hit.content.len() > 100 {
+                    format!("{}...", &hit.content[..100])
+                } else {
+                    hit.content.clone()
+                };
+                let sid_len = hit.session_id.len().min(8);
+                println!(
+                    "  [{}] {} | {} | {}",
+                    &hit.session_id[..sid_len],
+                    hit.role,
+                    hit.created_at.get(..19).unwrap_or(&hit.created_at),
+                    content_preview
+                );
+            }
+            println!();
+        }
+        Err(e) => eprintln!("Search failed: {e}"),
+    }
+}
+
 pub fn handle_cron() {
     let store_path = hermes_config::config::hermes_home()
         .join("cron")

@@ -6,6 +6,160 @@ use hermes_core::{
 };
 use std::sync::Arc;
 
+// ─── FTS5 search tests ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_fts5_search_basic() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteSessionStore::open_at(&dir.path().join("state.db"))
+        .await
+        .unwrap();
+
+    store
+        .create_session(&make_meta("fts-basic", "2024-02-01T00:00:00"))
+        .await
+        .unwrap();
+
+    store
+        .append_message(
+            "fts-basic",
+            &Message::user("What is the Rust borrow checker?"),
+        )
+        .await
+        .unwrap();
+    store
+        .append_message(
+            "fts-basic",
+            &Message::assistant("The borrow checker enforces memory safety in Rust."),
+        )
+        .await
+        .unwrap();
+
+    let hits = store.search_messages("borrow checker", 10).await.unwrap();
+    assert!(!hits.is_empty(), "should find at least one result");
+    let contents: Vec<&str> = hits.iter().map(|h| h.content.as_str()).collect();
+    assert!(
+        contents.iter().any(|c| c.contains("borrow checker")),
+        "result should contain search term"
+    );
+}
+
+#[tokio::test]
+async fn test_fts5_search_no_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteSessionStore::open_at(&dir.path().join("state.db"))
+        .await
+        .unwrap();
+
+    store
+        .create_session(&make_meta("fts-empty", "2024-02-02T00:00:00"))
+        .await
+        .unwrap();
+
+    store
+        .append_message("fts-empty", &Message::user("Hello world"))
+        .await
+        .unwrap();
+
+    let hits = store
+        .search_messages("xyznonexistentterm123", 10)
+        .await
+        .unwrap();
+    assert!(hits.is_empty(), "should return empty for nonexistent term");
+}
+
+#[tokio::test]
+async fn test_fts5_search_across_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteSessionStore::open_at(&dir.path().join("state.db"))
+        .await
+        .unwrap();
+
+    store
+        .create_session(&make_meta("fts-sess-a", "2024-02-03T00:00:00"))
+        .await
+        .unwrap();
+    store
+        .create_session(&make_meta("fts-sess-b", "2024-02-03T00:01:00"))
+        .await
+        .unwrap();
+
+    store
+        .append_message("fts-sess-a", &Message::user("I love programming in Go"))
+        .await
+        .unwrap();
+    store
+        .append_message(
+            "fts-sess-b",
+            &Message::user("Python is great for data science"),
+        )
+        .await
+        .unwrap();
+    store
+        .append_message(
+            "fts-sess-b",
+            &Message::assistant("Python has many libraries"),
+        )
+        .await
+        .unwrap();
+
+    let hits = store.search_messages("Python", 10).await.unwrap();
+    assert!(!hits.is_empty(), "should find Python messages");
+    for hit in &hits {
+        assert_eq!(
+            hit.session_id, "fts-sess-b",
+            "only session B has Python messages"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_fts5_search_ranking() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SqliteSessionStore::open_at(&dir.path().join("state.db"))
+        .await
+        .unwrap();
+
+    store
+        .create_session(&make_meta("fts-rank", "2024-02-04T00:00:00"))
+        .await
+        .unwrap();
+
+    // This message contains "Rust" twice — should rank higher.
+    store
+        .append_message(
+            "fts-rank",
+            &Message::user("Rust is great. I love Rust programming."),
+        )
+        .await
+        .unwrap();
+    // This message contains "Rust" once.
+    store
+        .append_message("fts-rank", &Message::assistant("Have you tried Rust?"))
+        .await
+        .unwrap();
+    // No "Rust" here — should not appear.
+    store
+        .append_message("fts-rank", &Message::user("Python is also nice"))
+        .await
+        .unwrap();
+
+    let hits = store.search_messages("Rust", 10).await.unwrap();
+    assert_eq!(hits.len(), 2, "exactly two messages mention Rust");
+
+    // Results are ordered by rank (lower = more relevant); FTS5 rank values are
+    // negative so the most-relevant row has the smallest (most negative) rank.
+    // Verify ordering is consistent (each rank <= previous rank).
+    let ranks: Vec<f64> = hits.iter().map(|h| h.rank).collect();
+    for window in ranks.windows(2) {
+        assert!(
+            window[0] <= window[1],
+            "results should be ordered by relevance (rank ascending): {:?}",
+            ranks
+        );
+    }
+}
+
 fn make_meta(id: &str, started_at: &str) -> SessionMeta {
     SessionMeta {
         id: id.to_owned(),

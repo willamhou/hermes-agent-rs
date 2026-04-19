@@ -314,6 +314,18 @@ async fn repl_loop(
                             handlers::handle_save(history, args);
                         }
                         "cron" => handlers::handle_cron(),
+                        "search" => {
+                            let query = input
+                                .strip_prefix("/search")
+                                .or_else(|| input.strip_prefix("/se"))
+                                .unwrap_or("")
+                                .trim();
+                            if query.is_empty() {
+                                println!("Usage: /search <query>");
+                            } else {
+                                handlers::handle_search(query, store).await;
+                            }
+                        }
                         _ => {}
                     }
                     continue;

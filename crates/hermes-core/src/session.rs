@@ -21,6 +21,17 @@ pub struct SessionMeta {
     pub title: Option<String>,
 }
 
+/// A single search result returned by [`SessionStore::search_messages`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchHit {
+    pub session_id: String,
+    pub message_id: i64,
+    pub role: String,
+    pub content: String,
+    pub rank: f64,
+    pub created_at: String,
+}
+
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     async fn create_session(&self, meta: &SessionMeta) -> Result<()>;
@@ -30,4 +41,13 @@ pub trait SessionStore: Send + Sync {
     async fn get_session(&self, session_id: &str) -> Result<Option<SessionMeta>>;
     async fn list_sessions(&self, limit: usize) -> Result<Vec<SessionMeta>>;
     async fn update_usage(&self, session_id: &str, usage: &TokenUsage) -> Result<()>;
+
+    /// Search message content across all sessions using FTS5.
+    ///
+    /// Returns results ordered by relevance (lower rank = more relevant).
+    /// Default implementation returns an empty vec so existing impls don't break.
+    async fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        let _ = (query, limit);
+        Ok(vec![])
+    }
 }
