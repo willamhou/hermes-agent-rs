@@ -98,6 +98,21 @@ impl ToolRegistry {
             .is_some()
     }
 
+    /// Return tool names grouped by toolset.
+    pub fn tools_by_toolset(&self) -> std::collections::BTreeMap<String, Vec<String>> {
+        let guard = self.tools.read().expect("tool registry read lock poisoned");
+        let mut map = std::collections::BTreeMap::<String, Vec<String>>::new();
+        for (name, tool) in guard.iter() {
+            map.entry(tool.toolset().to_string())
+                .or_default()
+                .push(name.clone());
+        }
+        for names in map.values_mut() {
+            names.sort_unstable();
+        }
+        map
+    }
+
     /// Replace every tool with the given toolset, keeping all other toolsets intact.
     pub fn replace_toolset(&self, toolset: &str, tools: Vec<Box<dyn Tool>>) {
         let mut guard = self

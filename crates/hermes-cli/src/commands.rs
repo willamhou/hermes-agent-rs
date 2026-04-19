@@ -92,6 +92,48 @@ pub const COMMANDS: &[CommandDef] = &[
         description: "Search past conversations",
         usage: "/search <query>",
     },
+    CommandDef {
+        name: "config",
+        aliases: &[],
+        description: "Show configuration",
+        usage: "/config",
+    },
+    CommandDef {
+        name: "provider",
+        aliases: &[],
+        description: "Show provider info",
+        usage: "/provider",
+    },
+    CommandDef {
+        name: "usage",
+        aliases: &[],
+        description: "Token usage stats",
+        usage: "/usage",
+    },
+    CommandDef {
+        name: "yolo",
+        aliases: &[],
+        description: "Toggle auto-approve",
+        usage: "/yolo",
+    },
+    CommandDef {
+        name: "title",
+        aliases: &[],
+        description: "Set session title",
+        usage: "/title <text>",
+    },
+    CommandDef {
+        name: "toolsets",
+        aliases: &["ts"],
+        description: "Tools by category",
+        usage: "/toolsets",
+    },
+    CommandDef {
+        name: "verbose",
+        aliases: &[],
+        description: "Toggle debug logging",
+        usage: "/verbose",
+    },
 ];
 
 /// Resolve a slash command from user input.
@@ -149,22 +191,25 @@ mod tests {
 
     #[test]
     fn resolve_by_unambiguous_prefix() {
-        // "cr" matches only "cron"
-        let cmd = resolve_command("/cr").expect("should resolve /cr prefix to cron");
-        assert_eq!(cmd.name, "cron");
-
         // "sk" matches only "skills"
         let cmd = resolve_command("/sk").expect("should resolve /sk prefix to skills");
         assert_eq!(cmd.name, "skills");
+
+        // "pr" matches only "provider"
+        let cmd = resolve_command("/pr").expect("should resolve /pr prefix to provider");
+        assert_eq!(cmd.name, "provider");
     }
 
     #[test]
     fn ambiguous_prefix_returns_none() {
-        // "s" matches "status", "save", "skills" — ambiguous
+        // "s" matches "status", "save", "skills", "search" — ambiguous
         assert!(resolve_command("/s").is_none());
 
-        // "c" matches "clear", "compress", "cron" — ambiguous
+        // "c" matches "clear", "compress", "cron", "config" — ambiguous
         assert!(resolve_command("/c").is_none());
+
+        // "to" matches "tools", "toolsets" — ambiguous
+        assert!(resolve_command("/to").is_none());
     }
 
     #[test]

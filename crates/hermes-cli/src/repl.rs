@@ -13,7 +13,7 @@ use hermes_agent::{
 };
 use hermes_config::{
     SqliteSessionStore,
-    config::{AppConfig, hermes_home},
+    config::{AppConfig, ApprovalPolicy, hermes_home},
 };
 use hermes_core::{
     clarify::ClarifyRequest,
@@ -55,11 +55,12 @@ pub async fn run_repl() -> Result<()> {
     let working_dir = std::env::current_dir().context("failed to get current directory")?;
     let tool_config = Arc::new(config.tool_config(working_dir.clone()));
 
+    let shared_policy = Arc::new(RwLock::new(config.approval.policy.clone()));
     let approval_manager = ApprovalManager::load_or_default();
     let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(8);
     approval_manager.spawn_handler(
         approval_rx,
-        config.approval.policy.clone(),
+        Arc::clone(&shared_policy),
         is_interactive_terminal(),
     );
 
@@ -73,13 +74,10 @@ pub async fn run_repl() -> Result<()> {
     ));
 
     let (clarify_tx, clarify_rx) = mpsc::channel::<ClarifyRequest>(4);
-    // Shared flag: clarify handler sets this while reading stdin so the readline
-    // loop (in read_repl_input) knows to pause. Although the current repl_loop
-    // design serializes readline and run_message (so there is no concurrent
-    // stdin read in normal flow), this guard makes the invariant explicit and
-    // protects against future refactors that might introduce concurrency.
     let clarify_active = Arc::new(AtomicBool::new(false));
     spawn_clarify_handler(clarify_rx, Arc::clone(&clarify_active));
+
+    let verbose = Arc::new(AtomicBool::new(false));
 
     let agent_config = AgentConfig {
         provider,
@@ -125,13 +123,18 @@ pub async fn run_repl() -> Result<()> {
     println!("Session: {session_id}");
     println!("Type /help for commands, /quit to exit.\n");
 
+    let repl_state = ReplState {
+        clarify_active,
+        approval_policy: shared_policy,
+        verbose,
+    };
     repl_loop(
         &mut agent,
         &mut history,
         &store,
         &session_id,
         &config,
-        clarify_active,
+        repl_state,
     )
     .await?;
 
@@ -187,11 +190,12 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
     let working_dir = PathBuf::from(&meta.cwd);
     let tool_config = Arc::new(config.tool_config(working_dir.clone()));
 
+    let shared_policy = Arc::new(RwLock::new(config.approval.policy.clone()));
     let approval_manager = ApprovalManager::load_or_default();
     let (approval_tx, approval_rx) = mpsc::channel::<ApprovalRequest>(8);
     approval_manager.spawn_handler(
         approval_rx,
-        config.approval.policy.clone(),
+        Arc::clone(&shared_policy),
         is_interactive_terminal(),
     );
 
@@ -205,6 +209,8 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
     let (clarify_tx, clarify_rx) = mpsc::channel::<ClarifyRequest>(4);
     let clarify_active = Arc::new(AtomicBool::new(false));
     spawn_clarify_handler(clarify_rx, Arc::clone(&clarify_active));
+
+    let verbose = Arc::new(AtomicBool::new(false));
 
     let mut agent = Agent::new(AgentConfig {
         provider,
@@ -225,19 +231,40 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
     println!("Hermes — model: {model}");
     println!("Type /help for commands, /quit to exit.\n");
 
+    let repl_state = ReplState {
+        clarify_active,
+        approval_policy: shared_policy,
+        verbose,
+    };
     repl_loop(
         &mut agent,
         &mut history,
         &store,
         &session_id,
         &config,
-        clarify_active,
+        repl_state,
     )
     .await?;
 
     let _ = store.end_session(&session_id).await;
 
     Ok(())
+}
+
+/// Shared REPL state passed to the loop.
+struct ReplState {
+    clarify_active: Arc<AtomicBool>,
+    approval_policy: Arc<RwLock<ApprovalPolicy>>,
+    verbose: Arc<AtomicBool>,
+}
+
+/// Extract the argument portion after the first whitespace in a slash command.
+fn cmd_args(input: &str) -> &str {
+    input
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest)
+        .unwrap_or("")
+        .trim()
 }
 
 /// Core REPL loop shared by `run_repl` and `run_repl_with_resume`.
@@ -247,13 +274,14 @@ async fn repl_loop(
     store: &SqliteSessionStore,
     session_id: &str,
     config: &AppConfig,
-    clarify_active: Arc<AtomicBool>,
+    state: ReplState,
 ) -> Result<()> {
     let history_path = hermes_home().join("cli_history.txt");
 
     // ── Main async loop ───────────────────────────────────────────────────────
     loop {
-        let input = read_repl_input(history_path.clone(), Arc::clone(&clarify_active)).await?;
+        let input =
+            read_repl_input(history_path.clone(), Arc::clone(&state.clarify_active)).await?;
 
         if input.is_empty() {
             continue;
@@ -314,12 +342,26 @@ async fn repl_loop(
                             handlers::handle_save(history, args);
                         }
                         "cron" => handlers::handle_cron(),
+                        "config" => handlers::handle_config(config),
+                        "provider" => handlers::handle_provider(&config.model),
+                        "usage" => {
+                            handlers::handle_usage(session_id, store).await;
+                        }
+                        "yolo" => {
+                            handlers::handle_yolo(&state.approval_policy).await;
+                        }
+                        "title" => {
+                            let title = cmd_args(&input);
+                            if title.is_empty() {
+                                println!("Usage: /title <text>");
+                            } else {
+                                handlers::handle_title(title, session_id, store).await;
+                            }
+                        }
+                        "toolsets" => handlers::handle_toolsets(agent.registry()),
+                        "verbose" => handlers::handle_verbose(&state.verbose),
                         "search" => {
-                            let query = input
-                                .strip_prefix("/search")
-                                .or_else(|| input.strip_prefix("/se"))
-                                .unwrap_or("")
-                                .trim();
+                            let query = cmd_args(&input);
                             if query.is_empty() {
                                 println!("Usage: /search <query>");
                             } else {

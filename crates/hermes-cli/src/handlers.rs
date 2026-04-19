@@ -1,8 +1,12 @@
 //! REPL command handler functions.
 
+use std::sync::Arc;
+
 use hermes_agent::token_counter::TokenCounter;
+use hermes_config::config::AppConfig;
 use hermes_core::message::{Message, Role};
 use hermes_tools::ToolRegistry;
+use tokio::sync::RwLock;
 
 pub fn handle_help() {
     use crate::commands::COMMANDS;
@@ -117,6 +121,151 @@ pub async fn handle_search(query: &str, store: &hermes_config::SqliteSessionStor
             println!();
         }
         Err(e) => eprintln!("Search failed: {e}"),
+    }
+}
+
+pub fn handle_config(config: &AppConfig) {
+    println!("\nConfiguration:");
+    println!("  model:          {}", config.model);
+    println!("  max_iterations: {}", config.max_iterations);
+    println!("  temperature:    {}", config.temperature);
+    println!("  approval:       {:?}", config.approval.policy);
+    println!("  terminal:");
+    println!("    timeout:        {}s", config.terminal.timeout);
+    println!("    max_timeout:    {}s", config.terminal.max_timeout);
+    println!(
+        "    output_max:     {} chars",
+        config.terminal.output_max_chars
+    );
+    println!("  file:");
+    println!("    read_max_chars: {}", config.file.read_max_chars);
+    println!("    read_max_lines: {}", config.file.read_max_lines);
+    println!("  browser:");
+    println!(
+        "    headless: {} | sandbox: {}",
+        config.browser.headless, config.browser.sandbox
+    );
+    println!("  mcp_servers:    {}", config.mcp_servers.len());
+    if !config.mcp_servers.is_empty() {
+        for s in &config.mcp_servers {
+            let status = if s.enabled { "on" } else { "off" };
+            println!("    - {} ({})", s.name, status);
+        }
+    }
+    println!(
+        "\n  Config file: {}/config.yaml",
+        hermes_config::config::hermes_home().display()
+    );
+    println!();
+}
+
+pub fn handle_provider(model: &str) {
+    let parts: Vec<&str> = model.splitn(2, '/').collect();
+    let (provider, model_name) = if parts.len() == 2 {
+        (parts[0], parts[1])
+    } else {
+        ("openai", model)
+    };
+    println!("\nProvider: {provider}");
+    println!("Model:    {model_name}");
+
+    let key_var = match provider {
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "openai" | "openai-codex" | "openai-responses" => "OPENAI_API_KEY",
+        "openrouter" => "OPENROUTER_API_KEY",
+        _ => "HERMES_API_KEY",
+    };
+    let key_status = if std::env::var(key_var).is_ok_and(|k| !k.is_empty()) {
+        format!("{key_var} = ****")
+    } else if std::env::var("HERMES_API_KEY").is_ok_and(|k| !k.is_empty()) {
+        "HERMES_API_KEY = ****".to_string()
+    } else {
+        "not set".to_string()
+    };
+    println!("API key:  {key_status}");
+    println!();
+}
+
+pub async fn handle_usage(session_id: &str, store: &hermes_config::SqliteSessionStore) {
+    use hermes_core::session::SessionStore;
+    match store.get_session(session_id).await {
+        Ok(Some(meta)) => {
+            println!(
+                "\nToken usage (session {}):",
+                &session_id[..session_id.len().min(8)]
+            );
+            println!("  Input tokens:  {}", meta.input_tokens);
+            println!("  Output tokens: {}", meta.output_tokens);
+            println!(
+                "  Total tokens:  {}",
+                meta.input_tokens + meta.output_tokens
+            );
+            println!("  Messages:      {}", meta.message_count);
+            println!("  Tool calls:    {}", meta.tool_call_count);
+            println!();
+        }
+        Ok(None) => println!("Session not found."),
+        Err(e) => eprintln!("Failed to get usage: {e}"),
+    }
+}
+
+pub async fn handle_yolo(approval_policy: &Arc<RwLock<hermes_config::config::ApprovalPolicy>>) {
+    use hermes_config::config::ApprovalPolicy;
+    let mut policy = approval_policy.write().await;
+    *policy = match *policy {
+        ApprovalPolicy::Deny => {
+            println!("Cannot toggle YOLO: approval policy is set to Deny in configuration.");
+            return;
+        }
+        ApprovalPolicy::Ask => {
+            println!("YOLO mode ON — dangerous commands auto-approved.");
+            println!("Toggle off with /yolo");
+            ApprovalPolicy::Yolo
+        }
+        ApprovalPolicy::Yolo => {
+            println!("YOLO mode OFF — dangerous commands require approval.");
+            ApprovalPolicy::Ask
+        }
+    };
+}
+
+pub async fn handle_title(
+    title: &str,
+    session_id: &str,
+    store: &hermes_config::SqliteSessionStore,
+) {
+    const MAX_TITLE_LEN: usize = 200;
+    if title.len() > MAX_TITLE_LEN {
+        println!("Title too long (max {MAX_TITLE_LEN} characters).");
+        return;
+    }
+    if let Err(e) = store.update_title(session_id, title).await {
+        eprintln!("Failed to set title: {e}");
+    } else {
+        println!("Session title set to: {title}");
+    }
+}
+
+pub fn handle_toolsets(registry: &ToolRegistry) {
+    let groups = registry.tools_by_toolset();
+    println!("\nTools by category ({} total):\n", registry.len());
+    for (toolset, names) in &groups {
+        println!("  [{toolset}]");
+        for name in names {
+            println!("    {name}");
+        }
+    }
+    println!();
+}
+
+pub fn handle_verbose(verbose: &Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+    let was = verbose.fetch_xor(true, Ordering::Relaxed);
+    let now = !was;
+    if now {
+        println!("Verbose mode ON (note: tracing level change not yet wired).");
+    } else {
+        println!("Verbose mode OFF.");
     }
 }
 

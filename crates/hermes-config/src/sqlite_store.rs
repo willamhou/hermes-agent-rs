@@ -94,6 +94,26 @@ impl SqliteSessionStore {
         Ok(Self { conn })
     }
 
+    /// Update the title of a session.
+    pub async fn update_title(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> hermes_core::error::Result<()> {
+        let sid = session_id.to_owned();
+        let t = title.to_owned();
+        self.conn
+            .call(move |c| -> rusqlite::Result<()> {
+                c.execute(
+                    "UPDATE sessions SET title = ?1 WHERE id = ?2",
+                    rusqlite::params![t, sid],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(db_err)
+    }
+
     /// Search message content across all sessions using FTS5.
     ///
     /// Uses the `messages_fts` virtual table. Results are ordered by relevance
@@ -584,5 +604,23 @@ mod tests {
 
         let after = store.get_session("sess-end").await.unwrap().unwrap();
         assert!(after.ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_update_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteSessionStore::open_at(&dir.path().join("state.db"))
+            .await
+            .unwrap();
+
+        store
+            .create_session(&make_meta("title-test", "2024-03-01T00:00:00"))
+            .await
+            .unwrap();
+
+        store.update_title("title-test", "New Title").await.unwrap();
+
+        let meta = store.get_session("title-test").await.unwrap().unwrap();
+        assert_eq!(meta.title, Some("New Title".to_owned()));
     }
 }

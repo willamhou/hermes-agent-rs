@@ -42,6 +42,12 @@ pub trait SessionStore: Send + Sync {
     async fn list_sessions(&self, limit: usize) -> Result<Vec<SessionMeta>>;
     async fn update_usage(&self, session_id: &str, usage: &TokenUsage) -> Result<()>;
 
+    /// Update the session title.
+    async fn update_title(&self, session_id: &str, title: &str) -> Result<()> {
+        let _ = (session_id, title);
+        Ok(())
+    }
+
     /// Search message content across all sessions using FTS5.
     ///
     /// Returns results ordered by relevance (lower rank = more relevant).

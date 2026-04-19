@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use hermes_config::config::{ApprovalPolicy, hermes_home};
 use hermes_core::tool::{ApprovalDecision, ApprovalRequest};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ApprovalFile {
@@ -104,7 +104,7 @@ impl ApprovalManager {
     pub fn spawn_handler(
         self,
         mut approval_rx: mpsc::Receiver<ApprovalRequest>,
-        policy: ApprovalPolicy,
+        policy: Arc<RwLock<ApprovalPolicy>>,
         interactive: bool,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -117,7 +117,8 @@ impl ApprovalManager {
                     );
                     remembered
                 } else {
-                    match policy {
+                    let current_policy = policy.read().await.clone();
+                    match current_policy {
                         ApprovalPolicy::Yolo => {
                             tracing::warn!(
                                 tool = %req.tool_name,
@@ -313,7 +314,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let manager = ApprovalManager::load(tmp.path().join("approvals.json")).unwrap();
         let (approval_tx, approval_rx) = mpsc::channel(1);
-        let handle = manager.spawn_handler(approval_rx, ApprovalPolicy::Yolo, false);
+        let policy = Arc::new(RwLock::new(ApprovalPolicy::Yolo));
+        let handle = manager.spawn_handler(approval_rx, policy, false);
 
         let (response_tx, response_rx) = oneshot::channel();
         approval_tx
@@ -337,7 +339,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let manager = ApprovalManager::load(tmp.path().join("approvals.json")).unwrap();
         let (approval_tx, approval_rx) = mpsc::channel(1);
-        let handle = manager.spawn_handler(approval_rx, ApprovalPolicy::Ask, false);
+        let policy = Arc::new(RwLock::new(ApprovalPolicy::Ask));
+        let handle = manager.spawn_handler(approval_rx, policy, false);
 
         let (response_tx, response_rx) = oneshot::channel();
         approval_tx
