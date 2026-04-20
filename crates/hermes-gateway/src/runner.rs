@@ -34,7 +34,11 @@ impl GatewayRunner {
             .app_config
             .api_key()
             .ok_or_else(|| anyhow::anyhow!("No API key configured"))?;
-        let provider = create_provider(&self.app_config.model, api_key, None)?;
+        let provider = create_provider(
+            &self.app_config.model,
+            api_key,
+            self.app_config.base_url.as_deref(),
+        )?;
 
         // Build tool registry — same tools as CLI, including inventory-registered ones
         let registry = Arc::new(ToolRegistry::from_inventory());
@@ -194,15 +198,39 @@ impl GatewayRunner {
 
         // 5. Main event loop
         tracing::info!("gateway started — waiting for messages");
-        while let Some(event) = event_rx.recv().await {
-            match event {
-                PlatformEvent::Message(msg) => {
-                    let r = router.clone();
-                    tokio::spawn(async move {
-                        r.route(msg).await;
-                    });
+
+        // Telegram/Discord adapters send through event_rx.
+        // API server routes directly through SessionRouter (bypasses event channel).
+        let has_event_adapters =
+            self.gateway_config.telegram.is_some() || self.gateway_config.discord.is_some();
+
+        tracing::info!(
+            has_event_adapters,
+            handles = adapter_handles.len(),
+            "deciding main loop mode"
+        );
+        if has_event_adapters {
+            // Event-driven: process messages until all adapters disconnect
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    PlatformEvent::Message(msg) => {
+                        let r = router.clone();
+                        tokio::spawn(async move {
+                            r.route(msg).await;
+                        });
+                    }
+                    PlatformEvent::Shutdown => break,
                 }
-                PlatformEvent::Shutdown => break,
+            }
+        } else {
+            // API-only mode: wait for adapter handle (axum serve blocks)
+            tracing::info!(
+                handles = adapter_handles.len(),
+                "api-only mode — waiting for adapter handles"
+            );
+            for handle in &mut adapter_handles {
+                let result = handle.await;
+                tracing::info!(?result, "adapter handle finished");
             }
         }
 

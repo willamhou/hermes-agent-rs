@@ -46,8 +46,8 @@ pub async fn run_repl() -> Result<()> {
     })?;
 
     // ── Provider + tools ─────────────────────────────────────────────────────
-    let provider =
-        create_provider(&config.model, api_key, None).context("failed to create provider")?;
+    let provider = create_provider(&config.model, api_key, config.base_url.as_deref())
+        .context("failed to create provider")?;
     let registry = build_registry(&config).await;
 
     // ── Agent ────────────────────────────────────────────────────────────────
@@ -185,7 +185,8 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
     let config = AppConfig::load();
     let model = meta.model.clone();
     let api_key = config.api_key().with_context(|| "No API key")?;
-    let provider = create_provider(&model, api_key, None).context("failed to create provider")?;
+    let provider = create_provider(&model, api_key, config.base_url.as_deref())
+        .context("failed to create provider")?;
     let registry = build_registry(&config).await;
     let working_dir = PathBuf::from(&meta.cwd);
     let tool_config = Arc::new(config.tool_config(working_dir.clone()));

@@ -290,6 +290,10 @@ pub struct AppConfig {
     #[serde(default = "default_model")]
     pub model: String,
 
+    /// Override the provider base URL (e.g. for OpenAI-compatible proxies).
+    #[serde(default)]
+    pub base_url: Option<String>,
+
     /// Maximum agent loop iterations per invocation.
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
@@ -339,6 +343,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             model: default_model(),
+            base_url: None,
             max_iterations: default_max_iterations(),
             temperature: default_temperature(),
             terminal: TerminalConfigYaml::default(),
