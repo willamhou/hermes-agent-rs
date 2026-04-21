@@ -4,6 +4,8 @@ A high-performance AI agent framework in Rust. Single binary, 26 MB, 0 dependenc
 
 Features streaming tool-calling agents with 17 built-in tools, multi-platform gateway, OpenAI-compatible API, cron scheduling, MCP integration, and 78 bundled skills.
 
+[![Demo](https://asciinema.org/a/6QEKM06EO9iwn30j.svg)](https://asciinema.org/a/6QEKM06EO9iwn30j)
+
 ## Quick Start
 
 ```bash
