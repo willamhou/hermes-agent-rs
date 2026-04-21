@@ -68,20 +68,24 @@ impl SessionRouter {
         }
     }
 
-    /// Get or create a session's message sender. Returns Err(String) on failure.
+    /// Get or create a session's message sender.
     async fn get_or_create_session(
         &self,
         key: &str,
     ) -> std::result::Result<mpsc::Sender<RoutedMessage>, String> {
+        // Check session limit BEFORE entry() to avoid DashMap self-deadlock
+        // (entry holds shard lock, len() tries to acquire all shard locks).
+        if self.sessions.len() >= self.max_sessions {
+            return Err("Error: maximum concurrent sessions reached".into());
+        }
         match self.sessions.entry(key.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(e) => {
                 e.get().last_active.store(epoch_secs(), Ordering::Relaxed);
                 Ok(e.get().msg_tx.clone())
             }
             dashmap::mapref::entry::Entry::Vacant(e) => {
-                if self.sessions.len() >= self.max_sessions {
-                    return Err("Error: maximum concurrent sessions reached".into());
-                }
+                // Note: do NOT call self.sessions.len() here — it would deadlock
+                // by trying to acquire all shard locks while we hold one from entry().
                 let agent = build_session_agent(key, &self.shared, &self.app_config)
                     .map_err(|err| format!("Error: failed to create session: {err}"))?;
                 let (tx, rx) = mpsc::channel::<RoutedMessage>(32);
@@ -106,7 +110,6 @@ impl SessionRouter {
     /// Returns the agent's response text.
     pub async fn route(&self, event: MessageEvent) -> String {
         let key = session_key(&event);
-
         let msg_tx = match self.get_or_create_session(&key).await {
             Ok(tx) => tx,
             Err(err) => return err,
@@ -206,6 +209,10 @@ async fn session_task_with_agent(
 
     while let Some(routed) = msg_rx.recv().await {
         last_active.store(epoch_secs(), Ordering::Relaxed);
+        tracing::debug!(
+            text_len = routed.event.text.len(),
+            "session task: received message"
+        );
 
         let (delta_tx, mut delta_rx) = mpsc::channel(64);
 

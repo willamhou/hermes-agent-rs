@@ -204,11 +204,6 @@ impl GatewayRunner {
         let has_event_adapters =
             self.gateway_config.telegram.is_some() || self.gateway_config.discord.is_some();
 
-        tracing::info!(
-            has_event_adapters,
-            handles = adapter_handles.len(),
-            "deciding main loop mode"
-        );
         if has_event_adapters {
             // Event-driven: process messages until all adapters disconnect
             while let Some(event) = event_rx.recv().await {
@@ -224,13 +219,9 @@ impl GatewayRunner {
             }
         } else {
             // API-only mode: wait for adapter handle (axum serve blocks)
-            tracing::info!(
-                handles = adapter_handles.len(),
-                "api-only mode — waiting for adapter handles"
-            );
+            tracing::info!("api-only mode — press ctrl-c to stop");
             for handle in &mut adapter_handles {
-                let result = handle.await;
-                tracing::info!(?result, "adapter handle finished");
+                let _ = handle.await;
             }
         }
 

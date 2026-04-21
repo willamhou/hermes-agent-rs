@@ -138,7 +138,18 @@ impl Agent {
                 stop_sequences: vec![],
             };
 
+            tracing::debug!(
+                budget_remaining = self.budget.remaining(),
+                tools = schemas.len(),
+                history_len = history.len(),
+                "agent loop: calling provider"
+            );
             let response = self.provider.chat(&request, Some(&delta_tx)).await?;
+            tracing::debug!(
+                content_len = response.content.len(),
+                tool_calls = response.tool_calls.len(),
+                "agent loop: provider returned"
+            );
 
             // Push assistant turn to history.
             let assistant_msg = Message {

@@ -202,10 +202,9 @@ impl PlatformAdapter for ApiServerAdapter {
             .await
             .map_err(|e| hermes_core::error::HermesError::Config(e.to_string()))?;
 
-        let serve_result = axum::serve(listener, app).await;
-        info!("axum::serve exited: {:?}", serve_result.as_ref().err());
-
-        serve_result.map_err(|e| hermes_core::error::HermesError::Config(e.to_string()))?;
+        axum::serve(listener, app)
+            .await
+            .map_err(|e| hermes_core::error::HermesError::Config(e.to_string()))?;
 
         Ok(())
     }
