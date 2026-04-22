@@ -480,6 +480,7 @@ mod tests {
     fn config_serde_roundtrip() {
         let original = AppConfig {
             model: "openai/gpt-4o".to_string(),
+            base_url: None,
             max_iterations: 50,
             temperature: 0.5,
             terminal: TerminalConfigYaml::default(),
