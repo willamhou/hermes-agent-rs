@@ -15,10 +15,11 @@
   - invocation through `model: "agent:<name>"`
   - per-agent tool and skill allowlists
   - `/v1/runs` list/get/cancel with best-effort task abort
+  - durable run replay via `/v1/runs/{id}/replay`
   - persisted run events via `/v1/runs/{id}/events`
   - startup reconciliation for runs left `pending` / `running` during process exit
   - CLI `hermes agents ...` commands plus YAML `diff` / `sync`
-  - CLI `hermes runs ...` inspection and Signet verification commands
+  - CLI `hermes runs ...` inspection, replay, and Signet verification commands
   - optional Signet request/response receipts for managed tool calls
   - example scripts for managed API smoke tests, Signet verification, and a repository GitHub Actions workflow
 
@@ -28,7 +29,7 @@
 
 ## Still Missing From The Managed Beta Roadmap
 
-- Durable run replay or restart recovery that resumes in-flight runs
+- Restart-safe recovery that resumes in-flight runs after process restart
 - MCP-backed tools in managed mode
 - Vault / KMS or a hosted audit pipeline
 - Multi-tenant namespaces and RBAC
