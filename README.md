@@ -307,6 +307,8 @@ That script walks through:
 The end-to-end API example lives at [examples/managed-agents-beta.sh](examples/managed-agents-beta.sh).
 The CI-oriented verification helper lives at [examples/verify-managed-run.sh](examples/verify-managed-run.sh).
 The repository workflow lives at [.github/workflows/managed-run-verify.yml](.github/workflows/managed-run-verify.yml).
+It is bound to the GitHub Actions environment `managed-verify`, which should define
+`HERMES_MODEL`, `HERMES_BASE_URL`, and `HERMES_API_KEY` as environment secrets.
 The mirrored example file lives at [examples/github-actions-managed-run-verify.yml](examples/github-actions-managed-run-verify.yml).
 
 See [docs/specs/2026-04-22-managed-agents-v1-beta-plan.md](docs/specs/2026-04-22-managed-agents-v1-beta-plan.md) for the current beta contract and non-goals.
