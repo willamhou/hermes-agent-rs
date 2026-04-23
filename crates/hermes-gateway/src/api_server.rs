@@ -26,6 +26,7 @@ use hermes_managed::{
     build_managed_runtime, preflight_managed_model, resolve_managed_version_defaults,
     validate_managed_agent_name, validate_managed_beta_tools,
 };
+use hermes_tools::session_cleanup;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -336,6 +337,7 @@ impl PlatformAdapter for ApiServerAdapter {
                 "/v1/runs/{id}",
                 get(handle_managed_run_get).delete(handle_managed_run_cancel),
             )
+            .route("/v1/runs/{id}/replay", post(handle_managed_run_replay))
             .route("/v1/runs/{id}/events", get(handle_managed_run_events_list))
             .route("/v1/models", get(handle_oai_models))
             .route("/health", get(handle_health))
@@ -886,7 +888,7 @@ async fn handle_managed_run_events_list(
     }
 
     let limit = clamp_run_events_limit(query.limit);
-    match managed.store.list_run_events(&run_id, limit).await {
+    match managed.store.list_run_events_tail(&run_id, limit).await {
         Ok(events) => Json(ManagedRunEventListResponse {
             object: "list",
             data: events,
@@ -960,12 +962,16 @@ async fn handle_managed_run_cancel(
     } else {
         if let Err(e) = managed
             .store
-            .request_run_cancel(&run_id, chrono::Utc::now())
+            .record_run_terminal_intent(
+                &run_id,
+                ManagedRunStatus::Cancelled,
+                Some("cancelled via API"),
+            )
             .await
         {
             return managed_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to request managed run cancel: {e}"),
+                format!("failed to record managed run cancel intent: {e}"),
             );
         }
         if let Err(e) = managed
@@ -1382,6 +1388,58 @@ async fn load_managed_agent_version(
     Ok((agent, version))
 }
 
+async fn load_managed_agent_version_for_run(
+    managed: &ManagedApiState,
+    run: &hermes_managed::ManagedRun,
+) -> std::result::Result<(ManagedAgent, ManagedAgentVersion), Response> {
+    let agent = match managed.store.get_agent(&run.agent_id).await {
+        Ok(Some(agent)) => agent,
+        Ok(None) => {
+            return Err(managed_error_response(
+                StatusCode::NOT_FOUND,
+                format!(
+                    "managed agent not found for run {}: {}",
+                    run.id, run.agent_id
+                ),
+            ));
+        }
+        Err(e) => {
+            return Err(managed_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load managed agent for run {}: {e}", run.id),
+            ));
+        }
+    };
+
+    let version = match managed
+        .store
+        .get_agent_version(&run.agent_id, run.agent_version)
+        .await
+    {
+        Ok(Some(version)) => version,
+        Ok(None) => {
+            return Err(managed_error_response(
+                StatusCode::NOT_FOUND,
+                format!(
+                    "managed agent version not found for run {}: {}@{}",
+                    run.id, run.agent_id, run.agent_version
+                ),
+            ));
+        }
+        Err(e) => {
+            return Err(managed_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "failed to load managed agent version for run {}: {e}",
+                    run.id
+                ),
+            ));
+        }
+    };
+
+    Ok((agent, version))
+}
+
 async fn finalize_managed_run(
     store: Arc<ManagedStore>,
     runs: Arc<RunRegistry>,
@@ -1412,12 +1470,22 @@ async fn finalize_managed_run(
         .and_then(|snapshot| snapshot.last_error.clone())
         .or(last_error);
 
+    if matches!(
+        status_to_store,
+        ManagedRunStatus::Completed | ManagedRunStatus::Failed
+    ) {
+        let _ = store
+            .record_run_terminal_intent(&run_id, status_to_store.clone(), error_to_store.as_deref())
+            .await;
+    }
+
     let _ = store
         .update_run_status(&run_id, status_to_store.clone(), error_to_store.as_deref())
         .await;
     if !was_terminal {
         append_terminal_run_event(store.as_ref(), &run_id, &status_to_store, error_to_store).await;
     }
+    log_managed_cleanup(&run_id, session_cleanup::cleanup_session(&run_id));
     let _ = runs.remove(&run_id);
 }
 
@@ -1429,7 +1497,6 @@ async fn terminate_managed_run(
     last_error: Option<String>,
 ) {
     let was_terminal = run_is_terminal(store.as_ref(), runs.as_ref(), &run_id).await;
-    let _ = store.request_run_cancel(&run_id, chrono::Utc::now()).await;
 
     let snapshot = runs
         .terminate_run(&run_id, status.clone(), last_error.clone())
@@ -1442,13 +1509,46 @@ async fn terminate_managed_run(
         None => (status, last_error),
     };
 
+    if matches!(
+        status_to_store,
+        ManagedRunStatus::Cancelled | ManagedRunStatus::Failed | ManagedRunStatus::TimedOut
+    ) {
+        let _ = store
+            .record_run_terminal_intent(&run_id, status_to_store.clone(), error_to_store.as_deref())
+            .await;
+    }
+
     let _ = store
         .update_run_status(&run_id, status_to_store.clone(), error_to_store.as_deref())
         .await;
     if !was_terminal {
         append_terminal_run_event(store.as_ref(), &run_id, &status_to_store, error_to_store).await;
     }
+    log_managed_cleanup(&run_id, session_cleanup::cleanup_session(&run_id));
     let _ = runs.remove(&run_id);
+}
+
+fn log_managed_cleanup(run_id: &str, summary: session_cleanup::SessionCleanupSummary) {
+    if summary.attempted == 0 {
+        return;
+    }
+
+    if summary.failures.is_empty() {
+        tracing::info!(
+            run_id,
+            attempted = summary.attempted,
+            cleaned = summary.cleaned,
+            "cleaned up session-scoped resources for managed run"
+        );
+    } else {
+        tracing::warn!(
+            run_id,
+            attempted = summary.attempted,
+            cleaned = summary.cleaned,
+            failures = ?summary.failures,
+            "managed run cleanup completed with failures"
+        );
+    }
 }
 
 async fn spawn_managed_run(
@@ -1465,6 +1565,24 @@ async fn spawn_managed_run(
     Response,
 > {
     let (agent, version) = load_managed_agent_version(managed, agent_name).await?;
+    spawn_managed_run_with_version(managed, &agent, &version, prompt, None).await
+}
+
+async fn spawn_managed_run_with_version(
+    managed: &ManagedApiState,
+    agent: &ManagedAgent,
+    version: &ManagedAgentVersion,
+    prompt: String,
+    replay_of_run_id: Option<String>,
+) -> std::result::Result<
+    (
+        String,
+        u64,
+        broadcast::Receiver<StreamDelta>,
+        oneshot::Receiver<ManagedRunOutcome>,
+    ),
+    Response,
+> {
     let working_dir = std::env::current_dir().map_err(|e| {
         oai_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1474,8 +1592,8 @@ async fn spawn_managed_run(
     })?;
 
     let runtime = build_managed_runtime(
-        &agent,
-        &version,
+        agent,
+        version,
         managed.shared.registry.as_ref(),
         managed.shared.skills.as_ref(),
         &managed.app_config,
@@ -1490,7 +1608,9 @@ async fn spawn_managed_run(
         )
     })?;
 
-    let run = runtime.run.clone();
+    let mut run = runtime.run.clone();
+    run.prompt = prompt.clone();
+    run.replay_of_run_id = replay_of_run_id.clone();
     managed.store.create_run(&run).await.map_err(|e| {
         oai_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1503,13 +1623,19 @@ async fn spawn_managed_run(
         &run.id,
         ManagedRunEventDraft {
             kind: ManagedRunEventKind::RunCreated,
-            message: Some(format!(
-                "managed run created for {}@{}",
-                agent.name, version.version
-            )),
+            message: Some(match &replay_of_run_id {
+                Some(source_run_id) => format!(
+                    "managed run replayed from {source_run_id} for {}@{}",
+                    agent.name, version.version
+                ),
+                None => format!("managed run created for {}@{}", agent.name, version.version),
+            }),
             tool_name: None,
             tool_call_id: None,
-            metadata: None,
+            metadata: Some(serde_json::json!({
+                "prompt_chars": run.prompt.chars().count(),
+                "replay_of_run_id": replay_of_run_id,
+            })),
         },
     )
     .await;
@@ -1594,6 +1720,82 @@ async fn spawn_managed_run(
     .await;
 
     Ok((run_id, timeout_secs, broadcast_rx, outcome_rx))
+}
+
+async fn handle_managed_run_replay(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = check_bearer_auth(&headers, &state.api_key) {
+        return e.into_response();
+    }
+
+    let Some(managed) = state.managed else {
+        return managed_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "managed runtime not available",
+        );
+    };
+
+    let source_run = match managed.store.get_run(&run_id).await {
+        Ok(Some(run)) => run,
+        Ok(None) => {
+            return managed_error_response(
+                StatusCode::NOT_FOUND,
+                format!("managed run not found: {run_id}"),
+            );
+        }
+        Err(e) => {
+            return managed_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load managed run: {e}"),
+            );
+        }
+    };
+
+    if source_run.prompt.trim().is_empty() {
+        return managed_error_response(
+            StatusCode::CONFLICT,
+            format!("managed run is not replayable yet: {run_id}"),
+        );
+    }
+
+    let (agent, version) = match load_managed_agent_version_for_run(&managed, &source_run).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    let new_run_id = match spawn_managed_run_with_version(
+        &managed,
+        &agent,
+        &version,
+        source_run.prompt.clone(),
+        Some(source_run.id.clone()),
+    )
+    .await
+    {
+        Ok((run_id, _, _, _)) => run_id,
+        Err(response) => return response,
+    };
+
+    match managed.store.get_run(&new_run_id).await {
+        Ok(Some(run)) => (
+            StatusCode::CREATED,
+            Json(ManagedRunEnvelope {
+                run: apply_run_snapshot(run, managed.runs.snapshot(&new_run_id)),
+            }),
+        )
+            .into_response(),
+        Ok(None) => managed_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("managed replayed run disappeared after creation: {new_run_id}"),
+        ),
+        Err(e) => managed_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to reload replayed managed run: {e}"),
+        ),
+    }
 }
 
 async fn handle_managed_oai_chat(
@@ -3236,6 +3438,14 @@ mod tests {
         let mut run = hermes_managed::ManagedRun::new(&agent.id, 1, "openai/gpt-4o-mini");
         run.status = ManagedRunStatus::Running;
         managed.store.create_run(&run).await.unwrap();
+        let mut child = tokio::process::Command::new("bash")
+            .args(["-lc", "sleep 30"])
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let _cleanup_registration =
+            hermes_tools::session_cleanup::register_pid(&run.id, pid, "managed cancel test")
+                .unwrap();
         managed
             .runs
             .register(
@@ -3270,6 +3480,11 @@ mod tests {
         let stored = managed.store.get_run(&run.id).await.unwrap().unwrap();
         assert_eq!(stored.status, ManagedRunStatus::Cancelled);
         wait_for_run_eviction(managed.runs.as_ref(), &run.id).await;
+        let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .expect("cleanup should kill registered child")
+            .expect("child wait should succeed");
+        assert!(!status.success());
     }
 
     #[tokio::test]
@@ -3289,6 +3504,126 @@ mod tests {
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_terminate_managed_run_timeout_does_not_mark_cancel_requested() {
+        let _env_guard = ENV_LOCK.lock().await;
+        let home = TempDir::new().unwrap();
+        let _home_guard = EnvVarGuard::set("HERMES_HOME", &home.path().to_string_lossy());
+        let (_tmp, state, agent, version) =
+            build_managed_test_state_with_version(AppConfig::default(), |_| {}).await;
+        let managed = state.managed.clone().unwrap();
+
+        let mut run = hermes_managed::ManagedRun::new(&agent.id, version.version, &version.model);
+        run.status = ManagedRunStatus::Running;
+        managed.store.create_run(&run).await.unwrap();
+
+        terminate_managed_run(
+            Arc::clone(&managed.store),
+            Arc::clone(&managed.runs),
+            run.id.clone(),
+            ManagedRunStatus::TimedOut,
+            Some("managed run timed out after 5s".to_string()),
+        )
+        .await;
+
+        let stored = managed.store.get_run(&run.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, ManagedRunStatus::TimedOut);
+        assert!(stored.cancel_requested_at.is_none());
+        assert_eq!(
+            stored.last_error.as_deref(),
+            Some("managed run timed out after 5s")
+        );
+
+        let events = managed.store.list_run_events(&run.id, 10).await.unwrap();
+        let terminal_event = events
+            .iter()
+            .find(|event| event.kind == ManagedRunEventKind::RunTimedOut)
+            .expect("timed out event missing");
+        assert_eq!(
+            terminal_event.message.as_deref(),
+            Some("managed run timed out after 5s")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_managed_run_replay_creates_new_run_from_original_prompt() {
+        let _env_guard = ENV_LOCK.lock().await;
+        let _api_key_guard = EnvVarGuard::set("OPENAI_API_KEY", "test-openai-key");
+        let home = TempDir::new().unwrap();
+        let _home_guard = EnvVarGuard::set("HERMES_HOME", &home.path().to_string_lossy());
+
+        let Some((base_url, _audits, server_handle)) = spawn_mock_managed_provider_server(
+            MockManagedProviderProtocol::OpenAi,
+            "Hello from replay",
+        )
+        .await
+        else {
+            return;
+        };
+        let (_tmp, state, agent, version) =
+            build_managed_test_state_with_version(AppConfig::default(), |version| {
+                version.base_url = Some(base_url.clone());
+                version.timeout_secs = 5;
+            })
+            .await;
+        let managed = state.managed.clone().unwrap();
+
+        let mut source_run =
+            hermes_managed::ManagedRun::new(&agent.id, version.version, &version.model);
+        source_run.status = ManagedRunStatus::Completed;
+        source_run.prompt = "Re-run this review".to_string();
+        managed.store.create_run(&source_run).await.unwrap();
+
+        let app = Router::new()
+            .route("/v1/runs/{id}/replay", post(handle_managed_run_replay))
+            .with_state(state);
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/runs/{}/replay", source_run.id))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let replay_run_id = json["run"]["id"].as_str().unwrap().to_string();
+        assert_ne!(replay_run_id, source_run.id);
+        assert_eq!(json["run"]["replay_of_run_id"], source_run.id);
+        assert_eq!(json["run"]["prompt"], "Re-run this review");
+
+        let replayed = wait_for_run_status(
+            managed.store.as_ref(),
+            &replay_run_id,
+            ManagedRunStatus::Completed,
+        )
+        .await;
+        assert_eq!(replayed.prompt, "Re-run this review");
+        assert_eq!(
+            replayed.replay_of_run_id.as_deref(),
+            Some(source_run.id.as_str())
+        );
+        wait_for_run_eviction(managed.runs.as_ref(), &replay_run_id).await;
+
+        let events = managed
+            .store
+            .list_run_events(&replay_run_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(events[0].kind, ManagedRunEventKind::RunCreated);
+        assert_eq!(
+            events[0]
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("replay_of_run_id"))
+                .and_then(|value| value.as_str()),
+            Some(source_run.id.as_str())
+        );
+
+        server_handle.abort();
     }
 
     #[tokio::test]
@@ -3469,7 +3804,7 @@ mod tests {
             .uri(format!("/v1/runs/{}/events", run.id))
             .body(Body::empty())
             .unwrap();
-        let events_response = app.oneshot(events_request).await.unwrap();
+        let events_response = app.clone().oneshot(events_request).await.unwrap();
         assert_eq!(events_response.status(), StatusCode::OK);
         let events_bytes = events_response
             .into_body()
@@ -3487,6 +3822,32 @@ mod tests {
         assert!(kinds.contains(&"run.created".to_string()));
         assert!(kinds.contains(&"run.started".to_string()));
         assert!(kinds.contains(&"run.completed".to_string()));
+
+        let limited_events_request = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/v1/runs/{}/events?limit=2", run.id))
+            .body(Body::empty())
+            .unwrap();
+        let limited_events_response = app.oneshot(limited_events_request).await.unwrap();
+        assert_eq!(limited_events_response.status(), StatusCode::OK);
+        let limited_events_bytes = limited_events_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let limited_events_json: serde_json::Value =
+            serde_json::from_slice(&limited_events_bytes).unwrap();
+        let limited_kinds = limited_events_json["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            limited_kinds,
+            vec!["run.started".to_string(), "run.completed".to_string()]
+        );
 
         server_handle.abort();
     }

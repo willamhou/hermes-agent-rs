@@ -38,6 +38,7 @@ uuid.workspace = true
 secrecy.workspace = true
 chrono.workspace = true
 signet-core.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

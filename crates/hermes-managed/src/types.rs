@@ -252,6 +252,10 @@ pub struct ManagedRun {
     pub agent_version: u32,
     pub status: ManagedRunStatus,
     pub model: String,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_of_run_id: Option<String>,
     pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
@@ -268,6 +272,8 @@ impl ManagedRun {
             agent_version,
             status: ManagedRunStatus::Pending,
             model: model.into(),
+            prompt: String::new(),
+            replay_of_run_id: None,
             started_at: now,
             updated_at: now,
             ended_at: None,

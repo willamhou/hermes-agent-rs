@@ -197,6 +197,7 @@ impl RunHandle {
         last_error: Option<String>,
     ) -> RunStatusSnapshot {
         let now = Utc::now();
+        let mark_cancel_requested = status == ManagedRunStatus::Cancelled;
         let mut state = self.state.lock().expect("run handle lock poisoned");
         if let Some(task) = state.task.as_ref() {
             task.abort();
@@ -207,7 +208,7 @@ impl RunHandle {
             state.ended_at = Some(now);
             state.last_error = last_error;
         }
-        if state.cancel_requested_at.is_none() {
+        if mark_cancel_requested && state.cancel_requested_at.is_none() {
             state.cancel_requested_at = Some(now);
         }
         drop(state);
@@ -332,7 +333,7 @@ mod tests {
 
         assert_eq!(snapshot.status, ManagedRunStatus::TimedOut);
         assert_eq!(snapshot.last_error.as_deref(), Some("timed out"));
-        assert!(snapshot.cancel_requested_at.is_some());
+        assert!(snapshot.cancel_requested_at.is_none());
     }
 
     #[tokio::test]

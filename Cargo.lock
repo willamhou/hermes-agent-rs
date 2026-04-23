@@ -1350,6 +1350,7 @@ dependencies = [
  "hermes-provider",
  "hermes-skills",
  "hermes-tools",
+ "reqwest",
  "rustyline",
  "secrecy 0.10.3",
  "serde",
