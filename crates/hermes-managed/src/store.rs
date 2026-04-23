@@ -623,10 +623,13 @@ impl ManagedStore {
     ) -> Result<()> {
         if !matches!(
             status,
-            ManagedRunStatus::Cancelled | ManagedRunStatus::Failed | ManagedRunStatus::TimedOut
+            ManagedRunStatus::Completed
+                | ManagedRunStatus::Cancelled
+                | ManagedRunStatus::Failed
+                | ManagedRunStatus::TimedOut
         ) {
             return Err(HermesError::Config(format!(
-                "terminal intent only supports cancelled/failed/timed_out, got {}",
+                "terminal intent only supports completed/cancelled/failed/timed_out, got {}",
                 status.as_str()
             )));
         }
@@ -740,9 +743,9 @@ impl ManagedStore {
 
                 let tx = c.transaction()?;
                 for raw in &mut raws {
-                    let (status, kind, message) = reconcile_incomplete_run(raw);
-                    let status_str = status.as_str().to_string();
-                    let kind_str = kind.as_str().to_string();
+                    let reconciled = reconcile_incomplete_run(raw);
+                    let status_str = reconciled.status.as_str().to_string();
+                    let kind_str = reconciled.event_kind.as_str().to_string();
                     let run_id = raw.id.clone();
 
                     tx.execute(
@@ -758,7 +761,7 @@ impl ManagedStore {
                             status_str,
                             reconciled_at,
                             reconciled_at,
-                            message,
+                            reconciled.last_error,
                             run_id,
                         ],
                     )?;
@@ -766,13 +769,18 @@ impl ManagedStore {
                         "INSERT INTO run_events
                             (run_id, kind, message, tool_name, tool_call_id, metadata, created_at)
                          VALUES (?1, ?2, ?3, NULL, NULL, NULL, ?4)",
-                        rusqlite::params![raw.id, kind_str, message, reconciled_at],
+                        rusqlite::params![
+                            raw.id,
+                            kind_str,
+                            reconciled.event_message,
+                            reconciled_at
+                        ],
                     )?;
 
                     raw.status = status_str;
                     raw.updated_at = reconciled_at.clone();
                     raw.ended_at = Some(reconciled_at.clone());
-                    raw.last_error = Some(message);
+                    raw.last_error = reconciled.last_error;
                 }
                 tx.commit()?;
 
@@ -1008,7 +1016,14 @@ struct RawRunEvent {
     created_at: String,
 }
 
-fn reconcile_incomplete_run(raw: &RawRun) -> (ManagedRunStatus, ManagedRunEventKind, String) {
+struct ReconciledIncompleteRun {
+    status: ManagedRunStatus,
+    event_kind: ManagedRunEventKind,
+    event_message: Option<String>,
+    last_error: Option<String>,
+}
+
+fn reconcile_incomplete_run(raw: &RawRun) -> ReconciledIncompleteRun {
     if let Some(status) = raw
         .terminal_status_hint
         .as_deref()
@@ -1016,39 +1031,57 @@ fn reconcile_incomplete_run(raw: &RawRun) -> (ManagedRunStatus, ManagedRunEventK
         .filter(|status| {
             matches!(
                 status,
-                ManagedRunStatus::Cancelled | ManagedRunStatus::Failed | ManagedRunStatus::TimedOut
+                ManagedRunStatus::Completed
+                    | ManagedRunStatus::Cancelled
+                    | ManagedRunStatus::Failed
+                    | ManagedRunStatus::TimedOut
             )
         })
     {
-        let message = raw
+        let event_message = raw
             .terminal_reason_hint
             .clone()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| terminal_intent_reconcile_message(&status).to_string());
-        return (status.clone(), terminal_event_kind(&status), message);
+        let last_error = if status == ManagedRunStatus::Completed {
+            None
+        } else {
+            Some(event_message.clone())
+        };
+        return ReconciledIncompleteRun {
+            status: status.clone(),
+            event_kind: terminal_event_kind(&status),
+            event_message: Some(event_message),
+            last_error,
+        };
     }
 
     if raw.cancel_requested_at.is_some() {
-        (
-            ManagedRunStatus::Cancelled,
-            ManagedRunEventKind::RunCancelled,
-            "gateway restarted after cancel was requested".to_string(),
-        )
+        let message = "gateway restarted after cancel was requested".to_string();
+        ReconciledIncompleteRun {
+            status: ManagedRunStatus::Cancelled,
+            event_kind: ManagedRunEventKind::RunCancelled,
+            event_message: Some(message.clone()),
+            last_error: Some(message),
+        }
     } else {
-        (
-            ManagedRunStatus::Failed,
-            ManagedRunEventKind::RunFailed,
-            "gateway restarted before managed run completed".to_string(),
-        )
+        let message = "gateway restarted before managed run completed".to_string();
+        ReconciledIncompleteRun {
+            status: ManagedRunStatus::Failed,
+            event_kind: ManagedRunEventKind::RunFailed,
+            event_message: Some(message.clone()),
+            last_error: Some(message),
+        }
     }
 }
 
 fn terminal_event_kind(status: &ManagedRunStatus) -> ManagedRunEventKind {
     match status {
+        ManagedRunStatus::Completed => ManagedRunEventKind::RunCompleted,
         ManagedRunStatus::Cancelled => ManagedRunEventKind::RunCancelled,
         ManagedRunStatus::Failed => ManagedRunEventKind::RunFailed,
         ManagedRunStatus::TimedOut => ManagedRunEventKind::RunTimedOut,
-        ManagedRunStatus::Pending | ManagedRunStatus::Running | ManagedRunStatus::Completed => {
+        ManagedRunStatus::Pending | ManagedRunStatus::Running => {
             unreachable!("non-terminal or unsupported status used for terminal event kind")
         }
     }
@@ -1056,6 +1089,9 @@ fn terminal_event_kind(status: &ManagedRunStatus) -> ManagedRunEventKind {
 
 fn terminal_intent_reconcile_message(status: &ManagedRunStatus) -> &'static str {
     match status {
+        ManagedRunStatus::Completed => {
+            "gateway restarted while managed run completion was being recorded"
+        }
         ManagedRunStatus::Cancelled => {
             "gateway restarted while managed run cancellation was being recorded"
         }
@@ -1065,7 +1101,7 @@ fn terminal_intent_reconcile_message(status: &ManagedRunStatus) -> &'static str 
         ManagedRunStatus::TimedOut => {
             "gateway restarted while managed run timeout was being recorded"
         }
-        ManagedRunStatus::Pending | ManagedRunStatus::Running | ManagedRunStatus::Completed => {
+        ManagedRunStatus::Pending | ManagedRunStatus::Running => {
             unreachable!("unsupported status used for terminal intent message")
         }
     }
@@ -1557,6 +1593,44 @@ mod tests {
         assert_eq!(
             events[0].message.as_deref(),
             Some("managed run timed out after 5s")
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_incomplete_runs_preserves_completed_intent() {
+        let (_dir, path) = temp_db();
+        let store = ManagedStore::open_at(&path).await.unwrap();
+
+        let agent = ManagedAgent::new("reconcile-completed-hint");
+        store.create_agent(&agent).await.unwrap();
+        let version = ManagedAgentVersion::new(&agent.id, 1, "openai/gpt-4o-mini", "prompt");
+        store.create_agent_version(&version).await.unwrap();
+
+        let mut run = ManagedRun::new(&agent.id, 1, "openai/gpt-4o-mini");
+        run.status = ManagedRunStatus::Running;
+        store.create_run(&run).await.unwrap();
+        store
+            .record_run_terminal_intent(&run.id, ManagedRunStatus::Completed, None)
+            .await
+            .unwrap();
+
+        let reconciled = store.reconcile_incomplete_runs().await.unwrap();
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0].status, ManagedRunStatus::Completed);
+        assert!(reconciled[0].cancel_requested_at.is_none());
+        assert!(reconciled[0].last_error.is_none());
+
+        let stored = store.get_run(&run.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, ManagedRunStatus::Completed);
+        assert!(stored.cancel_requested_at.is_none());
+        assert!(stored.last_error.is_none());
+
+        let events = store.list_run_events(&run.id, 10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, ManagedRunEventKind::RunCompleted);
+        assert_eq!(
+            events[0].message.as_deref(),
+            Some("gateway restarted while managed run completion was being recorded")
         );
     }
 }

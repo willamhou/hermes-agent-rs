@@ -1470,7 +1470,10 @@ async fn finalize_managed_run(
         .and_then(|snapshot| snapshot.last_error.clone())
         .or(last_error);
 
-    if status_to_store == ManagedRunStatus::Failed {
+    if matches!(
+        status_to_store,
+        ManagedRunStatus::Completed | ManagedRunStatus::Failed
+    ) {
         let _ = store
             .record_run_terminal_intent(&run_id, status_to_store.clone(), error_to_store.as_deref())
             .await;
