@@ -49,10 +49,14 @@ CREATE TABLE IF NOT EXISTS runs (
     agent_version INTEGER NOT NULL,
     status TEXT NOT NULL,
     model TEXT NOT NULL,
+    prompt TEXT NOT NULL DEFAULT '',
+    replay_of_run_id TEXT,
     started_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     ended_at TEXT,
     cancel_requested_at TEXT,
+    terminal_status_hint TEXT,
+    terminal_reason_hint TEXT,
     last_error TEXT,
     FOREIGN KEY (agent_id, agent_version) REFERENCES agent_versions(agent_id, version)
 );
@@ -93,6 +97,21 @@ impl ManagedStore {
         let conn = Connection::open(path).await?;
         conn.call(|c| -> rusqlite::Result<()> {
             c.execute_batch(SCHEMA)?;
+            if !has_column(c, "runs", "prompt")? {
+                c.execute(
+                    "ALTER TABLE runs ADD COLUMN prompt TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+            }
+            if !has_column(c, "runs", "replay_of_run_id")? {
+                c.execute("ALTER TABLE runs ADD COLUMN replay_of_run_id TEXT", [])?;
+            }
+            if !has_column(c, "runs", "terminal_status_hint")? {
+                c.execute("ALTER TABLE runs ADD COLUMN terminal_status_hint TEXT", [])?;
+            }
+            if !has_column(c, "runs", "terminal_reason_hint")? {
+                c.execute("ALTER TABLE runs ADD COLUMN terminal_reason_hint TEXT", [])?;
+            }
             if !has_column(c, "run_events", "metadata")? {
                 c.execute("ALTER TABLE run_events ADD COLUMN metadata TEXT", [])?;
             }
@@ -459,6 +478,8 @@ impl ManagedStore {
         let agent_version = i64::from(run.agent_version);
         let status = run.status.as_str().to_string();
         let model = run.model.clone();
+        let prompt = run.prompt.clone();
+        let replay_of_run_id = run.replay_of_run_id.clone();
         let started_at = format_ts(&run.started_at);
         let updated_at = format_ts(&run.updated_at);
         let ended_at = run.ended_at.as_ref().map(format_ts);
@@ -469,15 +490,18 @@ impl ManagedStore {
             .call(move |c| -> rusqlite::Result<()> {
                 c.execute(
                     "INSERT INTO runs
-                        (id, agent_id, agent_version, status, model, started_at, updated_at,
-                         ended_at, cancel_requested_at, last_error)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        (id, agent_id, agent_version, status, model, prompt, replay_of_run_id,
+                         started_at, updated_at, ended_at, cancel_requested_at, terminal_status_hint,
+                         terminal_reason_hint, last_error)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, ?12)",
                     rusqlite::params![
                         id,
                         agent_id,
                         agent_version,
                         status,
                         model,
+                        prompt,
+                        replay_of_run_id,
                         started_at,
                         updated_at,
                         ended_at,
@@ -497,8 +521,9 @@ impl ManagedStore {
             .conn
             .call(move |c| -> rusqlite::Result<Option<RawRun>> {
                 c.query_row(
-                    "SELECT id, agent_id, agent_version, status, model, started_at, updated_at,
-                            ended_at, cancel_requested_at, last_error
+                    "SELECT id, agent_id, agent_version, status, model, prompt, replay_of_run_id,
+                            started_at, updated_at, ended_at, cancel_requested_at, terminal_status_hint,
+                            terminal_reason_hint, last_error
                      FROM runs
                      WHERE id = ?1",
                     rusqlite::params![run_id],
@@ -509,11 +534,15 @@ impl ManagedStore {
                             agent_version: row.get(2)?,
                             status: row.get(3)?,
                             model: row.get(4)?,
-                            started_at: row.get(5)?,
-                            updated_at: row.get(6)?,
-                            ended_at: row.get(7)?,
-                            cancel_requested_at: row.get(8)?,
-                            last_error: row.get(9)?,
+                            prompt: row.get(5)?,
+                            replay_of_run_id: row.get(6)?,
+                            started_at: row.get(7)?,
+                            updated_at: row.get(8)?,
+                            ended_at: row.get(9)?,
+                            cancel_requested_at: row.get(10)?,
+                            terminal_status_hint: row.get(11)?,
+                            terminal_reason_hint: row.get(12)?,
+                            last_error: row.get(13)?,
                         })
                     },
                 )
@@ -530,8 +559,9 @@ impl ManagedStore {
             .conn
             .call(move |c| -> rusqlite::Result<Vec<RawRun>> {
                 let mut stmt = c.prepare(
-                    "SELECT id, agent_id, agent_version, status, model, started_at, updated_at,
-                            ended_at, cancel_requested_at, last_error
+                    "SELECT id, agent_id, agent_version, status, model, prompt, replay_of_run_id,
+                            started_at, updated_at, ended_at, cancel_requested_at, terminal_status_hint,
+                            terminal_reason_hint, last_error
                      FROM runs
                      ORDER BY started_at DESC
                      LIMIT ?1",
@@ -543,11 +573,15 @@ impl ManagedStore {
                         agent_version: row.get(2)?,
                         status: row.get(3)?,
                         model: row.get(4)?,
-                        started_at: row.get(5)?,
-                        updated_at: row.get(6)?,
-                        ended_at: row.get(7)?,
-                        cancel_requested_at: row.get(8)?,
-                        last_error: row.get(9)?,
+                        prompt: row.get(5)?,
+                        replay_of_run_id: row.get(6)?,
+                        started_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                        ended_at: row.get(9)?,
+                        cancel_requested_at: row.get(10)?,
+                        terminal_status_hint: row.get(11)?,
+                        terminal_reason_hint: row.get(12)?,
+                        last_error: row.get(13)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()
@@ -581,6 +615,52 @@ impl ManagedStore {
             .map_err(db_err)
     }
 
+    pub async fn record_run_terminal_intent(
+        &self,
+        run_id: &str,
+        status: ManagedRunStatus,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        if !matches!(
+            status,
+            ManagedRunStatus::Cancelled | ManagedRunStatus::Failed | ManagedRunStatus::TimedOut
+        ) {
+            return Err(HermesError::Config(format!(
+                "terminal intent only supports cancelled/failed/timed_out, got {}",
+                status.as_str()
+            )));
+        }
+
+        let run_id = run_id.to_owned();
+        let status_str = status.as_str().to_string();
+        let reason = reason.map(ToOwned::to_owned);
+        let now = format_ts(&Utc::now());
+        let cancel_requested_at = if status == ManagedRunStatus::Cancelled {
+            Some(now.clone())
+        } else {
+            None
+        };
+
+        self.conn
+            .call(move |c| -> rusqlite::Result<()> {
+                c.execute(
+                    "UPDATE runs
+                     SET updated_at = ?1,
+                         cancel_requested_at = CASE
+                             WHEN ?2 IS NOT NULL THEN COALESCE(cancel_requested_at, ?2)
+                             ELSE cancel_requested_at
+                         END,
+                         terminal_status_hint = ?3,
+                         terminal_reason_hint = ?4
+                     WHERE id = ?5",
+                    rusqlite::params![now, cancel_requested_at, status_str, reason, run_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(db_err)
+    }
+
     pub async fn update_run_status(
         &self,
         run_id: &str,
@@ -604,6 +684,8 @@ impl ManagedStore {
                      SET status = ?1,
                          updated_at = ?2,
                          ended_at = COALESCE(?3, ended_at),
+                         terminal_status_hint = NULL,
+                         terminal_reason_hint = NULL,
                          last_error = ?4
                      WHERE id = ?5",
                     rusqlite::params![status_str, updated_at, ended_at, last_error, run_id],
@@ -623,8 +705,9 @@ impl ManagedStore {
             .conn
             .call(move |c| -> rusqlite::Result<Vec<RawRun>> {
                 let mut stmt = c.prepare(
-                    "SELECT id, agent_id, agent_version, status, model, started_at, updated_at,
-                            ended_at, cancel_requested_at, last_error
+                    "SELECT id, agent_id, agent_version, status, model, prompt, replay_of_run_id,
+                            started_at, updated_at, ended_at, cancel_requested_at, terminal_status_hint,
+                            terminal_reason_hint, last_error
                      FROM runs
                      WHERE status IN (?1, ?2)
                      ORDER BY started_at ASC",
@@ -637,11 +720,15 @@ impl ManagedStore {
                             agent_version: row.get(2)?,
                             status: row.get(3)?,
                             model: row.get(4)?,
-                            started_at: row.get(5)?,
-                            updated_at: row.get(6)?,
-                            ended_at: row.get(7)?,
-                            cancel_requested_at: row.get(8)?,
-                            last_error: row.get(9)?,
+                            prompt: row.get(5)?,
+                            replay_of_run_id: row.get(6)?,
+                            started_at: row.get(7)?,
+                            updated_at: row.get(8)?,
+                            ended_at: row.get(9)?,
+                            cancel_requested_at: row.get(10)?,
+                            terminal_status_hint: row.get(11)?,
+                            terminal_reason_hint: row.get(12)?,
+                            last_error: row.get(13)?,
                         })
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -656,7 +743,6 @@ impl ManagedStore {
                     let (status, kind, message) = reconcile_incomplete_run(raw);
                     let status_str = status.as_str().to_string();
                     let kind_str = kind.as_str().to_string();
-                    let message = message.to_string();
                     let run_id = raw.id.clone();
 
                     tx.execute(
@@ -664,6 +750,8 @@ impl ManagedStore {
                          SET status = ?1,
                              updated_at = ?2,
                              ended_at = COALESCE(ended_at, ?3),
+                             terminal_status_hint = NULL,
+                             terminal_reason_hint = NULL,
                              last_error = ?4
                          WHERE id = ?5",
                         rusqlite::params![
@@ -897,10 +985,14 @@ struct RawRun {
     agent_version: i64,
     status: String,
     model: String,
+    prompt: String,
+    replay_of_run_id: Option<String>,
     started_at: String,
     updated_at: String,
     ended_at: Option<String>,
     cancel_requested_at: Option<String>,
+    terminal_status_hint: Option<String>,
+    terminal_reason_hint: Option<String>,
     last_error: Option<String>,
 }
 
@@ -916,19 +1008,66 @@ struct RawRunEvent {
     created_at: String,
 }
 
-fn reconcile_incomplete_run(raw: &RawRun) -> (ManagedRunStatus, ManagedRunEventKind, &'static str) {
+fn reconcile_incomplete_run(raw: &RawRun) -> (ManagedRunStatus, ManagedRunEventKind, String) {
+    if let Some(status) = raw
+        .terminal_status_hint
+        .as_deref()
+        .and_then(ManagedRunStatus::parse)
+        .filter(|status| {
+            matches!(
+                status,
+                ManagedRunStatus::Cancelled | ManagedRunStatus::Failed | ManagedRunStatus::TimedOut
+            )
+        })
+    {
+        let message = raw
+            .terminal_reason_hint
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| terminal_intent_reconcile_message(&status).to_string());
+        return (status.clone(), terminal_event_kind(&status), message);
+    }
+
     if raw.cancel_requested_at.is_some() {
         (
             ManagedRunStatus::Cancelled,
             ManagedRunEventKind::RunCancelled,
-            "gateway restarted after cancel was requested",
+            "gateway restarted after cancel was requested".to_string(),
         )
     } else {
         (
             ManagedRunStatus::Failed,
             ManagedRunEventKind::RunFailed,
-            "gateway restarted before managed run completed",
+            "gateway restarted before managed run completed".to_string(),
         )
+    }
+}
+
+fn terminal_event_kind(status: &ManagedRunStatus) -> ManagedRunEventKind {
+    match status {
+        ManagedRunStatus::Cancelled => ManagedRunEventKind::RunCancelled,
+        ManagedRunStatus::Failed => ManagedRunEventKind::RunFailed,
+        ManagedRunStatus::TimedOut => ManagedRunEventKind::RunTimedOut,
+        ManagedRunStatus::Pending | ManagedRunStatus::Running | ManagedRunStatus::Completed => {
+            unreachable!("non-terminal or unsupported status used for terminal event kind")
+        }
+    }
+}
+
+fn terminal_intent_reconcile_message(status: &ManagedRunStatus) -> &'static str {
+    match status {
+        ManagedRunStatus::Cancelled => {
+            "gateway restarted while managed run cancellation was being recorded"
+        }
+        ManagedRunStatus::Failed => {
+            "gateway restarted while managed run failure was being recorded"
+        }
+        ManagedRunStatus::TimedOut => {
+            "gateway restarted while managed run timeout was being recorded"
+        }
+        ManagedRunStatus::Pending | ManagedRunStatus::Running | ManagedRunStatus::Completed => {
+            unreachable!("unsupported status used for terminal intent message")
+        }
     }
 }
 
@@ -1011,6 +1150,8 @@ fn map_run(raw: RawRun) -> Result<ManagedRun> {
             HermesError::Config(format!("unknown run status in DB: {}", raw.status))
         })?,
         model: raw.model,
+        prompt: raw.prompt,
+        replay_of_run_id: raw.replay_of_run_id,
         started_at: parse_ts(&raw.started_at, "runs.started_at")?,
         updated_at: parse_ts(&raw.updated_at, "runs.updated_at")?,
         ended_at: raw
@@ -1202,6 +1343,8 @@ mod tests {
 
         let mut run = ManagedRun::new(&agent.id, 1, "openai/gpt-4o-mini");
         run.status = ManagedRunStatus::Running;
+        run.prompt = "review the latest diff".to_string();
+        run.replay_of_run_id = Some("run_previous".to_string());
         store.create_run(&run).await.unwrap();
 
         store.request_run_cancel(&run.id, Utc::now()).await.unwrap();
@@ -1216,6 +1359,8 @@ mod tests {
 
         let fetched = store.get_run(&run.id).await.unwrap().unwrap();
         assert_eq!(fetched.status, ManagedRunStatus::Cancelled);
+        assert_eq!(fetched.prompt, "review the latest diff");
+        assert_eq!(fetched.replay_of_run_id.as_deref(), Some("run_previous"));
         assert!(fetched.cancel_requested_at.is_some());
         assert!(fetched.ended_at.is_some());
         assert_eq!(fetched.last_error.as_deref(), Some("aborted by user"));
@@ -1364,6 +1509,54 @@ mod tests {
         assert_eq!(
             events[0].message.as_deref(),
             Some("gateway restarted after cancel was requested")
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_incomplete_runs_preserves_timed_out_intent() {
+        let (_dir, path) = temp_db();
+        let store = ManagedStore::open_at(&path).await.unwrap();
+
+        let agent = ManagedAgent::new("reconcile-timeout-hint");
+        store.create_agent(&agent).await.unwrap();
+        let version = ManagedAgentVersion::new(&agent.id, 1, "openai/gpt-4o-mini", "prompt");
+        store.create_agent_version(&version).await.unwrap();
+
+        let mut run = ManagedRun::new(&agent.id, 1, "openai/gpt-4o-mini");
+        run.status = ManagedRunStatus::Running;
+        store.create_run(&run).await.unwrap();
+        store
+            .record_run_terminal_intent(
+                &run.id,
+                ManagedRunStatus::TimedOut,
+                Some("managed run timed out after 5s"),
+            )
+            .await
+            .unwrap();
+
+        let reconciled = store.reconcile_incomplete_runs().await.unwrap();
+        assert_eq!(reconciled.len(), 1);
+        assert_eq!(reconciled[0].status, ManagedRunStatus::TimedOut);
+        assert!(reconciled[0].cancel_requested_at.is_none());
+        assert_eq!(
+            reconciled[0].last_error.as_deref(),
+            Some("managed run timed out after 5s")
+        );
+
+        let stored = store.get_run(&run.id).await.unwrap().unwrap();
+        assert_eq!(stored.status, ManagedRunStatus::TimedOut);
+        assert!(stored.cancel_requested_at.is_none());
+        assert_eq!(
+            stored.last_error.as_deref(),
+            Some("managed run timed out after 5s")
+        );
+
+        let events = store.list_run_events(&run.id, 10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, ManagedRunEventKind::RunTimedOut);
+        assert_eq!(
+            events[0].message.as_deref(),
+            Some("managed run timed out after 5s")
         );
     }
 }

@@ -13,6 +13,7 @@ pub mod patch;
 pub mod path_utils;
 pub mod process_registry;
 pub mod registry;
+pub mod session_cleanup;
 pub mod terminal;
 pub mod vision;
 pub mod web_extract;

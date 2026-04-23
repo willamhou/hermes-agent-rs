@@ -8,7 +8,8 @@ use anyhow::Context;
 use clap::Subcommand;
 use hermes_config::config::AppConfig;
 use hermes_managed::{ManagedRun, ManagedRunEvent, ManagedStore};
-use serde::Serialize;
+use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
 use signet_core::audit::{self, AuditFilter};
 
 #[derive(Subcommand, Debug)]
@@ -61,10 +62,19 @@ pub enum RunsAction {
         #[arg(long)]
         strict: bool,
     },
+    /// Replay one managed run through the gateway API
+    Replay {
+        /// Run id
+        run: String,
+        /// Emit JSON instead of text output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub async fn run_runs(action: RunsAction) -> anyhow::Result<()> {
     let store = ManagedStore::open().await?;
+    let app_config = AppConfig::load();
 
     match action {
         RunsAction::List { limit, json } => list_runs(&store, limit, json).await,
@@ -81,10 +91,8 @@ pub async fn run_runs(action: RunsAction) -> anyhow::Result<()> {
             json,
             quiet,
             strict,
-        } => {
-            let config = AppConfig::load();
-            verify_run_signet(&store, &config, &run, json, quiet, strict).await
-        }
+        } => verify_run_signet(&store, &app_config, &run, json, quiet, strict).await,
+        RunsAction::Replay { run, json } => replay_run(&store, &app_config, &run, json).await,
     }
 }
 
@@ -100,7 +108,7 @@ struct RunListJsonResponse {
     data: Vec<RunJsonEntry>,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct RunGetJsonResponse {
     run: ManagedRun,
     agent_name: String,
@@ -233,6 +241,11 @@ async fn get_run(store: &ManagedStore, run_ref: &str, json: bool) -> anyhow::Res
     println!("Agent ID:         {}", run.agent_id);
     println!("Agent version:    {}", run.agent_version);
     println!("Model:            {}", run.model);
+    println!(
+        "Replay of:        {}",
+        run.replay_of_run_id.as_deref().unwrap_or("-")
+    );
+    println!("Prompt chars:     {}", run.prompt.chars().count());
     println!("Status:           {}", run.status.as_str());
     println!("Started:          {}", format_ts(run.started_at));
     println!("Updated:          {}", format_ts(run.updated_at));
@@ -253,6 +266,62 @@ async fn get_run(store: &ManagedStore, run_ref: &str, json: bool) -> anyhow::Res
         run.last_error.as_deref().unwrap_or("-")
     );
 
+    Ok(())
+}
+
+async fn replay_run(
+    store: &ManagedStore,
+    app_config: &AppConfig,
+    run_ref: &str,
+    json: bool,
+) -> anyhow::Result<()> {
+    let run = load_run(store, run_ref).await?;
+    let base_url = managed_gateway_base_url(app_config)?;
+    let api_key = managed_gateway_api_key(app_config)?;
+    let url = format!(
+        "{}/v1/runs/{}/replay",
+        base_url.trim_end_matches('/'),
+        run.id
+    );
+
+    let response = reqwest::Client::new()
+        .post(url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .context("failed to call managed run replay API")?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .context("failed to read managed run replay response")?;
+
+    if status != StatusCode::CREATED {
+        anyhow::bail!(
+            "managed run replay failed ({}): {}",
+            status.as_u16(),
+            body.trim()
+        );
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_str(&body).context("failed to parse managed run replay response")?;
+    if json {
+        print_json(&value)?;
+        return Ok(());
+    }
+
+    let replayed_run: RunGetJsonResponse = serde_json::from_value(value)
+        .context("failed to decode managed run replay response body")?;
+    println!("Replayed run created: {}", replayed_run.run.id);
+    println!("Agent:              {}", replayed_run.agent_name);
+    println!("Agent version:      {}", replayed_run.run.agent_version);
+    println!(
+        "Replay of:          {}",
+        replayed_run.run.replay_of_run_id.as_deref().unwrap_or("-")
+    );
+    println!("Status:             {}", replayed_run.run.status.as_str());
     Ok(())
 }
 
@@ -698,6 +767,42 @@ fn verification_failure_summary(summary: &RunVerifyJsonResponse) -> String {
     } else {
         reasons.join("; ")
     }
+}
+
+fn managed_gateway_base_url(app_config: &AppConfig) -> anyhow::Result<String> {
+    if let Ok(value) = std::env::var("HERMES_GATEWAY_BASE_URL") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.trim_end_matches('/').to_string());
+        }
+    }
+
+    let bind_addr = app_config
+        .gateway
+        .as_ref()
+        .and_then(|gateway| gateway.api_server.as_ref())
+        .map(|api| api.bind_addr.as_str())
+        .unwrap_or("127.0.0.1:8080");
+    Ok(format!("http://{}", bind_addr.trim_end_matches('/')))
+}
+
+fn managed_gateway_api_key(app_config: &AppConfig) -> anyhow::Result<String> {
+    if let Some(api_key) = app_config
+        .gateway
+        .as_ref()
+        .and_then(|gateway| gateway.api_server.as_ref())
+        .and_then(|api| api.api_key.as_ref())
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(api_key.clone());
+    }
+
+    std::env::var("HERMES_API_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .context(
+            "No managed gateway API key found. Set gateway.api_server.api_key or HERMES_API_KEY",
+        )
 }
 
 fn format_ts(value: chrono::DateTime<chrono::Utc>) -> String {

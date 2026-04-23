@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::approval_key::approval_memory_key;
+use crate::session_cleanup;
 use hermes_core::{
     error::Result,
     message::ToolResult,
@@ -109,6 +110,8 @@ impl Tool for ExecuteCodeTool {
         };
 
         let child_id = child.id();
+        let cleanup_registration = child_id
+            .and_then(|pid| session_cleanup::register_pid(&ctx.session_id, pid, "execute_code"));
         let output =
             match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
                 .await
@@ -118,6 +121,9 @@ impl Tool for ExecuteCodeTool {
                         unsafe {
                             libc::kill(pid as libc::pid_t, libc::SIGKILL);
                         }
+                    }
+                    if let Some(registration) = cleanup_registration.as_ref() {
+                        let _ = session_cleanup::unregister(registration);
                     }
                     let _ = std::fs::remove_file(&temp_file);
                     return Ok(ToolResult::ok(
@@ -130,10 +136,18 @@ impl Tool for ExecuteCodeTool {
                     ));
                 }
                 Ok(Err(e)) => {
+                    if let Some(registration) = cleanup_registration.as_ref() {
+                        let _ = session_cleanup::unregister(registration);
+                    }
                     let _ = std::fs::remove_file(&temp_file);
                     return Ok(ToolResult::error(format!("python execution failed: {e}")));
                 }
-                Ok(Ok(output)) => output,
+                Ok(Ok(output)) => {
+                    if let Some(registration) = cleanup_registration.as_ref() {
+                        let _ = session_cleanup::unregister(registration);
+                    }
+                    output
+                }
             };
 
         let _ = std::fs::remove_file(&temp_file);

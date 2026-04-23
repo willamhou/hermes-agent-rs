@@ -6,6 +6,7 @@ use regex::Regex;
 use serde_json::json;
 
 use crate::approval_key::approval_memory_key;
+use crate::session_cleanup;
 use hermes_core::{
     error::Result,
     message::ToolResult,
@@ -227,6 +228,11 @@ impl Tool for TerminalTool {
             let registry = crate::process_registry::global_registry();
             return match registry.spawn(&command, &workdir) {
                 Ok(id) => {
+                    let _ = session_cleanup::register_background_process(
+                        &ctx.session_id,
+                        id.clone(),
+                        format!("terminal background: {command}"),
+                    );
                     let output_json = json!({
                         "process_id": id,
                         "status": "started",
@@ -257,6 +263,9 @@ impl Tool for TerminalTool {
 
         // Capture the child id before consuming the child with wait_with_output
         let child_id = child.id();
+        let cleanup_registration = child_id.and_then(|pid| {
+            session_cleanup::register_pid(&ctx.session_id, pid, format!("terminal: {command}"))
+        });
 
         match tokio::time::timeout(timeout, child.wait_with_output()).await {
             Err(_elapsed) => {
@@ -267,6 +276,9 @@ impl Tool for TerminalTool {
                         libc::kill(pid as libc::pid_t, libc::SIGKILL);
                     }
                 }
+                if let Some(registration) = cleanup_registration.as_ref() {
+                    let _ = session_cleanup::unregister(registration);
+                }
                 let output_json = json!({
                     "output": "",
                     "exit_code": 124,
@@ -274,8 +286,16 @@ impl Tool for TerminalTool {
                 });
                 Ok(ToolResult::ok(output_json.to_string()))
             }
-            Ok(Err(e)) => Ok(ToolResult::error(format!("command execution failed: {e}"))),
+            Ok(Err(e)) => {
+                if let Some(registration) = cleanup_registration.as_ref() {
+                    let _ = session_cleanup::unregister(registration);
+                }
+                Ok(ToolResult::error(format!("command execution failed: {e}")))
+            }
             Ok(Ok(output)) => {
+                if let Some(registration) = cleanup_registration.as_ref() {
+                    let _ = session_cleanup::unregister(registration);
+                }
                 let exit_code = output.status.code().unwrap_or(-1);
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
