@@ -2,14 +2,14 @@
 
 A high-performance AI agent framework in Rust. Single binary, 26 MB, 0 dependencies to install.
 
-Features streaming tool-calling agents with 17 built-in tools, multi-platform gateway, OpenAI-compatible API, cron scheduling, MCP integration, and 78 bundled skills.
+Features streaming tool-calling agents with 17 built-in tools, multi-platform gateway, OpenAI-compatible API, managed-agents beta control plane, cron scheduling, MCP integration, and 78 bundled skills.
 
 [![Demo](https://asciinema.org/a/6QEKM06EO9iwn30j.svg)](https://asciinema.org/a/6QEKM06EO9iwn30j)
 
 ## Quick Start
 
 ```bash
-# Prerequisites: Rust 1.85+, one API key
+# Prerequisites: Rust 1.86+, one API key
 export ANTHROPIC_API_KEY=sk-...  # or OPENAI_API_KEY / OPENROUTER_API_KEY
 
 # Interactive REPL
@@ -69,7 +69,7 @@ Streaming response (CLI / SSE / Telegram / ...)
 
 ### Gateway
 - **Telegram** — long-polling with user allowlist, message splitting, exponential backoff
-- **API Server** — OpenAI-compatible `/v1/chat/completions` (SSE streaming), `/v1/models`, plus legacy REST
+- **API Server** — OpenAI-compatible `/v1/chat/completions` (SSE streaming), `/v1/models`, managed `/v1/agents` and `/v1/runs`, plus legacy REST
 - Per-session agent isolation with idle cleanup
 - Cron scheduler (60s tick loop, file-locked)
 
@@ -95,13 +95,14 @@ Streaming response (CLI / SSE / Telegram / ...)
 crates/
 ├── hermes-core       # Traits: Tool, Provider, SessionStore, PlatformAdapter, MemoryAccess
 ├── hermes-provider   # Anthropic, OpenAI, OpenRouter — SSE streaming, retry, tool-call assembly
-├── hermes-tools      # 13 tools + ToolRegistry (inventory compile-time registration)
+├── hermes-tools      # 17 tools + ToolRegistry (inventory compile-time registration)
 ├── hermes-agent      # Agent loop, compression, delegation, prompt caching, token counter
 ├── hermes-memory     # BuiltinMemory, MemoryManager, prefetch cache
 ├── hermes-skills     # SkillManager, matching, skill tools
 ├── hermes-config     # YAML config, SQLite session store (WAL + FTS5)
 ├── hermes-mcp        # MCP client (stdio + HTTP), tool/prompt/resource bridges
 ├── hermes-cron       # CronJob, JobStore, CronScheduler, CronTool
+├── hermes-managed    # Managed agents domain, store, run registry, runtime filtering
 ├── hermes-gateway    # GatewayRunner, SessionRouter, Telegram + API Server adapters
 └── hermes-cli        # Binary: REPL, oneshot, session management, approval UI
 ```
@@ -109,6 +110,22 @@ crates/
 ## Configuration
 
 Config file: `~/.hermes/config.yaml` (or `$HERMES_HOME/config.yaml`)
+
+Hermes also loads `~/.hermes/.env` before parsing config. `HERMES_MODEL` and
+`HERMES_BASE_URL` can override the YAML values, and provider keys can live there too.
+
+For OpenAI-compatible endpoints, including NewAPI-style gateways, the simplest setup is:
+
+```bash
+cat >> ~/.hermes/.env <<'EOF'
+HERMES_MODEL=openai/gpt-4.1-mini
+HERMES_BASE_URL=https://your-openai-compatible-host/v1
+HERMES_API_KEY=sk-...
+EOF
+```
+
+`HERMES_MODEL` may also be a bare model name such as `gpt-4.1-mini` when you want
+OpenAI-compatible routing with a custom `HERMES_BASE_URL`.
 
 ```yaml
 model: anthropic/claude-sonnet-4-20250514
@@ -173,6 +190,126 @@ curl http://localhost:8080/v1/chat/completions \
 # Use with Open WebUI, LobeChat, LibreChat, ChatBox, etc.
 # Set base URL to http://localhost:8080/v1
 ```
+
+Managed agents use the same endpoint with `model: "agent:<name>"`.
+When publishing managed-agent versions, omitted `model` and `base_url` fields inherit the
+current global Hermes config, including `HERMES_MODEL` and `HERMES_BASE_URL` from `~/.hermes/.env`.
+
+## Managed Agents Beta
+
+The current managed-agents surface is a beta control plane, not hosted-platform parity.
+
+What exists today:
+- agent CRUD plus immutable versions
+- invocation through `model: "agent:<name>"`
+- per-agent tool and skill allowlists
+- persisted run timelines via `GET /v1/runs/{id}/events`
+- startup reconciliation that marks runs left active during process exit as `failed` or `cancelled`
+- optional Signet receipts for managed tool calls, appended to a local audit chain
+- best-effort run cancellation through `DELETE /v1/runs/:id`
+- CLI `hermes agents ...` commands plus YAML `diff` / `sync`
+
+Current non-goals:
+- hard real-time cancellation guarantees
+- MCP in managed mode
+- hosted control plane, remote KMS, or managed audit pipeline
+- run replay, RBAC, or multi-tenant namespaces
+
+Example YAML:
+
+```yaml
+name: code-reviewer
+system_prompt: |
+  Review code carefully and explain concrete risks.
+allowed_tools:
+  - read_file
+  - search_files
+  - patch
+allowed_skills: []
+max_iterations: 90
+temperature: 0.0
+approval_policy: ask
+timeout_secs: 300
+```
+
+If you omit `model` or `base_url` in YAML or version-create requests, Hermes resolves and stores
+the current global defaults at publish time. That keeps each immutable version pinned even if your
+global `.env` changes later.
+
+The same sample lives at [examples/code-reviewer.yaml](examples/code-reviewer.yaml).
+
+Example flow:
+
+```bash
+# Sync one or more YAML specs from ~/.hermes/agents
+cargo run --release -p hermes-cli -- agents sync --dry-run
+cargo run --release -p hermes-cli -- agents sync --yes
+
+# Or create directly from the CLI. `--model` and `--base-url` are optional;
+# when omitted they inherit the current ~/.hermes/.env values.
+cargo run --release -p hermes-cli -- agents create code-reviewer
+cargo run --release -p hermes-cli -- agents versions create code-reviewer \
+  --system-prompt "Review code carefully and explain concrete risks." \
+  --tool read_file \
+  --tool search_files \
+  --tool patch
+
+# Inspect managed runs and follow persisted timeline events.
+cargo run --release -p hermes-cli -- runs list
+cargo run --release -p hermes-cli -- runs list --json
+cargo run --release -p hermes-cli -- runs get <run-id>
+cargo run --release -p hermes-cli -- runs get <run-id> --json
+cargo run --release -p hermes-cli -- runs events <run-id> --json
+cargo run --release -p hermes-cli -- runs events <run-id> --follow
+cargo run --release -p hermes-cli -- runs verify <run-id>
+cargo run --release -p hermes-cli -- runs verify <run-id> --json
+cargo run --release -p hermes-cli -- runs verify <run-id> --strict
+cargo run --release -p hermes-cli -- runs verify <run-id> --quiet --strict
+
+# CI-friendly Signet verification helpers
+# Signet verification is meaningful only for runs that actually executed at least one managed tool.
+bash examples/verify-managed-run.sh --latest
+bash examples/verify-managed-run.sh --agent code-reviewer --json
+```
+
+Optional Signet integration for managed runtimes:
+
+```yaml
+signet:
+  enabled: true
+  key_name: hermes-managed
+  owner: hermes
+  # dir: /absolute/path/to/signet-data
+```
+
+When enabled, managed tool calls emit extra `tool.progress` timeline entries such as
+structured `tool.request_signed` / `tool.response_signed` timeline events with receipt metadata,
+and Hermes appends Signet audit files under
+`~/.hermes/signet/audit` by default. Keys live under `~/.hermes/signet/keys`.
+
+Minimal API walkthrough:
+
+```bash
+# Assumes gateway is already running and HERMES_API_KEY is set
+# Use HERMES_GATEWAY_BASE_URL for the local gateway; keep HERMES_BASE_URL for the upstream model API.
+# Override MANAGED_USER_PROMPT for a short deterministic smoke prompt when needed.
+bash examples/managed-agents-beta.sh
+```
+
+That script walks through:
+- `POST /v1/agents`
+- `POST /v1/agents/{id}/versions`
+- `POST /v1/chat/completions` with `model: "agent:<name>"`
+- `GET /v1/runs`
+- `GET /v1/runs/{id}/events`
+- optional `DELETE /v1/runs/{id}` cancellation
+
+The end-to-end API example lives at [examples/managed-agents-beta.sh](examples/managed-agents-beta.sh).
+The CI-oriented verification helper lives at [examples/verify-managed-run.sh](examples/verify-managed-run.sh).
+The repository workflow lives at [.github/workflows/managed-run-verify.yml](.github/workflows/managed-run-verify.yml).
+The mirrored example file lives at [examples/github-actions-managed-run-verify.yml](examples/github-actions-managed-run-verify.yml).
+
+See [docs/specs/2026-04-22-managed-agents-v1-beta-plan.md](docs/specs/2026-04-22-managed-agents-v1-beta-plan.md) for the current beta contract and non-goals.
 
 ## Gateway (Telegram)
 

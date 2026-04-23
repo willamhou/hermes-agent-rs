@@ -146,6 +146,18 @@ impl SkillManager {
         self.skills.iter().find(|skill| skill.name == name)
     }
 
+    pub fn filtered(&self, allowed_names: &HashSet<String>) -> Self {
+        Self {
+            skills: self
+                .skills
+                .iter()
+                .filter(|skill| allowed_names.contains(&skill.name))
+                .cloned()
+                .collect(),
+            dirs: self.dirs.clone(),
+        }
+    }
+
     pub fn reload(&mut self) -> Result<()> {
         self.discover()
     }
@@ -424,6 +436,24 @@ platforms: [linux]
                 .as_text_lossy()
                 .contains("[Active skills")
         );
+    }
+
+    #[test]
+    fn filtered_manager_excludes_blocked_skills_from_matching() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(tmp.path(), "deploy", "Deployment helper", "Use deployment");
+        write_skill(tmp.path(), "testing", "Testing helper", "Use testing");
+
+        let manager = SkillManager::new(vec![tmp.path().to_path_buf()]).unwrap();
+        let filtered = manager.filtered(&HashSet::from(["deploy".to_string()]));
+
+        let listed = filtered.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "deploy");
+
+        let matched = filtered.match_for_turn("please use deploy and testing", &[], 3);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].name, "deploy");
     }
 
     #[test]

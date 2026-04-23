@@ -67,6 +67,7 @@ pub async fn run_oneshot(
         working_dir,
         approval_tx,
         tool_config,
+        execution_observer: None,
         memory,
         skills: Some(skills),
         compression: CompressionConfig::default(),

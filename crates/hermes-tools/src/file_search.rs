@@ -351,6 +351,7 @@ mod tests {
             working_dir,
             approval_tx,
             delta_tx,
+            execution_observer: None,
             tool_config: Arc::new(config),
             memory: None,
             aux_provider: None,

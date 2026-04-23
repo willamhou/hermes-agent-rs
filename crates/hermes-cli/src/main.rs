@@ -1,11 +1,13 @@
 //! Hermes CLI entry point.
 
+mod agents;
 mod approval;
 mod commands;
 mod handlers;
 mod oneshot;
 mod render;
 mod repl;
+mod runs;
 mod tooling;
 
 use clap::{Parser, Subcommand};
@@ -44,6 +46,12 @@ struct Cli {
 enum Commands {
     /// Start the gateway server (Telegram, API)
     Gateway,
+    /// Managed agent control-plane commands
+    #[command(subcommand)]
+    Agents(agents::AgentsAction),
+    /// Managed run inspection commands
+    #[command(subcommand)]
+    Runs(runs::RunsAction),
     /// Cron job management
     #[command(subcommand)]
     Cron(CronAction),
@@ -71,6 +79,14 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(Commands::Gateway) = cli.command {
         return run_gateway().await;
+    }
+
+    if let Some(Commands::Agents(action)) = cli.command {
+        return agents::run_agents(action).await;
+    }
+
+    if let Some(Commands::Runs(action)) = cli.command {
+        return runs::run_runs(action).await;
     }
 
     if let Some(Commands::Cron(action)) = cli.command {

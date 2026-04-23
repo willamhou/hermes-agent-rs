@@ -18,6 +18,7 @@ fn make_test_ctx(workspace: &Path) -> ToolContext {
         working_dir: workspace.to_path_buf(),
         approval_tx,
         delta_tx,
+        execution_observer: None,
         tool_config: Arc::new(ToolConfig {
             terminal: TerminalToolConfig::default(),
             file: FileToolConfig::default(),
@@ -293,6 +294,7 @@ async fn test_write_file_etc_blocked() {
         working_dir: std::path::PathBuf::from("/tmp"),
         approval_tx,
         delta_tx,
+        execution_observer: None,
         tool_config: Arc::new(ToolConfig {
             terminal: TerminalToolConfig::default(),
             file: FileToolConfig::default(),

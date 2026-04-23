@@ -1,0 +1,35 @@
+[package]
+name = "hermes-managed"
+description = "Managed-agent control plane types and storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hermes-core.workspace = true
+hermes-config.workspace = true
+hermes-agent.workspace = true
+hermes-provider.workspace = true
+hermes-memory.workspace = true
+hermes-tools.workspace = true
+hermes-skills.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+tokio-rusqlite.workspace = true
+rusqlite.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+sha2.workspace = true
+reqwest.workspace = true
+secrecy.workspace = true
+signet-core.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile.workspace = true
+axum.workspace = true

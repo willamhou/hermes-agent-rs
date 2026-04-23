@@ -178,6 +178,7 @@ where
         working_dir: workspace_path.clone(),
         approval_tx,
         tool_config: Arc::new(tool_config),
+        execution_observer: None,
         memory,
         skills: None,
         compression: CompressionConfig::default(),

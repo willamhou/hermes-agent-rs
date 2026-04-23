@@ -1,5 +1,7 @@
 # Hermes Agent RS — Example Configuration
 # Copy to ~/.hermes/config.yaml and adjust as needed.
+# You can also override `model` and `base_url` via `HERMES_MODEL` and
+# `HERMES_BASE_URL` in ~/.hermes/.env.
 
 # Model in "provider/model" format. Bare model name defaults to OpenAI.
 model: anthropic/claude-sonnet-4-20250514
@@ -31,6 +33,15 @@ browser:
 # Dangerous command approval policy: ask | yolo | deny
 approval:
   policy: ask
+
+# Optional Signet receipts for managed-agent tool calls.
+# When enabled, Hermes signs each managed tool call and appends a local
+# hash-chained audit record under ~/.hermes/signet by default.
+# signet:
+#   enabled: true
+#   key_name: hermes-managed
+#   owner: hermes
+#   # dir: /absolute/path/to/signet-data
 
 # MCP (Model Context Protocol) servers — auto-discovered at startup.
 # mcp_servers:

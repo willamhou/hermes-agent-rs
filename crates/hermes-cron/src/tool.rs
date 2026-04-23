@@ -271,6 +271,7 @@ mod tests {
             working_dir: dir.path().to_path_buf(),
             approval_tx,
             delta_tx,
+            execution_observer: None,
             tool_config: Arc::new(ToolConfig::default()),
             memory: None,
             aux_provider: None,

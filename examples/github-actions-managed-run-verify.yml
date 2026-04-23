@@ -1,0 +1,106 @@
+# This example mirrors `.github/workflows/managed-run-verify.yml`.
+# Use the repository workflow directly unless you specifically want a copy outside `.github/workflows/`.
+#
+# Required repository secrets:
+# - HERMES_MODEL
+# - HERMES_BASE_URL
+# - HERMES_API_KEY
+#
+# This workflow:
+# 1. creates an isolated HERMES_HOME
+# 2. enables the API gateway plus Signet receipts
+# 3. starts the local Hermes gateway
+# 4. creates a managed run through the public API example
+# 5. verifies the latest run with `--quiet --strict`
+
+name: Managed Run Verify (Example)
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  HERMES_HOME: ${{ github.workspace }}/.hermes-ci
+  HERMES_MODEL: ${{ secrets.HERMES_MODEL }}
+  HERMES_BASE_URL: ${{ secrets.HERMES_BASE_URL }}
+  HERMES_API_KEY: ${{ secrets.HERMES_API_KEY }}
+  HERMES_GATEWAY_BASE_URL: http://127.0.0.1:8080
+  MANAGED_MODEL: ${{ secrets.HERMES_MODEL }}
+  MANAGED_AGENT_NAME: ci-code-reviewer-${{ github.run_id }}
+  MANAGED_USER_PROMPT: Use the read_file tool on README.md and reply with the first line only.
+
+jobs:
+  verify-managed-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate required secrets
+        run: |
+          : "${HERMES_MODEL:?Set repository secret HERMES_MODEL}"
+          : "${HERMES_BASE_URL:?Set repository secret HERMES_BASE_URL}"
+          : "${HERMES_API_KEY:?Set repository secret HERMES_API_KEY}"
+
+      - name: Prepare Hermes config
+        run: |
+          mkdir -p "${HERMES_HOME}"
+          cat > "${HERMES_HOME}/config.yaml" <<EOF
+          model: ${HERMES_MODEL}
+          signet:
+            enabled: true
+            key_name: hermes-managed-ci
+            owner: github-actions
+          gateway:
+            api_server:
+              bind_addr: "127.0.0.1:8080"
+              api_key: "${HERMES_API_KEY}"
+          EOF
+
+      - name: Build Hermes CLI
+        run: cargo build --release -p hermes-cli
+
+      - name: Start Hermes gateway
+        run: |
+          target/release/hermes gateway \
+            > "${RUNNER_TEMP}/hermes-gateway.log" 2>&1 &
+          echo $! > "${RUNNER_TEMP}/hermes-gateway.pid"
+
+      - name: Wait for gateway health
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl -fsS "${HERMES_GATEWAY_BASE_URL}/health" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Gateway did not become healthy." >&2
+          cat "${RUNNER_TEMP}/hermes-gateway.log" >&2 || true
+          exit 1
+
+      - name: Create a managed run through the public API
+        run: bash examples/managed-agents-beta.sh
+
+      - name: Verify the latest managed run
+        run: bash examples/verify-managed-run.sh --latest
+
+      - name: Upload gateway log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-gateway-log
+          path: ${{ runner.temp }}/hermes-gateway.log
+
+      - name: Stop Hermes gateway
+        if: always()
+        run: |
+          if [[ -f "${RUNNER_TEMP}/hermes-gateway.pid" ]]; then
+            kill "$(cat "${RUNNER_TEMP}/hermes-gateway.pid")" || true
+          fi

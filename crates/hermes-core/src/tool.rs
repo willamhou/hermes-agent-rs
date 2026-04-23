@@ -106,6 +106,7 @@ pub struct ToolContext {
     pub working_dir: PathBuf,
     pub approval_tx: mpsc::Sender<ApprovalRequest>,
     pub delta_tx: mpsc::Sender<StreamDelta>,
+    pub execution_observer: Option<Arc<dyn ToolExecutionObserver>>,
     pub tool_config: Arc<ToolConfig>,
     pub memory: Option<Arc<dyn MemoryAccess>>,
     pub aux_provider: Option<Arc<dyn crate::provider::Provider>>,
@@ -169,6 +170,42 @@ pub enum ApprovalDecision {
     AllowSession,
     AllowAlways,
     Deny,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolExecutionObservation {
+    pub session_id: String,
+    pub call_id: String,
+    pub tool_name: String,
+    pub toolset: Option<String>,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolExecutionResultObservation {
+    pub request: ToolExecutionObservation,
+    pub result: ToolResult,
+}
+
+#[async_trait]
+pub trait ToolExecutionObserver: Send + Sync {
+    async fn on_tool_call(
+        &self,
+        observation: ToolExecutionObservation,
+        ctx: &ToolContext,
+    ) -> Result<()> {
+        let _ = (observation, ctx);
+        Ok(())
+    }
+
+    async fn on_tool_result(
+        &self,
+        observation: ToolExecutionResultObservation,
+        ctx: &ToolContext,
+    ) -> Result<()> {
+        let _ = (observation, ctx);
+        Ok(())
+    }
 }
 
 #[async_trait]

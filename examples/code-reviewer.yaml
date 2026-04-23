@@ -1,0 +1,14 @@
+name: code-reviewer
+model: openai/gpt-4o-mini
+system_prompt: |
+  Review code carefully.
+  Call out concrete bugs, behavior regressions, missing tests, and risky assumptions.
+allowed_tools:
+  - patch
+  - read_file
+  - search_files
+allowed_skills: []
+max_iterations: 90
+temperature: 0.0
+approval_policy: ask
+timeout_secs: 300

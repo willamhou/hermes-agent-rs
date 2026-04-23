@@ -5,7 +5,7 @@ use std::sync::Arc;
 use hermes_core::{
     message::{ToolCall, ToolResult},
     stream::StreamDelta,
-    tool::ToolContext,
+    tool::{ToolContext, ToolExecutionObservation, ToolExecutionResultObservation},
 };
 use hermes_tools::registry::ToolRegistry;
 use tokio::task::JoinSet;
@@ -19,6 +19,63 @@ pub struct ToolCallResult {
 
 /// Tools that must never be run in parallel.
 pub const NEVER_PARALLEL: &[&str] = &["clarify"];
+
+async fn notify_tool_observer(
+    ctx: &ToolContext,
+    call: &ToolCall,
+    toolset: Option<String>,
+) -> ToolExecutionObservation {
+    let observation = ToolExecutionObservation {
+        session_id: ctx.session_id.clone(),
+        call_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        toolset,
+        arguments: call.arguments.clone(),
+    };
+
+    let Some(observer) = ctx.execution_observer.as_ref() else {
+        return observation;
+    };
+
+    if let Err(err) = observer.on_tool_call(observation.clone(), ctx).await {
+        tracing::warn!(
+            tool = %call.name,
+            call_id = %call.id,
+            "tool execution observer failed: {err}"
+        );
+    }
+
+    observation
+}
+
+async fn notify_tool_result_observer(
+    ctx: &ToolContext,
+    observation: ToolExecutionObservation,
+    result: &ToolResult,
+) {
+    let Some(observer) = ctx.execution_observer.as_ref() else {
+        return;
+    };
+    let tool_name = observation.tool_name.clone();
+    let call_id = observation.call_id.clone();
+
+    if let Err(err) = observer
+        .on_tool_result(
+            ToolExecutionResultObservation {
+                request: observation,
+                result: result.clone(),
+            },
+            ctx,
+        )
+        .await
+    {
+        tracing::warn!(
+            tool = %tool_name,
+            call_id = %call_id,
+            "tool result observer failed: {err}"
+        );
+    }
+}
 
 /// Returns `true` when the given calls can be executed concurrently.
 pub fn should_parallelize(calls: &[ToolCall], registry: &ToolRegistry) -> bool {
@@ -112,10 +169,16 @@ pub async fn execute_parallel(
 
         set.spawn(async move {
             let result = match registry.get(&call.name) {
-                Some(tool) => tool
-                    .execute(call.arguments.clone(), &ctx)
-                    .await
-                    .unwrap_or_else(|e| ToolResult::error(e.to_string())),
+                Some(tool) => {
+                    let observation =
+                        notify_tool_observer(&ctx, &call, Some(tool.toolset().to_string())).await;
+                    let result = tool
+                        .execute(call.arguments.clone(), &ctx)
+                        .await
+                        .unwrap_or_else(|e| ToolResult::error(e.to_string()));
+                    notify_tool_result_observer(&ctx, observation, &result).await;
+                    result
+                }
                 None => ToolResult::error(format!("unknown tool: {}", call.name)),
             };
 
@@ -171,10 +234,16 @@ pub async fn execute_sequential(
             .await;
 
         let result = match registry.get(&call.name) {
-            Some(tool) => tool
-                .execute(call.arguments.clone(), ctx)
-                .await
-                .unwrap_or_else(|e| ToolResult::error(e.to_string())),
+            Some(tool) => {
+                let observation =
+                    notify_tool_observer(ctx, call, Some(tool.toolset().to_string())).await;
+                let result = tool
+                    .execute(call.arguments.clone(), ctx)
+                    .await
+                    .unwrap_or_else(|e| ToolResult::error(e.to_string()));
+                notify_tool_result_observer(ctx, observation, &result).await;
+                result
+            }
             None => ToolResult::error(format!("unknown tool: {}", call.name)),
         };
 
@@ -193,7 +262,19 @@ pub async fn execute_sequential(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use hermes_core::{
+        error::Result,
+        message::ToolResult,
+        tool::{
+            ApprovalRequest, Tool, ToolConfig, ToolContext, ToolExecutionObservation,
+            ToolExecutionObserver, ToolSchema,
+        },
+    };
     use hermes_tools::registry::ToolRegistry;
+    use tokio::sync::mpsc;
 
     fn make_call(name: &str) -> ToolCall {
         ToolCall {
@@ -208,6 +289,66 @@ mod tests {
             id: format!("id-{name}"),
             name: name.to_string(),
             arguments: serde_json::json!({ "path": path }),
+        }
+    }
+
+    struct EchoTool;
+
+    #[async_trait]
+    impl Tool for EchoTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                name: "echo".to_string(),
+                description: "echo".to_string(),
+                parameters: serde_json::json!({}),
+            }
+        }
+
+        fn toolset(&self) -> &str {
+            "test"
+        }
+
+        async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> Result<ToolResult> {
+            Ok(ToolResult::ok(args.to_string()))
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        observations: Mutex<Vec<ToolExecutionObservation>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutionObserver for RecordingObserver {
+        async fn on_tool_call(
+            &self,
+            observation: ToolExecutionObservation,
+            _ctx: &ToolContext,
+        ) -> Result<()> {
+            self.observations.lock().unwrap().push(observation);
+            Ok(())
+        }
+    }
+
+    fn make_ctx(observer: Arc<dyn ToolExecutionObserver>) -> ToolContext {
+        let (approval_tx, _) = mpsc::channel::<ApprovalRequest>(1);
+        let (delta_tx, _) = mpsc::channel(4);
+        ToolContext {
+            session_id: "run_test".to_string(),
+            working_dir: std::env::temp_dir(),
+            approval_tx,
+            delta_tx,
+            execution_observer: Some(observer),
+            tool_config: Arc::new(ToolConfig::default()),
+            memory: None,
+            aux_provider: None,
+            skills: None,
+            delegation_depth: 0,
+            clarify_tx: None,
         }
     }
 
@@ -256,5 +397,28 @@ mod tests {
     #[test]
     fn test_empty_paths_no_conflict() {
         assert!(!has_path_conflicts(&[]));
+    }
+
+    #[tokio::test]
+    async fn test_execute_sequential_notifies_tool_observer() {
+        let registry = Arc::new(ToolRegistry::new());
+        registry.register(Box::new(EchoTool));
+
+        let observer = Arc::new(RecordingObserver::default());
+        let ctx = make_ctx(observer.clone());
+        let calls = vec![ToolCall {
+            id: "call_123".to_string(),
+            name: "echo".to_string(),
+            arguments: serde_json::json!({ "value": "hello" }),
+        }];
+
+        let results = execute_sequential(&calls, registry, &ctx).await;
+
+        assert_eq!(results.len(), 1);
+        let observations = observer.observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].call_id, "call_123");
+        assert_eq!(observations[0].tool_name, "echo");
+        assert_eq!(observations[0].toolset.as_deref(), Some("test"));
     }
 }

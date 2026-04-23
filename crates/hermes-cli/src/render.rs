@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 /// - [`StreamDelta::ToolCallStart`]   → `[tool: name]` in yellow
 /// - [`StreamDelta::ToolCallArgsDelta`] → skipped (too noisy)
 /// - [`StreamDelta::ToolProgress`]    → `[tool: status]` in cyan
+/// - [`StreamDelta::ToolEvent`]       → `[tool: message]` in cyan
 /// - [`StreamDelta::Done`]            → newline, then stop
 pub async fn render_stream(mut rx: mpsc::Receiver<StreamDelta>) {
     let stdout = std::io::stdout();
@@ -56,6 +57,22 @@ pub async fn render_stream(mut rx: mpsc::Receiver<StreamDelta>) {
                     lock,
                     SetForegroundColor(Color::Cyan),
                     Print(format!("\n[{tool}: {status}]")),
+                    ResetColor
+                );
+                let _ = lock.flush();
+            }
+            StreamDelta::ToolEvent {
+                tool,
+                message,
+                kind,
+                ..
+            } => {
+                let mut lock = stdout.lock();
+                let label = message.unwrap_or(kind);
+                let _ = execute!(
+                    lock,
+                    SetForegroundColor(Color::Cyan),
+                    Print(format!("\n[{tool}: {label}]")),
                     ResetColor
                 );
                 let _ = lock.flush();
