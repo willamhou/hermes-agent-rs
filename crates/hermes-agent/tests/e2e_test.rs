@@ -196,10 +196,10 @@ fn browser_executable() -> Option<PathBuf> {
     }
 
     let candidates = [
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
         "/usr/bin/google-chrome",
         "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     ];
     candidates
@@ -711,8 +711,9 @@ async fn test_agent_browser_tool_real_page_flow() {
         Content::Text(s) => s.clone(),
         _ => panic!("expected text content"),
     };
-    let parsed: serde_json::Value =
-        serde_json::from_str(&extract_result).expect("browser extract result should be valid JSON");
+    let parsed: serde_json::Value = serde_json::from_str(&extract_result).unwrap_or_else(|err| {
+        panic!("browser extract result should be valid JSON ({err}): {extract_result}")
+    });
     assert_eq!(parsed["content"].as_str(), Some("Hello, Hermes!"));
 
     let close_result = match &history[12].content {
@@ -720,7 +721,9 @@ async fn test_agent_browser_tool_real_page_flow() {
         _ => panic!("expected text content"),
     };
     let close_parsed: serde_json::Value =
-        serde_json::from_str(&close_result).expect("browser close result should be valid JSON");
+        serde_json::from_str(&close_result).unwrap_or_else(|err| {
+            panic!("browser close result should be valid JSON ({err}): {close_result}")
+        });
     assert_eq!(close_parsed["closed"].as_bool(), Some(true));
 }
 
