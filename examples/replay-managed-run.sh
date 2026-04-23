@@ -8,21 +8,18 @@ source "${SCRIPT_DIR}/lib/managed-run-helpers.sh"
 usage() {
   cat <<'EOF'
 Usage:
-  bash examples/verify-managed-run.sh [--run <run-id> | --latest | --agent <name>] [--wait] [--timeout-secs <n>] [--poll-ms <ms>] [--json] [--limit <n>]
+  bash examples/replay-managed-run.sh [--run <run-id> | --latest | --agent <name>] [--json] [--limit <n>]
 
 Examples:
-  bash examples/verify-managed-run.sh --latest
-  bash examples/verify-managed-run.sh --agent code-reviewer --wait
-  bash examples/verify-managed-run.sh --run run_123 --wait --json
+  bash examples/replay-managed-run.sh --latest
+  bash examples/replay-managed-run.sh --agent code-reviewer
+  bash examples/replay-managed-run.sh --run run_123 --json
 
 Notes:
   - The script resolves the Hermes CLI from `HERMES_CLI_BIN`, `target/release/hermes`, or
     `cargo run --release -p hermes-cli -- ...`.
   - `--latest` is the default when no selector is provided.
-  - `--wait` polls `hermes runs get` until the run reaches a terminal state before verification.
-    Override the 120s default with `--timeout-secs` or the 500ms poll interval with `--poll-ms`.
-  - Verification runs with `--strict`, so it exits non-zero if receipts are missing or invalid.
-  - Signet receipts are only recorded when the managed run actually executes at least one tool call.
+  - The default stdout output is the new replayed run id for easy shell capture.
 EOF
 }
 
@@ -31,9 +28,6 @@ RUN_ID=""
 AGENT_NAME=""
 LIMIT=100
 OUTPUT_JSON=0
-WAIT_FOR_TERMINAL=0
-WAIT_TIMEOUT_SECS=120
-POLL_MS=500
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -55,20 +49,8 @@ while [[ $# -gt 0 ]]; do
       OUTPUT_JSON=1
       shift
       ;;
-    --wait)
-      WAIT_FOR_TERMINAL=1
-      shift
-      ;;
     --limit)
       LIMIT="${2:-}"
-      shift 2
-      ;;
-    --timeout-secs)
-      WAIT_TIMEOUT_SECS="${2:-}"
-      shift 2
-      ;;
-    --poll-ms)
-      POLL_MS="${2:-}"
       shift 2
       ;;
     -h|--help)
@@ -98,16 +80,6 @@ if ! [[ "${LIMIT}" =~ ^[0-9]+$ ]] || [[ "${LIMIT}" -lt 1 ]]; then
   exit 1
 fi
 
-if ! [[ "${WAIT_TIMEOUT_SECS}" =~ ^[0-9]+$ ]] || [[ "${WAIT_TIMEOUT_SECS}" -lt 1 ]]; then
-  echo "--timeout-secs must be a positive integer." >&2
-  exit 1
-fi
-
-if ! [[ "${POLL_MS}" =~ ^[0-9]+$ ]] || [[ "${POLL_MS}" -lt 1 ]]; then
-  echo "--poll-ms must be a positive integer." >&2
-  exit 1
-fi
-
 require_command python3
 setup_hermes_cli
 
@@ -130,19 +102,20 @@ if [[ -z "${RUN_ID}" ]]; then
   exit 1
 fi
 
-echo "Selected run: ${RUN_ID}" >&2
+echo "Selected source run: ${RUN_ID}" >&2
 
-if [[ "${WAIT_FOR_TERMINAL}" -eq 1 ]]; then
-  echo "Waiting for managed run ${RUN_ID} to reach a terminal state..." >&2
-  terminal_status="$(
-    wait_for_managed_run_terminal "${RUN_ID}" "${WAIT_TIMEOUT_SECS}" "${POLL_MS}"
-  )"
-  echo "Run ${RUN_ID} reached terminal status: ${terminal_status}" >&2
+replay_json="$(hermes_cli runs replay "${RUN_ID}" --json)"
+replayed_run_id="$(printf '%s' "${replay_json}" | extract_run_id_from_envelope)"
+
+if [[ -z "${replayed_run_id}" ]]; then
+  echo "Failed to extract replayed run id from response." >&2
+  exit 1
 fi
 
+echo "Replayed run: ${replayed_run_id}" >&2
+
 if [[ "${OUTPUT_JSON}" -eq 1 ]]; then
-  hermes_cli runs verify "${RUN_ID}" --json --strict
+  printf '%s\n' "${replay_json}"
 else
-  hermes_cli runs verify "${RUN_ID}" --quiet --strict
-  echo "Signet verification OK for run ${RUN_ID}" >&2
+  printf '%s\n' "${replayed_run_id}"
 fi

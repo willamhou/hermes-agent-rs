@@ -15,7 +15,9 @@
 # 2. enables the API gateway plus Signet receipts
 # 3. starts the local Hermes gateway
 # 4. creates a managed run through the public API example
-# 5. verifies the latest run with `--quiet --strict`
+# 5. verifies the created run for the CI agent
+# 6. replays that run
+# 7. waits for and verifies the replayed run
 
 name: Managed Run Verify (Example)
 
@@ -35,6 +37,7 @@ jobs:
       HERMES_BASE_URL: ${{ secrets.HERMES_BASE_URL }}
       HERMES_API_KEY: ${{ secrets.HERMES_API_KEY }}
       HERMES_GATEWAY_BASE_URL: http://127.0.0.1:8080
+      HERMES_CLI_BIN: ${{ github.workspace }}/target/release/hermes
       MANAGED_MODEL: ${{ secrets.HERMES_MODEL }}
       MANAGED_AGENT_NAME: ci-code-reviewer-${{ github.run_id }}
       MANAGED_USER_PROMPT: Use the read_file tool on README.md and reply with the first line only.
@@ -94,8 +97,20 @@ jobs:
       - name: Create a managed run through the public API
         run: bash examples/managed-agents-beta.sh
 
-      - name: Verify the latest managed run
-        run: bash examples/verify-managed-run.sh --latest
+      - name: Verify the managed run for this agent
+        run: bash examples/verify-managed-run.sh --agent "${MANAGED_AGENT_NAME}"
+
+      - name: Replay the managed run for this agent
+        id: replay
+        run: |
+          replayed_run_id="$(bash examples/replay-managed-run.sh --agent "${MANAGED_AGENT_NAME}")"
+          echo "run_id=${replayed_run_id}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify the replayed managed run
+        run: |
+          bash examples/verify-managed-run.sh \
+            --run "${{ steps.replay.outputs.run_id }}" \
+            --wait
 
       - name: Upload gateway log on failure
         if: failure()

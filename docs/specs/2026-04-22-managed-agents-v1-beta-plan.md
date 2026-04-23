@@ -15,8 +15,9 @@ Implemented already:
 - CLI `hermes agents ...` CRUD plus YAML `diff` / `sync`
 - canonical YAML hashing plus `# hermes-synced: sha256=...` metadata
 - persisted managed run events via `/v1/runs/:id/events` and `hermes runs events`
+- durable managed run replay via `/v1/runs/:id/replay` and `hermes runs replay`
 - startup reconciliation that marks runs left active during process exit as terminal
-- managed run inspection via `hermes runs list|get|events`
+- managed run inspection via `hermes runs list|get|events|replay`
 - CLI Signet verification via `hermes runs verify [--json] [--strict] [--quiet]`
 - optional Signet request/response receipts for managed tool calls, stored in the local audit chain
 - managed disconnect / cancel behavior tests
@@ -42,11 +43,11 @@ v1 beta **is**:
 - Per-agent timeout / max iterations / approval policy
 - YAML `diff` / `sync` with dry-run and metadata hash
 - Persisted run status and event records
+- Durable run replay from persisted prompt and immutable agent version
 - Optional local Signet receipts and CLI verification for managed tool calls
 - Basic examples for API usage, CLI verification, and CI wiring
 
 v1 beta is **not**:
-- Persistent run replay
 - Restart-safe recovery that resumes runs which were still active during process exit
 - Full session management parity with hosted platforms
 - Multi-tenant namespaces or RBAC
@@ -524,7 +525,6 @@ What is already true:
 - local auditability via Signet exists for managed tool calls
 
 What still separates this from a more complete managed-agents offering:
-- no durable replay / resume of an interrupted run
 - no restart recovery for active runs after process death
 - no multi-tenant isolation model
 - no RBAC or org-level policy layer

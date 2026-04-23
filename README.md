@@ -204,6 +204,7 @@ What exists today:
 - invocation through `model: "agent:<name>"`
 - per-agent tool and skill allowlists
 - persisted run timelines via `GET /v1/runs/{id}/events`
+- durable run replay via `POST /v1/runs/{id}/replay`
 - startup reconciliation that marks runs left active during process exit as `failed` or `cancelled`
 - optional Signet receipts for managed tool calls, appended to a local audit chain
 - best-effort run cancellation through `DELETE /v1/runs/:id`
@@ -213,7 +214,7 @@ Current non-goals:
 - hard real-time cancellation guarantees
 - MCP in managed mode
 - hosted control plane, remote KMS, or managed audit pipeline
-- run replay, RBAC, or multi-tenant namespaces
+- restart-safe in-flight resume, RBAC, or multi-tenant namespaces
 
 Example YAML:
 
@@ -259,6 +260,7 @@ cargo run --release -p hermes-cli -- runs list
 cargo run --release -p hermes-cli -- runs list --json
 cargo run --release -p hermes-cli -- runs get <run-id>
 cargo run --release -p hermes-cli -- runs get <run-id> --json
+cargo run --release -p hermes-cli -- runs replay <run-id>
 cargo run --release -p hermes-cli -- runs events <run-id> --json
 cargo run --release -p hermes-cli -- runs events <run-id> --follow
 cargo run --release -p hermes-cli -- runs verify <run-id>
@@ -269,7 +271,9 @@ cargo run --release -p hermes-cli -- runs verify <run-id> --quiet --strict
 # CI-friendly Signet verification helpers
 # Signet verification is meaningful only for runs that actually executed at least one managed tool.
 bash examples/verify-managed-run.sh --latest
+bash examples/verify-managed-run.sh --run <run-id> --wait
 bash examples/verify-managed-run.sh --agent code-reviewer --json
+bash examples/replay-managed-run.sh --agent code-reviewer
 ```
 
 Optional Signet integration for managed runtimes:
@@ -304,8 +308,12 @@ That script walks through:
 - `GET /v1/runs/{id}/events`
 - optional `DELETE /v1/runs/{id}` cancellation
 
+The managed run API also supports `POST /v1/runs/{id}/replay` to enqueue a new run from the
+original persisted prompt and immutable agent version.
+
 The end-to-end API example lives at [examples/managed-agents-beta.sh](examples/managed-agents-beta.sh).
 The CI-oriented verification helper lives at [examples/verify-managed-run.sh](examples/verify-managed-run.sh).
+The replay helper lives at [examples/replay-managed-run.sh](examples/replay-managed-run.sh).
 The repository workflow lives at [.github/workflows/managed-run-verify.yml](.github/workflows/managed-run-verify.yml).
 It is bound to the GitHub Actions environment `managed-verify`, which should define
 `HERMES_MODEL`, `HERMES_BASE_URL`, and `HERMES_API_KEY` as environment secrets.
