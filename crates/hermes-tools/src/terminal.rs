@@ -330,6 +330,7 @@ mod tests {
             working_dir: std::path::PathBuf::from("/tmp"),
             approval_tx,
             delta_tx,
+            execution_observer: None,
             tool_config: Arc::new(config),
             memory: None,
             aux_provider: None,

@@ -281,6 +281,39 @@ impl Default for ApiServerGatewayConfig {
     }
 }
 
+// ─── Signet config ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignetConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_signet_key_name")]
+    pub key_name: String,
+    #[serde(default = "default_signet_owner")]
+    pub owner: String,
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+}
+
+fn default_signet_key_name() -> String {
+    "hermes-managed".to_string()
+}
+
+fn default_signet_owner() -> String {
+    "hermes".to_string()
+}
+
+impl Default for SignetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            key_name: default_signet_key_name(),
+            owner: default_signet_owner(),
+            dir: None,
+        }
+    }
+}
+
 // ─── Config struct ────────────────────────────────────────────────────────────
 
 /// Top-level application configuration.
@@ -325,6 +358,10 @@ pub struct AppConfig {
     /// Gateway configuration (Telegram, API server, etc.).
     #[serde(default)]
     pub gateway: Option<GatewayConfig>,
+
+    /// Optional Signet tool-call receipts for managed runtimes.
+    #[serde(default)]
+    pub signet: SignetConfig,
 }
 
 fn default_model() -> String {
@@ -352,6 +389,7 @@ impl Default for AppConfig {
             approval: ApprovalConfigYaml::default(),
             mcp_servers: vec![],
             gateway: None,
+            signet: SignetConfig::default(),
         }
     }
 }
@@ -368,25 +406,37 @@ impl AppConfig {
         }
 
         let path = hermes_home().join("config.yaml");
-
-        let contents = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Self::default();
-            }
+        let cfg = match std::fs::read_to_string(&path) {
+            Ok(contents) => match serde_yaml_ng::from_str::<AppConfig>(&contents) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    warn!(path = %path.display(), "failed to parse config YAML: {e}");
+                    Self::default()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(e) => {
                 warn!(path = %path.display(), "failed to read config file: {e}");
-                return Self::default();
+                Self::default()
             }
         };
 
-        match serde_yaml_ng::from_str::<AppConfig>(&contents) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                warn!(path = %path.display(), "failed to parse config YAML: {e}");
-                Self::default()
+        cfg.apply_env_overrides()
+    }
+
+    fn apply_env_overrides(mut self) -> Self {
+        if let Ok(model) = std::env::var("HERMES_MODEL") {
+            let trimmed = model.trim();
+            if !trimmed.is_empty() {
+                self.model = trimmed.to_string();
             }
         }
+
+        if let Ok(base_url) = std::env::var("HERMES_BASE_URL") {
+            self.base_url = normalize_env_override(&base_url);
+        }
+
+        self
     }
 
     /// Resolve the API key for the configured provider.
@@ -398,12 +448,15 @@ impl AppConfig {
     ///
     /// Falls back to `HERMES_API_KEY` if the provider-specific var is absent.
     pub fn api_key(&self) -> Option<SecretString> {
-        let provider = self
-            .model
-            .split('/')
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
+        self.api_key_for_model(&self.model)
+    }
+
+    /// Resolve the API key for an arbitrary `"provider/model"` string.
+    ///
+    /// Falls back to `HERMES_API_KEY` when the provider-specific environment
+    /// variable is absent.
+    pub fn api_key_for_model(&self, model: &str) -> Option<SecretString> {
+        let provider = model.split('/').next().unwrap_or("").to_ascii_lowercase();
 
         let provider_var = match provider.as_str() {
             "anthropic" => Some("ANTHROPIC_API_KEY"),
@@ -424,6 +477,15 @@ impl AppConfig {
             .ok()
             .filter(|k| !k.is_empty())
             .map(|k| SecretString::new(k.into()))
+    }
+
+    /// Resolve the base directory for Signet keys and audit logs.
+    pub fn signet_dir(&self) -> PathBuf {
+        self.signet
+            .dir
+            .clone()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| hermes_home().join("signet"))
     }
 
     /// Convert this config into a [`ToolConfig`] for the given workspace root.
@@ -458,11 +520,21 @@ impl AppConfig {
     }
 }
 
+fn normalize_env_override(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret;
     use std::sync::{LazyLock, Mutex};
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -489,6 +561,7 @@ mod tests {
             approval: ApprovalConfigYaml::default(),
             mcp_servers: vec![],
             gateway: None,
+            signet: SignetConfig::default(),
         };
         let yaml = serde_yaml_ng::to_string(&original).expect("serialize failed");
         let restored: AppConfig = serde_yaml_ng::from_str(&yaml).expect("deserialize failed");
@@ -529,6 +602,32 @@ mod tests {
     }
 
     #[test]
+    fn api_key_for_model_respects_provider_specific_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev_openai = std::env::var("OPENAI_API_KEY").ok();
+        let prev_hermes = std::env::var("HERMES_API_KEY").ok();
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "openai-key");
+            std::env::set_var("HERMES_API_KEY", "fallback-key");
+        }
+
+        let cfg = AppConfig::default();
+        let key = cfg
+            .api_key_for_model("openai/gpt-4o")
+            .expect("expected openai key");
+        assert_eq!(key.expose_secret(), "openai-key");
+
+        match prev_openai {
+            Some(value) => unsafe { std::env::set_var("OPENAI_API_KEY", value) },
+            None => unsafe { std::env::remove_var("OPENAI_API_KEY") },
+        }
+        match prev_hermes {
+            Some(value) => unsafe { std::env::set_var("HERMES_API_KEY", value) },
+            None => unsafe { std::env::remove_var("HERMES_API_KEY") },
+        }
+    }
+
+    #[test]
     fn hermes_home_env_override() {
         let _guard = ENV_LOCK.lock().unwrap();
         let previous = std::env::var("HERMES_HOME").ok();
@@ -553,6 +652,83 @@ mod tests {
             }
         }
         assert_eq!(home, PathBuf::from(override_path));
+    }
+
+    #[test]
+    fn load_applies_env_overrides_over_yaml() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            r#"
+model: anthropic/claude-sonnet-4-20250514
+base_url: https://yaml.example/v1
+"#,
+        )
+        .unwrap();
+
+        let prev_home = std::env::var("HERMES_HOME").ok();
+        let prev_model = std::env::var("HERMES_MODEL").ok();
+        let prev_base_url = std::env::var("HERMES_BASE_URL").ok();
+
+        unsafe {
+            std::env::set_var("HERMES_HOME", tmp.path());
+            std::env::set_var("HERMES_MODEL", "openai/gpt-4o-mini");
+            std::env::set_var("HERMES_BASE_URL", "https://env.example/v1");
+        }
+
+        let cfg = AppConfig::load();
+        assert_eq!(cfg.model, "openai/gpt-4o-mini");
+        assert_eq!(cfg.base_url.as_deref(), Some("https://env.example/v1"));
+
+        match prev_home {
+            Some(value) => unsafe { std::env::set_var("HERMES_HOME", value) },
+            None => unsafe { std::env::remove_var("HERMES_HOME") },
+        }
+        match prev_model {
+            Some(value) => unsafe { std::env::set_var("HERMES_MODEL", value) },
+            None => unsafe { std::env::remove_var("HERMES_MODEL") },
+        }
+        match prev_base_url {
+            Some(value) => unsafe { std::env::set_var("HERMES_BASE_URL", value) },
+            None => unsafe { std::env::remove_var("HERMES_BASE_URL") },
+        }
+    }
+
+    #[test]
+    fn load_treats_empty_env_base_url_as_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let prev_home = std::env::var("HERMES_HOME").ok();
+        let prev_model = std::env::var("HERMES_MODEL").ok();
+        let prev_base_url = std::env::var("HERMES_BASE_URL").ok();
+
+        unsafe {
+            std::env::set_var("HERMES_HOME", tmp.path());
+            std::env::set_var(
+                "HERMES_MODEL",
+                "openrouter/meta-llama/llama-3.1-8b-instruct",
+            );
+            std::env::set_var("HERMES_BASE_URL", "   ");
+        }
+
+        let cfg = AppConfig::load();
+        assert_eq!(cfg.model, "openrouter/meta-llama/llama-3.1-8b-instruct");
+        assert_eq!(cfg.base_url, None);
+
+        match prev_home {
+            Some(value) => unsafe { std::env::set_var("HERMES_HOME", value) },
+            None => unsafe { std::env::remove_var("HERMES_HOME") },
+        }
+        match prev_model {
+            Some(value) => unsafe { std::env::set_var("HERMES_MODEL", value) },
+            None => unsafe { std::env::remove_var("HERMES_MODEL") },
+        }
+        match prev_base_url {
+            Some(value) => unsafe { std::env::set_var("HERMES_BASE_URL", value) },
+            None => unsafe { std::env::remove_var("HERMES_BASE_URL") },
+        }
     }
 
     #[test]
@@ -588,6 +764,40 @@ model: openai/gpt-4o
         assert_eq!(cfg.browser.output_max_chars, 50_000);
         assert_eq!(cfg.approval.policy, ApprovalPolicy::Ask);
         assert!(cfg.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn signet_dir_defaults_to_hermes_home() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let previous = std::env::var("HERMES_HOME").ok();
+
+        unsafe {
+            std::env::set_var("HERMES_HOME", tmp.path());
+        }
+
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.signet_dir(), tmp.path().join("signet"));
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("HERMES_HOME", value) },
+            None => unsafe { std::env::remove_var("HERMES_HOME") },
+        }
+    }
+
+    #[test]
+    fn signet_dir_prefers_explicit_config_dir() {
+        let cfg = AppConfig {
+            signet: SignetConfig {
+                enabled: true,
+                key_name: "managed".to_string(),
+                owner: "team".to_string(),
+                dir: Some(PathBuf::from("/tmp/hermes-signet")),
+            },
+            ..AppConfig::default()
+        };
+
+        assert_eq!(cfg.signet_dir(), PathBuf::from("/tmp/hermes-signet"));
     }
 
     #[test]

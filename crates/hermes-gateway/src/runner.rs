@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use hermes_config::config::{AppConfig, GatewayConfig, hermes_home};
 use hermes_core::platform::{PlatformAdapter, PlatformEvent};
+use hermes_managed::{ManagedStore, RunRegistry};
 use hermes_provider::create_provider;
 use hermes_tools::ToolRegistry;
 use tokio::sync::{RwLock, mpsc};
@@ -120,7 +121,7 @@ impl GatewayRunner {
             adapters,
         });
         let router = SessionRouter::new(
-            shared,
+            Arc::clone(&shared),
             self.gateway_config.session_idle_timeout_secs,
             self.gateway_config.max_concurrent_sessions,
             self.app_config.clone(),
@@ -129,6 +130,29 @@ impl GatewayRunner {
         // Start API server with router for streaming, plus event channel for legacy /api/chat
         if let Some(adapter) = api_adapter {
             adapter.set_router(router.clone());
+            match ManagedStore::open().await {
+                Ok(store) => {
+                    let store = Arc::new(store);
+                    match store.reconcile_incomplete_runs().await {
+                        Ok(reconciled) if !reconciled.is_empty() => tracing::warn!(
+                            count = reconciled.len(),
+                            "reconciled managed runs left active by a previous process"
+                        ),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(
+                            "managed runtime started without reconciling incomplete runs: {e}"
+                        ),
+                    }
+
+                    adapter.set_managed_state(
+                        Arc::clone(&shared),
+                        self.app_config.clone(),
+                        store,
+                        Arc::new(RunRegistry::new()),
+                    )
+                }
+                Err(e) => tracing::warn!("managed runtime disabled — failed to open store: {e}"),
+            }
             let (api_event_tx, mut api_event_rx) = mpsc::channel::<PlatformEvent>(256);
             let api_router = router.clone();
             tokio::spawn(async move {

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
 };
 
@@ -37,10 +37,14 @@ impl ToolRegistry {
 
     /// Insert a tool, keyed by its `name()`.
     pub fn register(&self, tool: Box<dyn Tool>) {
+        self.register_arc(tool.name().to_string(), Arc::from(tool));
+    }
+
+    fn register_arc(&self, name: String, tool: Arc<dyn Tool>) {
         self.tools
             .write()
             .expect("tool registry write lock poisoned")
-            .insert(tool.name().to_string(), Arc::from(tool));
+            .insert(name, tool);
     }
 
     /// Look up a tool by name.
@@ -52,6 +56,14 @@ impl ToolRegistry {
             .cloned()
     }
 
+    /// Return true if a tool with this name is registered.
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools
+            .read()
+            .expect("tool registry read lock poisoned")
+            .contains_key(name)
+    }
+
     /// Return schemas for all currently-available tools (`is_available() == true`).
     pub fn available_schemas(&self) -> Vec<hermes_core::tool::ToolSchema> {
         self.tools
@@ -61,6 +73,28 @@ impl ToolRegistry {
             .filter(|t| t.is_available())
             .map(|t| t.schema())
             .collect()
+    }
+
+    /// Clone a registry containing only the named tools.
+    pub fn filtered<I, S>(&self, allowed: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let allowed = allowed
+            .into_iter()
+            .map(|name| name.as_ref().to_string())
+            .collect::<HashSet<_>>();
+
+        let filtered = Self::new();
+        let guard = self.tools.read().expect("tool registry read lock poisoned");
+        for (name, tool) in guard.iter() {
+            if allowed.contains(name) {
+                filtered.register_arc(name.clone(), Arc::clone(tool));
+            }
+        }
+
+        filtered
     }
 
     /// Return names of all registered tools.
@@ -224,6 +258,7 @@ mod tests {
             working_dir: std::path::PathBuf::from("/tmp"),
             approval_tx,
             delta_tx,
+            execution_observer: None,
             tool_config: Arc::new(ToolConfig::default()),
             memory: None,
             aux_provider: None,
@@ -298,6 +333,27 @@ mod tests {
 
         assert!(!result.is_error);
         assert_eq!(result.content, args.to_string());
+    }
+
+    #[test]
+    fn test_filtered_registry_only_exposes_allowed_tools() {
+        let registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool));
+        registry.register(Box::new(UnavailableTool));
+
+        let filtered = registry.filtered(["echo"]);
+        let mut names = filtered.tool_names();
+        names.sort_unstable();
+
+        assert_eq!(names, vec!["echo".to_string()]);
+        assert!(filtered.contains("echo"));
+        assert!(!filtered.contains("unavailable"));
+        assert!(filtered.get("echo").is_some());
+        assert!(filtered.get("unavailable").is_none());
+
+        let schemas = filtered.available_schemas();
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].name, "echo");
     }
 
     #[test]

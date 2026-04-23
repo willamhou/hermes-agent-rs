@@ -310,6 +310,7 @@ fn build_session_agent(
         working_dir: std::env::current_dir().unwrap_or_default(),
         approval_tx,
         tool_config: Arc::clone(&shared.tool_config),
+        execution_observer: None,
         memory,
         skills: shared.skills.clone(),
         compression: CompressionConfig::default(),

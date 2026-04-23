@@ -10,6 +10,7 @@ license.workspace = true
 hermes-core.workspace = true
 hermes-agent.workspace = true
 hermes-provider.workspace = true
+hermes-managed.workspace = true
 hermes-tools.workspace = true
 hermes-config.workspace = true
 hermes-cron.workspace = true
@@ -25,6 +26,7 @@ dashmap.workspace = true
 secrecy.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+chrono.workspace = true
 axum.workspace = true
 tokio-stream.workspace = true
 serenity.workspace = true
@@ -34,3 +36,4 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
+tempfile.workspace = true

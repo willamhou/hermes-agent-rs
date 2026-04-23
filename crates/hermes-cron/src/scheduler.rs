@@ -219,6 +219,7 @@ impl CronScheduler {
             working_dir: std::env::current_dir().unwrap_or_default(),
             approval_tx,
             tool_config,
+            execution_observer: None,
             memory,
             skills: None,
             compression: hermes_agent::compressor::CompressionConfig::default(),

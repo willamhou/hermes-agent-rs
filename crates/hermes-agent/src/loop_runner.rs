@@ -8,7 +8,9 @@ use hermes_core::{
     message::{Content, Message, Role},
     provider::{ChatRequest, Provider},
     stream::StreamDelta,
-    tool::{ApprovalRequest, SkillAccess, ToolConfig, ToolContext, ToolSchema},
+    tool::{
+        ApprovalRequest, SkillAccess, ToolConfig, ToolContext, ToolExecutionObserver, ToolSchema,
+    },
 };
 use hermes_tools::registry::ToolRegistry;
 use tokio::sync::{RwLock, mpsc};
@@ -30,6 +32,7 @@ pub struct AgentConfig {
     pub working_dir: PathBuf,
     pub approval_tx: mpsc::Sender<ApprovalRequest>,
     pub tool_config: Arc<ToolConfig>,
+    pub execution_observer: Option<Arc<dyn ToolExecutionObserver>>,
     pub memory: hermes_memory::MemoryManager,
     pub skills: Option<Arc<RwLock<hermes_skills::SkillManager>>>,
     pub compression: CompressionConfig,
@@ -49,6 +52,7 @@ pub struct Agent {
     working_dir: PathBuf,
     approval_tx: mpsc::Sender<ApprovalRequest>,
     tool_config: Arc<ToolConfig>,
+    execution_observer: Option<Arc<dyn ToolExecutionObserver>>,
     memory: hermes_memory::MemoryManager,
     skills: Option<Arc<RwLock<hermes_skills::SkillManager>>>,
     cache_manager: PromptCacheManager,
@@ -69,6 +73,7 @@ impl Agent {
             working_dir: config.working_dir,
             approval_tx: config.approval_tx,
             tool_config: config.tool_config,
+            execution_observer: config.execution_observer,
             memory: config.memory,
             skills: config.skills,
             cache_manager: PromptCacheManager::new(),
@@ -173,6 +178,7 @@ impl Agent {
                 working_dir: self.working_dir.clone(),
                 approval_tx: self.approval_tx.clone(),
                 delta_tx: delta_tx.clone(),
+                execution_observer: self.execution_observer.clone(),
                 tool_config: Arc::clone(&self.tool_config),
                 memory: Some(self.memory.tool_handle()),
                 aux_provider: Some(Arc::clone(&self.provider)),
@@ -529,6 +535,7 @@ mod tests {
             working_dir: std::env::temp_dir(),
             approval_tx,
             tool_config: Arc::new(ToolConfig::default()),
+            execution_observer: None,
             memory,
             skills,
             compression,

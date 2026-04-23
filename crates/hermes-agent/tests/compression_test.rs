@@ -122,6 +122,7 @@ fn make_agent(
         working_dir: workspace.path().to_path_buf(),
         approval_tx,
         tool_config: Arc::new(ToolConfig::default()),
+        execution_observer: None,
         memory,
         skills: None,
         compression,

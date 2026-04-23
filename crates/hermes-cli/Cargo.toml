@@ -23,6 +23,7 @@ hermes-cron.workspace = true
 hermes-gateway.workspace = true
 hermes-mcp.workspace = true
 hermes-memory.workspace = true
+hermes-managed.workspace = true
 hermes-skills.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -36,6 +37,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 secrecy.workspace = true
 chrono.workspace = true
+signet-core.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
