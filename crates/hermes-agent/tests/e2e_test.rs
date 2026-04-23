@@ -599,6 +599,13 @@ async fn test_agent_terminal_not_parallel() {
 
 #[tokio::test]
 async fn test_agent_browser_tool_real_page_flow() {
+    if std::env::var_os("GITHUB_ACTIONS").is_some()
+        && std::env::var_os("HERMES_RUN_BROWSER_E2E").is_none()
+    {
+        eprintln!("skipping browser e2e on GitHub Actions; set HERMES_RUN_BROWSER_E2E=1 to enable");
+        return;
+    }
+
     let Some(executable) = browser_executable() else {
         eprintln!("skipping browser e2e: no Chromium executable found");
         return;

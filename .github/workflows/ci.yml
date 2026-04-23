@@ -8,7 +8,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  HERMES_BROWSER_EXECUTABLE: /usr/bin/google-chrome
 
 jobs:
   check:
