@@ -94,6 +94,7 @@ pub async fn run_repl() -> Result<()> {
         compression: CompressionConfig::default(),
         delegation_depth: 0,
         clarify_tx: Some(clarify_tx),
+        checkpoint_observer: None,
     };
     let mut agent = Agent::new(agent_config);
     let mut history: Vec<Message> = Vec::new();
@@ -229,6 +230,7 @@ pub async fn run_repl_with_resume(resume_id: Option<String>) -> Result<()> {
         compression: CompressionConfig::default(),
         delegation_depth: 0,
         clarify_tx: Some(clarify_tx),
+        checkpoint_observer: None,
     });
 
     println!("Hermes — model: {model}");

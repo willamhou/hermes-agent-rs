@@ -163,6 +163,7 @@ impl Tool for DelegationTool {
             compression: CompressionConfig::default(),
             delegation_depth: ctx.delegation_depth + 1,
             clarify_tx: None,
+            checkpoint_observer: None,
         });
 
         // 9. Run child conversation

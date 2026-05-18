@@ -128,6 +128,7 @@ fn make_agent(
         compression,
         delegation_depth: 0,
         clarify_tx: None,
+        checkpoint_observer: None,
     });
 
     (agent, approval_rx)

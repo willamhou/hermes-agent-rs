@@ -186,6 +186,57 @@ fn default_mcp_server_enabled() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ManagedMcpPolicyYaml {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allowed_transports: Vec<McpTransportKind>,
+    #[serde(default)]
+    pub allowed_servers: Vec<String>,
+    #[serde(default)]
+    pub allow_side_effects: bool,
+    #[serde(default)]
+    pub stdio: ManagedMcpStdioPolicyYaml,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ManagedMcpStdioPolicyYaml {
+    #[serde(default)]
+    pub allowed_servers: Vec<String>,
+    #[serde(default)]
+    pub allowed_env_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedRecoveryPolicyYaml {
+    #[serde(default)]
+    pub auto_replay_interrupted: bool,
+    #[serde(default = "default_managed_max_auto_replays_per_root_run")]
+    pub max_auto_replays_per_root_run: u32,
+}
+
+fn default_managed_max_auto_replays_per_root_run() -> u32 {
+    3
+}
+
+impl Default for ManagedRecoveryPolicyYaml {
+    fn default() -> Self {
+        Self {
+            auto_replay_interrupted: false,
+            max_auto_replays_per_root_run: default_managed_max_auto_replays_per_root_run(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ManagedConfigYaml {
+    #[serde(default)]
+    pub mcp: ManagedMcpPolicyYaml,
+    #[serde(default)]
+    pub recovery: ManagedRecoveryPolicyYaml,
+}
+
 // ─── Approval config ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -355,6 +406,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
 
+    /// Managed-mode operator policy.
+    #[serde(default)]
+    pub managed: ManagedConfigYaml,
+
     /// Gateway configuration (Telegram, API server, etc.).
     #[serde(default)]
     pub gateway: Option<GatewayConfig>,
@@ -388,6 +443,7 @@ impl Default for AppConfig {
             browser: BrowserConfigYaml::default(),
             approval: ApprovalConfigYaml::default(),
             mcp_servers: vec![],
+            managed: ManagedConfigYaml::default(),
             gateway: None,
             signet: SignetConfig::default(),
         }
@@ -560,6 +616,7 @@ mod tests {
             browser: BrowserConfigYaml::default(),
             approval: ApprovalConfigYaml::default(),
             mcp_servers: vec![],
+            managed: ManagedConfigYaml::default(),
             gateway: None,
             signet: SignetConfig::default(),
         };
@@ -764,6 +821,7 @@ model: openai/gpt-4o
         assert_eq!(cfg.browser.output_max_chars, 50_000);
         assert_eq!(cfg.approval.policy, ApprovalPolicy::Ask);
         assert!(cfg.mcp_servers.is_empty());
+        assert!(!cfg.managed.mcp.enabled);
     }
 
     #[test]
@@ -881,6 +939,79 @@ mcp_servers:
             Some("Bearer test-token")
         );
         assert!(cfg.mcp_servers[0].command.is_empty());
+    }
+
+    #[test]
+    fn managed_mcp_policy_deserializes() {
+        let yaml = r#"
+model: openai/gpt-4o
+mcp_servers:
+  - name: remote-docs
+    transport: http
+    url: https://mcp.example.com
+managed:
+  mcp:
+    enabled: true
+    allowed_transports: [http]
+    allowed_servers: [remote-docs]
+    allow_side_effects: false
+"#;
+        let cfg: AppConfig = serde_yaml_ng::from_str(yaml).expect("deserialize failed");
+        assert!(cfg.managed.mcp.enabled);
+        assert_eq!(
+            cfg.managed.mcp.allowed_transports,
+            vec![McpTransportKind::Http]
+        );
+        assert_eq!(
+            cfg.managed.mcp.allowed_servers,
+            vec!["remote-docs".to_string()]
+        );
+        assert!(!cfg.managed.mcp.allow_side_effects);
+        assert!(cfg.managed.mcp.stdio.allowed_servers.is_empty());
+        assert!(cfg.managed.mcp.stdio.allowed_env_keys.is_empty());
+    }
+
+    #[test]
+    fn managed_mcp_stdio_policy_deserializes() {
+        let yaml = r#"
+model: openai/gpt-4o
+mcp_servers:
+  - name: local-docs
+    command: /usr/bin/docs-mcp
+    env:
+      DOCS_TOKEN: secret
+managed:
+  mcp:
+    enabled: true
+    allowed_transports: [http, stdio]
+    allowed_servers: [remote-docs]
+    stdio:
+      allowed_servers: [local-docs]
+      allowed_env_keys: [DOCS_TOKEN]
+"#;
+        let cfg: AppConfig = serde_yaml_ng::from_str(yaml).expect("deserialize failed");
+        assert_eq!(
+            cfg.managed.mcp.stdio.allowed_servers,
+            vec!["local-docs".to_string()]
+        );
+        assert_eq!(
+            cfg.managed.mcp.stdio.allowed_env_keys,
+            vec!["DOCS_TOKEN".to_string()]
+        );
+    }
+
+    #[test]
+    fn managed_recovery_policy_deserializes() {
+        let yaml = r#"
+model: openai/gpt-4o
+managed:
+  recovery:
+    auto_replay_interrupted: true
+    max_auto_replays_per_root_run: 5
+"#;
+        let cfg: AppConfig = serde_yaml_ng::from_str(yaml).expect("deserialize failed");
+        assert!(cfg.managed.recovery.auto_replay_interrupted);
+        assert_eq!(cfg.managed.recovery.max_auto_replays_per_root_run, 5);
     }
 
     #[test]

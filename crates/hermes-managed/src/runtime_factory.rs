@@ -2,21 +2,23 @@ use std::{path::PathBuf, sync::Arc};
 
 use hermes_agent::{
     compressor::CompressionConfig,
-    loop_runner::{Agent, AgentConfig},
+    loop_runner::{Agent, AgentConfig, ConversationCheckpointObserver},
 };
 use hermes_config::config::AppConfig;
 use hermes_core::{
-    error::{HermesError, Result},
-    tool::ApprovalDecision,
+    error::HermesError,
+    tool::{ApprovalDecision, ToolExecutionObserver},
 };
 use hermes_memory::MemoryManager;
 use hermes_provider::create_provider;
 use hermes_skills::SkillManager;
 use hermes_tools::ToolRegistry;
+use thiserror::Error;
 use tokio::sync::{RwLock, mpsc};
 
 use crate::{
-    build_filtered_registry, build_filtered_skill_manager,
+    ManagedMcpAdmissionRejection, ManagedRegistryBuildError, build_filtered_registry,
+    build_filtered_skill_manager,
     signet::build_signet_observer,
     types::{
         ManagedAgent, ManagedAgentVersion, ManagedApprovalPolicy, ManagedRun, ManagedRunStatus,
@@ -29,6 +31,70 @@ pub struct ManagedRuntime {
     pub skills: Option<Arc<RwLock<SkillManager>>>,
     pub run: ManagedRun,
     pub timeout_secs: u32,
+}
+
+pub struct ManagedRuntimeBuildContext {
+    pub run: ManagedRun,
+    pub working_dir: PathBuf,
+    pub checkpoint_observer: Option<Arc<dyn ConversationCheckpointObserver>>,
+    pub execution_observer: Option<Arc<dyn ToolExecutionObserver>>,
+}
+
+impl ManagedRuntimeBuildContext {
+    pub fn new(run: ManagedRun, working_dir: PathBuf) -> Self {
+        Self {
+            run,
+            working_dir,
+            checkpoint_observer: None,
+            execution_observer: None,
+        }
+    }
+}
+
+struct CombinedToolExecutionObserver {
+    observers: Vec<Arc<dyn ToolExecutionObserver>>,
+}
+
+#[async_trait::async_trait]
+impl ToolExecutionObserver for CombinedToolExecutionObserver {
+    async fn on_tool_call(
+        &self,
+        observation: hermes_core::tool::ToolExecutionObservation,
+        ctx: &hermes_core::tool::ToolContext,
+    ) -> hermes_core::error::Result<()> {
+        for observer in &self.observers {
+            observer.on_tool_call(observation.clone(), ctx).await?;
+        }
+        Ok(())
+    }
+
+    async fn on_tool_result(
+        &self,
+        observation: hermes_core::tool::ToolExecutionResultObservation,
+        ctx: &hermes_core::tool::ToolContext,
+    ) -> hermes_core::error::Result<()> {
+        for observer in &self.observers {
+            observer.on_tool_result(observation.clone(), ctx).await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ManagedRuntimeBuildError {
+    #[error(transparent)]
+    Registry(#[from] Box<ManagedRegistryBuildError>),
+    #[error(transparent)]
+    Runtime(#[from] HermesError),
+}
+
+impl ManagedRuntimeBuildError {
+    pub fn mcp_admission_rejection(&self) -> Option<&ManagedMcpAdmissionRejection> {
+        match self {
+            Self::Registry(err) => err.mcp_admission_rejection(),
+            Self::Runtime(_) => None,
+        }
+    }
 }
 
 fn managed_base_url<'a>(
@@ -53,8 +119,29 @@ pub async fn build_managed_runtime(
     source_registry: &ToolRegistry,
     source_skills: Option<&Arc<RwLock<SkillManager>>>,
     app_config: &AppConfig,
-    working_dir: PathBuf,
-) -> Result<ManagedRuntime> {
+    context: ManagedRuntimeBuildContext,
+) -> std::result::Result<ManagedRuntime, ManagedRuntimeBuildError> {
+    let filtered_registry = Arc::new(
+        build_filtered_registry(source_registry, &version.allowed_tools, app_config)
+            .await
+            .map_err(Box::new)?,
+    );
+
+    let filtered_skills = match (source_skills, version.allowed_skills.is_empty()) {
+        (_, true) => None,
+        (Some(skills), false) => {
+            let guard = skills.read().await;
+            let filtered = build_filtered_skill_manager(&guard, &version.allowed_skills)?;
+            Some(Arc::new(RwLock::new(filtered)))
+        }
+        (None, false) => {
+            return Err(HermesError::Config(
+                "managed agent requires skills but no skill manager is loaded".to_string(),
+            )
+            .into());
+        }
+    };
+
     let api_key = app_config
         .api_key_for_model(&version.model)
         .ok_or_else(|| {
@@ -70,32 +157,23 @@ pub async fn build_managed_runtime(
     )
     .map_err(|e| HermesError::Config(format!("failed to create provider: {e}")))?;
 
-    let filtered_registry = Arc::new(build_filtered_registry(
-        source_registry,
-        &version.allowed_tools,
-    )?);
-
-    let filtered_skills = match (source_skills, version.allowed_skills.is_empty()) {
-        (_, true) => None,
-        (Some(skills), false) => {
-            let guard = skills.read().await;
-            let filtered = build_filtered_skill_manager(&guard, &version.allowed_skills)?;
-            Some(Arc::new(RwLock::new(filtered)))
-        }
-        (None, false) => {
-            return Err(HermesError::Config(
-                "managed agent requires skills but no skill manager is loaded".to_string(),
-            ));
-        }
-    };
-
     let memory_dir = hermes_config::config::hermes_home()
         .join("memories")
         .join("managed")
         .join(&agent.id);
     let memory = MemoryManager::new(memory_dir, None)
         .map_err(|e| HermesError::Config(format!("failed to create memory: {e}")))?;
-    let execution_observer = build_signet_observer(app_config)?;
+    let execution_observer = match (
+        build_signet_observer(app_config)?,
+        context.execution_observer.clone(),
+    ) {
+        (Some(signet), Some(execution)) => Some(Arc::new(CombinedToolExecutionObserver {
+            observers: vec![signet, execution],
+        }) as Arc<dyn ToolExecutionObserver>),
+        (Some(signet), None) => Some(signet),
+        (None, Some(execution)) => Some(execution),
+        (None, None) => None,
+    };
 
     let (approval_tx, mut approval_rx) = mpsc::channel::<hermes_core::tool::ApprovalRequest>(8);
     let approval_policy = version.approval_policy.clone();
@@ -109,7 +187,7 @@ pub async fn build_managed_runtime(
         }
     });
 
-    let mut run = ManagedRun::new(agent.id.clone(), version.version, version.model.clone());
+    let mut run = context.run;
     run.status = ManagedRunStatus::Running;
     run.updated_at = chrono::Utc::now();
 
@@ -119,15 +197,16 @@ pub async fn build_managed_runtime(
         max_iterations: version.max_iterations,
         system_prompt: version.system_prompt.clone(),
         session_id: run.id.clone(),
-        working_dir: working_dir.clone(),
+        working_dir: context.working_dir.clone(),
         approval_tx,
-        tool_config: Arc::new(app_config.tool_config(working_dir)),
+        tool_config: Arc::new(app_config.tool_config(context.working_dir)),
         execution_observer,
         memory,
         skills: filtered_skills.clone(),
         compression: CompressionConfig::default(),
         delegation_depth: 0,
         clarify_tx: None,
+        checkpoint_observer: context.checkpoint_observer,
     });
 
     Ok(ManagedRuntime {
@@ -201,7 +280,7 @@ mod tests {
             &self,
             _args: serde_json::Value,
             _ctx: &hermes_core::tool::ToolContext,
-        ) -> Result<hermes_core::message::ToolResult> {
+        ) -> hermes_core::error::Result<hermes_core::message::ToolResult> {
             Ok(hermes_core::message::ToolResult::ok("ok"))
         }
     }
@@ -283,6 +362,7 @@ Use {name}
     async fn build_runtime_filters_tools_and_skills() {
         let _guard = ENV_LOCK.lock().await;
         let _api_key_guard = EnvVarGuard::set("OPENAI_API_KEY", "test-openai-key");
+        let _fallback_key_guard = EnvVarGuard::set("HERMES_API_KEY", "test-hermes-key");
 
         let tmp = TempDir::new().unwrap();
         let _home_guard = EnvVarGuard::set("HERMES_HOME", &tmp.path().to_string_lossy());
@@ -301,6 +381,7 @@ Use {name}
             ManagedAgentVersion::new(&agent.id, 1, "openai/gpt-4o-mini", "system prompt");
         version.allowed_tools = vec!["read_file".to_string()];
         version.allowed_skills = vec!["deploy".to_string()];
+        let run = ManagedRun::new(&agent.id, version.version, &version.model);
 
         let runtime = build_managed_runtime(
             &agent,
@@ -308,7 +389,7 @@ Use {name}
             &source_registry,
             Some(&source_skills),
             &cfg(),
-            std::env::temp_dir(),
+            ManagedRuntimeBuildContext::new(run, std::env::temp_dir()),
         )
         .await
         .unwrap();
@@ -324,6 +405,7 @@ Use {name}
     async fn build_runtime_requires_loaded_skills_when_allowlist_is_nonempty() {
         let _guard = ENV_LOCK.lock().await;
         let _api_key_guard = EnvVarGuard::set("OPENAI_API_KEY", "test-openai-key");
+        let _fallback_key_guard = EnvVarGuard::set("HERMES_API_KEY", "test-hermes-key");
         let tmp = TempDir::new().unwrap();
         let _home_guard = EnvVarGuard::set("HERMES_HOME", &tmp.path().to_string_lossy());
 
@@ -335,6 +417,7 @@ Use {name}
             ManagedAgentVersion::new(&agent.id, 1, "openai/gpt-4o-mini", "system prompt");
         version.allowed_tools = vec!["read_file".to_string()];
         version.allowed_skills = vec!["deploy".to_string()];
+        let run = ManagedRun::new(&agent.id, version.version, &version.model);
 
         let err = build_managed_runtime(
             &agent,
@@ -342,12 +425,45 @@ Use {name}
             &source_registry,
             None,
             &cfg(),
-            std::env::temp_dir(),
+            ManagedRuntimeBuildContext::new(run, std::env::temp_dir()),
         )
         .await
         .err()
         .unwrap();
 
         assert!(err.to_string().contains("requires skills"));
+    }
+
+    #[tokio::test]
+    async fn build_runtime_surfaces_structured_mcp_admission_rejection() {
+        let source_registry = ToolRegistry::new();
+        let agent = ManagedAgent::new("code-reviewer");
+        let mut version =
+            ManagedAgentVersion::new(&agent.id, 1, "openai/gpt-4o-mini", "system prompt");
+        version.allowed_tools = vec!["mcp_resource_read".to_string()];
+        let run = ManagedRun::new(&agent.id, version.version, &version.model);
+
+        let err = match build_managed_runtime(
+            &agent,
+            &version,
+            &source_registry,
+            None,
+            &cfg(),
+            ManagedRuntimeBuildContext::new(run, std::env::temp_dir()),
+        )
+        .await
+        {
+            Ok(_) => panic!("expected managed MCP admission rejection"),
+            Err(err) => err,
+        };
+
+        let rejection = err
+            .mcp_admission_rejection()
+            .expect("structured MCP admission rejection missing");
+        assert_eq!(rejection.code, "disabled_by_operator_policy");
+        assert_eq!(
+            rejection.requested_read_only_tools,
+            vec!["mcp_resource_read".to_string()]
+        );
     }
 }

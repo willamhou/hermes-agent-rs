@@ -197,24 +197,38 @@ current global Hermes config, including `HERMES_MODEL` and `HERMES_BASE_URL` fro
 
 ## Managed Agents Beta
 
-The current managed-agents surface is a beta control plane, not hosted-platform parity.
+Hermes includes a beta managed-agents control plane for self-hosted, multi-provider runs with a
+restricted built-in toolset. It is not hosted-platform parity.
 
-What exists today:
+Supported today:
 - agent CRUD plus immutable versions
 - invocation through `model: "agent:<name>"`
-- per-agent tool and skill allowlists
+- per-agent tool and skill allowlists for the managed beta toolset
 - persisted run timelines via `GET /v1/runs/{id}/events`
 - durable run replay via `POST /v1/runs/{id}/replay`
+- optional managed session history inheritance via `session_id` and `x-hermes-session-id`
 - startup reconciliation that marks runs left active during process exit as `failed` or `cancelled`
 - optional Signet receipts for managed tool calls, appended to a local audit chain
-- best-effort run cancellation through `DELETE /v1/runs/:id`
+- best-effort run cancellation through `DELETE /v1/runs/{id}`
+- API disconnect aborts the managed run task
 - CLI `hermes agents ...` commands plus YAML `diff` / `sync`
+- CLI `hermes runs ...` inspection, replay, event streaming, and Signet verification commands
+- example scripts for local API smoke tests, replay/verify helpers, and a manual GitHub Actions
+  smoke workflow
+
+Managed beta toolset:
+- `read_file`, `search_files`, `write_file`, `patch`
+- `memory_read`, `memory_write`
+- `web_search`, `web_extract`, `vision_analyze`
+- `skill_list`, `skill_view`
 
 Current non-goals:
-- hard real-time cancellation guarantees
+- hard real-time cancellation guarantees or universal kill semantics
 - MCP in managed mode
-- hosted control plane, remote KMS, or managed audit pipeline
-- restart-safe in-flight resume, RBAC, or multi-tenant namespaces
+- hosted control plane, remote KMS / vault refs, or managed audit pipeline
+- restart-safe in-flight resume after process death
+- full hosted-platform session / resume parity
+- RBAC, multi-tenant namespaces, or web UI
 
 Example YAML:
 
@@ -306,10 +320,8 @@ That script walks through:
 - `POST /v1/chat/completions` with `model: "agent:<name>"`
 - `GET /v1/runs`
 - `GET /v1/runs/{id}/events`
+- `POST /v1/runs/{id}/replay`
 - optional `DELETE /v1/runs/{id}` cancellation
-
-The managed run API also supports `POST /v1/runs/{id}/replay` to enqueue a new run from the
-original persisted prompt and immutable agent version.
 
 The end-to-end API example lives at [examples/managed-agents-beta.sh](examples/managed-agents-beta.sh).
 The CI-oriented verification helper lives at [examples/verify-managed-run.sh](examples/verify-managed-run.sh).
@@ -318,6 +330,8 @@ The repository workflow lives at [.github/workflows/managed-run-verify.yml](.git
 It is bound to the GitHub Actions environment `managed-verify`, which should define
 `HERMES_MODEL`, `HERMES_BASE_URL`, and `HERMES_API_KEY` as environment secrets.
 The mirrored example file lives at [examples/github-actions-managed-run-verify.yml](examples/github-actions-managed-run-verify.yml).
+This workflow is an opt-in smoke path for a configured environment, separate from the default
+repository pull-request CI.
 
 See [docs/specs/2026-04-22-managed-agents-v1-beta-plan.md](docs/specs/2026-04-22-managed-agents-v1-beta-plan.md) for the current beta contract and non-goals.
 

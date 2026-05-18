@@ -2,6 +2,7 @@
 
 mod approval_key;
 pub mod browser;
+pub mod browser_handoff;
 pub mod clarify;
 pub mod execute_code;
 pub mod file_read;
@@ -11,6 +12,7 @@ pub mod memory_tools;
 pub mod net_utils;
 pub mod patch;
 pub mod path_utils;
+pub mod process_handoff;
 pub mod process_registry;
 pub mod registry;
 pub mod session_cleanup;

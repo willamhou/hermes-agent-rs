@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
 };
@@ -15,6 +16,7 @@ inventory::collect!(ToolRegistration);
 /// Runtime registry that holds named tool instances.
 pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
+    toolset_owners: RwLock<HashMap<String, Arc<dyn Any + Send + Sync>>>,
 }
 
 impl ToolRegistry {
@@ -32,6 +34,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: RwLock::new(HashMap::new()),
+            toolset_owners: RwLock::new(HashMap::new()),
         }
     }
 
@@ -88,13 +91,45 @@ impl ToolRegistry {
 
         let filtered = Self::new();
         let guard = self.tools.read().expect("tool registry read lock poisoned");
+        let owner_guard = self
+            .toolset_owners
+            .read()
+            .expect("tool registry owner read lock poisoned");
         for (name, tool) in guard.iter() {
             if allowed.contains(name) {
                 filtered.register_arc(name.clone(), Arc::clone(tool));
+                filtered.clone_toolset_owner(tool.toolset(), &owner_guard);
             }
         }
 
         filtered
+    }
+
+    /// Copy a named subset of tools from another registry into this registry.
+    pub fn extend_from<I, S>(&self, other: &ToolRegistry, allowed: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let allowed = allowed
+            .into_iter()
+            .map(|name| name.as_ref().to_string())
+            .collect::<HashSet<_>>();
+
+        let guard = other
+            .tools
+            .read()
+            .expect("tool registry read lock poisoned");
+        let owner_guard = other
+            .toolset_owners
+            .read()
+            .expect("tool registry owner read lock poisoned");
+        for (name, tool) in guard.iter() {
+            if allowed.contains(name) {
+                self.register_arc(name.clone(), Arc::clone(tool));
+                self.clone_toolset_owner(tool.toolset(), &owner_guard);
+            }
+        }
     }
 
     /// Return names of all registered tools.
@@ -163,6 +198,43 @@ impl ToolRegistry {
             guard.insert(tool_name, Arc::from(tool));
         }
     }
+
+    /// Retain an owner object for a toolset so any background runtime state
+    /// lives as long as registries exposing that toolset.
+    pub fn set_toolset_owner<T>(&self, toolset: &str, owner: Option<Arc<T>>)
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        self.set_toolset_owner_erased(
+            toolset,
+            owner.map(|owner| owner as Arc<dyn Any + Send + Sync>),
+        );
+    }
+
+    fn set_toolset_owner_erased(&self, toolset: &str, owner: Option<Arc<dyn Any + Send + Sync>>) {
+        let mut guard = self
+            .toolset_owners
+            .write()
+            .expect("tool registry owner write lock poisoned");
+        match owner {
+            Some(owner) => {
+                guard.insert(toolset.to_string(), owner);
+            }
+            None => {
+                guard.remove(toolset);
+            }
+        }
+    }
+
+    fn clone_toolset_owner(
+        &self,
+        toolset: &str,
+        owners: &HashMap<String, Arc<dyn Any + Send + Sync>>,
+    ) {
+        if let Some(owner) = owners.get(toolset) {
+            self.set_toolset_owner_erased(toolset, Some(Arc::clone(owner)));
+        }
+    }
 }
 
 impl Default for ToolRegistry {
@@ -175,7 +247,10 @@ impl Default for ToolRegistry {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use async_trait::async_trait;
     use hermes_core::{
@@ -241,6 +316,16 @@ mod tests {
             _ctx: &ToolContext,
         ) -> Result<ToolResult> {
             Ok(ToolResult::error("unavailable"))
+        }
+    }
+
+    struct OwnerProbe {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for OwnerProbe {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -354,6 +439,63 @@ mod tests {
         let schemas = filtered.available_schemas();
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0].name, "echo");
+    }
+
+    #[test]
+    fn test_filtered_registry_keeps_toolset_owner_alive() {
+        let registry = ToolRegistry::new();
+        registry.register(Box::new(EchoTool));
+        let drops = Arc::new(AtomicUsize::new(0));
+        registry.set_toolset_owner(
+            "test",
+            Some(Arc::new(OwnerProbe {
+                drops: Arc::clone(&drops),
+            })),
+        );
+
+        let filtered = registry.filtered(["echo"]);
+        drop(registry);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        drop(filtered);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_extend_from_keeps_toolset_owner_alive() {
+        let source = ToolRegistry::new();
+        source.register(Box::new(EchoTool));
+        let drops = Arc::new(AtomicUsize::new(0));
+        source.set_toolset_owner(
+            "test",
+            Some(Arc::new(OwnerProbe {
+                drops: Arc::clone(&drops),
+            })),
+        );
+
+        let target = ToolRegistry::new();
+        target.extend_from(&source, ["echo"]);
+        drop(source);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        drop(target);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_clearing_toolset_owner_releases_owner() {
+        let registry = ToolRegistry::new();
+        let drops = Arc::new(AtomicUsize::new(0));
+        registry.set_toolset_owner(
+            "test",
+            Some(Arc::new(OwnerProbe {
+                drops: Arc::clone(&drops),
+            })),
+        );
+
+        registry.set_toolset_owner::<OwnerProbe>("test", None);
+
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

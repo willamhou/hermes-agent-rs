@@ -9,9 +9,12 @@ use dashmap::DashMap;
 use tokio::sync::{RwLock, mpsc, oneshot};
 
 use hermes_config::config::AppConfig;
-use hermes_core::platform::{ChatType, MessageEvent, PlatformAdapter};
-use hermes_core::stream::StreamDelta;
 use hermes_core::tool::ApprovalDecision;
+use hermes_core::{
+    platform::{ChatType, MessageEvent, PlatformAdapter},
+    session::SessionStore,
+    stream::StreamDelta,
+};
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -29,6 +32,7 @@ pub struct SharedState {
     pub registry: Arc<hermes_tools::ToolRegistry>,
     pub tool_config: Arc<hermes_core::tool::ToolConfig>,
     pub skills: Option<Arc<RwLock<hermes_skills::SkillManager>>>,
+    pub session_store: Option<Arc<dyn SessionStore>>,
     pub adapters: HashMap<String, Arc<dyn PlatformAdapter>>,
 }
 
@@ -316,6 +320,7 @@ fn build_session_agent(
         compression: CompressionConfig::default(),
         delegation_depth: 0,
         clarify_tx: None,
+        checkpoint_observer: None,
     }))
 }
 

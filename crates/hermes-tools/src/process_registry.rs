@@ -64,8 +64,68 @@ struct ProcessEntry {
     command: String,
     started_at: String,
     pid: u32,
+    process_group: Option<u32>,
     output: Arc<Mutex<String>>,
     exit_code: Arc<Mutex<Option<i32>>>,
+}
+
+#[cfg(unix)]
+pub(crate) fn configure_child_process_group(cmd: &mut tokio::process::Command) {
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn configure_child_process_group(_cmd: &mut tokio::process::Command) {}
+
+pub(crate) fn kill_process(pid: u32) -> Result<(), String> {
+    if pid == 0 {
+        return Err("unknown PID".to_string());
+    }
+
+    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    if ret == 0 {
+        return Ok(());
+    }
+
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(format!("kill failed: {err}"))
+    }
+}
+
+pub(crate) fn kill_process_group(process_group: u32) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        if process_group == 0 {
+            return Err("unknown process group".to_string());
+        }
+
+        let ret = unsafe { libc::kill(-(process_group as libc::pid_t), libc::SIGKILL) };
+        if ret == 0 {
+            return Ok(());
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(format!("killpg failed: {err}"))
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        kill_process(process_group)
+    }
 }
 
 // ─── Registry ────────────────────────────────────────────────────────────────
@@ -103,6 +163,7 @@ impl ProcessRegistry {
         cmd.stdout(std::process::Stdio::piped());
         // Merge stderr into stdout to avoid interleaved output
         cmd.stderr(std::process::Stdio::piped());
+        configure_child_process_group(&mut cmd);
 
         let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
         let pid = child.id().unwrap_or(0);
@@ -172,6 +233,7 @@ impl ProcessRegistry {
             command: command.to_string(),
             started_at: chrono::Utc::now().to_rfc3339(),
             pid,
+            process_group: (pid != 0).then_some(pid),
             output,
             exit_code,
         };
@@ -224,7 +286,7 @@ impl ProcessRegistry {
         })
     }
 
-    /// Kill a background process by sending SIGKILL.
+    /// Kill a background process by sending SIGKILL to its process group when available.
     pub fn kill(&self, id: &str) -> Result<(), String> {
         let guard = self.processes.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard
@@ -233,19 +295,11 @@ impl ProcessRegistry {
         if entry.exit_code.lock().ok().and_then(|g| *g).is_some() {
             return Err(format!("process {id} already exited"));
         }
-        if entry.pid == 0 {
-            return Err("unknown PID".to_string());
+        if let Some(process_group) = entry.process_group {
+            kill_process_group(process_group)
+        } else {
+            kill_process(entry.pid)
         }
-        // SAFETY: sending SIGKILL to a known child pid
-        let ret = unsafe { libc::kill(entry.pid as libc::pid_t, libc::SIGKILL) };
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            // ESRCH = already exited between check and kill (TOCTOU), treat as success
-            if err.raw_os_error() != Some(libc::ESRCH) {
-                return Err(format!("kill failed: {err}"));
-            }
-        }
-        Ok(())
     }
 
     /// Check if a process is still running.
@@ -255,6 +309,12 @@ impl ProcessRegistry {
             .get(id)
             .map(|e| e.exit_code.lock().ok().and_then(|g| *g).is_none())
             .unwrap_or(false)
+    }
+
+    /// Return the OS process-group ID for a tracked background process when known.
+    pub fn process_group_for(&self, id: &str) -> Option<u32> {
+        let guard = self.processes.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(id).and_then(|entry| entry.process_group)
     }
 
     /// Remove all exited processes.
@@ -282,6 +342,32 @@ impl ProcessRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::NamedTempFile;
+    use tokio::time::Duration;
+
+    fn pid_is_alive(pid: u32) -> bool {
+        let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if ret == 0 {
+            return true;
+        }
+        let err = std::io::Error::last_os_error();
+        err.raw_os_error() != Some(libc::ESRCH)
+    }
+
+    async fn wait_for_pid_file(path: &Path) -> u32 {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(path) {
+                    if let Ok(pid) = contents.trim().parse::<u32>() {
+                        return pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
 
     fn test_registry() -> ProcessRegistry {
         ProcessRegistry::new()
@@ -333,6 +419,25 @@ mod tests {
         assert_eq!(reg.len(), 1);
         reg.remove_exited();
         assert_eq!(reg.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn kill_terminates_background_process_group_descendants() {
+        let reg = test_registry();
+        let pid_file = NamedTempFile::new().unwrap();
+        let command = format!("sleep 30 & echo $! > {} && wait", pid_file.path().display());
+
+        let id = reg.spawn(&command, Path::new("/tmp")).unwrap();
+        let descendant_pid = wait_for_pid_file(pid_file.path()).await;
+        assert!(pid_is_alive(descendant_pid));
+
+        reg.kill(&id).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !pid_is_alive(descendant_pid),
+            "descendant pid {descendant_pid} should be terminated with the shell process group"
+        );
     }
 
     #[test]

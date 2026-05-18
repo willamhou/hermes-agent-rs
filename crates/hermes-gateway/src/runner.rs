@@ -4,14 +4,23 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hermes_config::config::{AppConfig, GatewayConfig, hermes_home};
+use hermes_config::{
+    SqliteSessionStore,
+    config::{AppConfig, GatewayConfig, hermes_home},
+};
 use hermes_core::platform::{PlatformAdapter, PlatformEvent};
-use hermes_managed::{ManagedStore, RunRegistry};
+use hermes_managed::{
+    ManagedRunCleanupResource, ManagedRunCleanupResourceKind, ManagedStore, RunRegistry,
+};
+use hermes_mcp::McpDurableCleanupExecutor;
 use hermes_provider::create_provider;
-use hermes_tools::ToolRegistry;
+use hermes_tools::{ToolRegistry, session_cleanup};
 use tokio::sync::{RwLock, mpsc};
 
-use crate::api_server::ApiServerAdapter;
+use crate::api_server::{
+    ApiServerAdapter, append_ancestor_follow_replay_decisions_for_replay_child,
+    append_source_takeover_update_for_replay_child, maybe_auto_replay_interrupted_runs,
+};
 use crate::discord::DiscordAdapter;
 use crate::session::{SessionRouter, SharedState};
 use crate::telegram::TelegramAdapter;
@@ -19,6 +28,207 @@ use crate::telegram::TelegramAdapter;
 pub struct GatewayRunner {
     gateway_config: GatewayConfig,
     app_config: AppConfig,
+}
+
+const MANAGED_CLEANUP_RECOVERY_BATCH_SIZE: usize = 256;
+const MANAGED_AUTO_REPLAY_BATCH_SIZE: usize = 64;
+
+#[derive(Default)]
+struct ManagedCleanupRecoverySummary {
+    attempted: usize,
+    cleaned: usize,
+    failures: Vec<String>,
+    run_failures: HashMap<String, Vec<ManagedCleanupRecoveryFailure>>,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedCleanupRecoveryFailure {
+    entry_id: u64,
+    stage: &'static str,
+    kind: ManagedRunCleanupResourceKind,
+    label: String,
+    target_value: String,
+    error: String,
+}
+
+fn durable_cleanup_resource_from_managed(
+    resource: &ManagedRunCleanupResource,
+) -> session_cleanup::DurableCleanupResource {
+    session_cleanup::DurableCleanupResource {
+        kind: match resource.kind {
+            ManagedRunCleanupResourceKind::Pid => session_cleanup::DurableCleanupResourceKind::Pid,
+            ManagedRunCleanupResourceKind::ProcessGroup => {
+                session_cleanup::DurableCleanupResourceKind::ProcessGroup
+            }
+            ManagedRunCleanupResourceKind::BrowserSession => {
+                session_cleanup::DurableCleanupResourceKind::BrowserSession
+            }
+            ManagedRunCleanupResourceKind::McpHttpResourceSubscription => {
+                session_cleanup::DurableCleanupResourceKind::McpHttpResourceSubscription
+            }
+            ManagedRunCleanupResourceKind::McpHttpSession => {
+                session_cleanup::DurableCleanupResourceKind::McpHttpSession
+            }
+        },
+        label: resource.label.clone(),
+        target_value: resource.target_value.clone(),
+    }
+}
+
+async fn reclaim_terminal_managed_cleanup_resources(
+    store: &ManagedStore,
+) -> anyhow::Result<ManagedCleanupRecoverySummary> {
+    let resources = store
+        .list_terminal_run_cleanup_resources(MANAGED_CLEANUP_RECOVERY_BATCH_SIZE)
+        .await?;
+    let mut summary = ManagedCleanupRecoverySummary {
+        attempted: resources.len(),
+        ..ManagedCleanupRecoverySummary::default()
+    };
+
+    for resource in resources {
+        let durable = durable_cleanup_resource_from_managed(&resource);
+        match session_cleanup::cleanup_persisted_resource(&durable).await {
+            Ok(()) => match store
+                .delete_run_cleanup_resource(&resource.run_id, resource.entry_id)
+                .await
+            {
+                Ok(_) => summary.cleaned += 1,
+                Err(err) => {
+                    let err = format!(
+                        "failed to delete cleanup manifest for {}#{}: {err}",
+                        resource.run_id, resource.entry_id
+                    );
+                    summary.failures.push(err.clone());
+                    summary
+                        .run_failures
+                        .entry(resource.run_id.clone())
+                        .or_default()
+                        .push(ManagedCleanupRecoveryFailure {
+                            entry_id: resource.entry_id,
+                            stage: "delete_manifest",
+                            kind: resource.kind.clone(),
+                            label: resource.label.clone(),
+                            target_value: resource.target_value.clone(),
+                            error: err,
+                        });
+                }
+            },
+            Err(err) => {
+                let err = format!(
+                    "failed to reclaim durable cleanup resource for {}#{}: {err}",
+                    resource.run_id, resource.entry_id
+                );
+                summary.failures.push(err.clone());
+                summary
+                    .run_failures
+                    .entry(resource.run_id.clone())
+                    .or_default()
+                    .push(ManagedCleanupRecoveryFailure {
+                        entry_id: resource.entry_id,
+                        stage: "cleanup_resource",
+                        kind: resource.kind.clone(),
+                        label: resource.label.clone(),
+                        target_value: resource.target_value.clone(),
+                        error: err,
+                    });
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+fn managed_cleanup_recovery_failure_event(
+    failures: &[ManagedCleanupRecoveryFailure],
+    context: &str,
+) -> hermes_managed::ManagedRunEventDraft {
+    hermes_managed::ManagedRunEventDraft {
+        kind: hermes_managed::ManagedRunEventKind::RunCleanupFailed,
+        message: Some(format!(
+            "Managed durable cleanup recovery failed for {} resource(s)",
+            failures.len()
+        )),
+        tool_name: None,
+        tool_call_id: None,
+        metadata: Some(serde_json::json!({
+            "phase": "recovery_reclaim",
+            "context": context,
+            "failures": failures.iter().map(|failure| serde_json::json!({
+                "entry_id": failure.entry_id,
+                "stage": failure.stage,
+                "kind": failure.kind.as_str(),
+                "label": failure.label,
+                "target_value": failure.target_value,
+                "error": failure.error,
+            })).collect::<Vec<_>>(),
+        })),
+    }
+}
+
+async fn log_terminal_managed_cleanup_recovery(
+    store: &ManagedStore,
+    summary: &ManagedCleanupRecoverySummary,
+    context: &str,
+) {
+    if summary.attempted == 0 {
+        return;
+    }
+
+    if summary.failures.is_empty() {
+        tracing::warn!(
+            attempted = summary.attempted,
+            cleaned = summary.cleaned,
+            context,
+            "reclaimed durable cleanup resources for terminal managed runs"
+        );
+    } else {
+        tracing::warn!(
+            attempted = summary.attempted,
+            cleaned = summary.cleaned,
+            failures = ?summary.failures,
+            context,
+            "managed durable cleanup recovery completed with failures"
+        );
+        for (run_id, failures) in &summary.run_failures {
+            let _ = store
+                .append_run_event(
+                    run_id,
+                    &managed_cleanup_recovery_failure_event(failures, context),
+                )
+                .await;
+        }
+    }
+}
+
+fn log_managed_auto_replay_summary(
+    summary: &crate::api_server::ManagedAutoReplaySummary,
+    context: &str,
+) {
+    if summary.is_empty() {
+        return;
+    }
+
+    if summary.failures.is_empty() {
+        tracing::warn!(
+            candidates = summary.candidates,
+            replayed = summary.replayed_run_ids.len(),
+            skipped_depth_limit = summary.skipped_depth_limit,
+            replayed_run_ids = ?summary.replayed_run_ids,
+            context,
+            "processed interrupted managed run auto-replay sweep"
+        );
+    } else {
+        tracing::warn!(
+            candidates = summary.candidates,
+            replayed = summary.replayed_run_ids.len(),
+            skipped_depth_limit = summary.skipped_depth_limit,
+            replayed_run_ids = ?summary.replayed_run_ids,
+            failures = ?summary.failures,
+            context,
+            "managed interrupted auto-replay sweep completed with failures"
+        );
+    }
 }
 
 impl GatewayRunner {
@@ -63,10 +273,19 @@ impl GatewayRunner {
             }
         };
 
+        let session_store = match SqliteSessionStore::open().await {
+            Ok(store) => Some(Arc::new(store) as Arc<dyn hermes_core::session::SessionStore>),
+            Err(e) => {
+                tracing::warn!("gateway session persistence disabled — failed to open store: {e}");
+                None
+            }
+        };
+
         // 2. Create adapters + event channel
         let (event_tx, mut event_rx) = mpsc::channel::<PlatformEvent>(256);
         let mut adapters: HashMap<String, Arc<dyn PlatformAdapter>> = HashMap::new();
         let mut adapter_handles = Vec::new();
+        let mut managed_recovery_handle = None;
 
         if let Some(ref tg_config) = self.gateway_config.telegram {
             let adapter = Arc::new(TelegramAdapter::new(
@@ -118,6 +337,7 @@ impl GatewayRunner {
             registry,
             tool_config,
             skills,
+            session_store,
             adapters,
         });
         let router = SessionRouter::new(
@@ -133,22 +353,149 @@ impl GatewayRunner {
             match ManagedStore::open().await {
                 Ok(store) => {
                     let store = Arc::new(store);
+                    let runs = Arc::new(RunRegistry::new());
+                    let worker_id = format!("gw_{}", uuid::Uuid::new_v4().simple());
+                    let cleanup_recorder: Arc<dyn session_cleanup::DurableCleanupRecorder> =
+                        store.clone();
+                    let _ =
+                        session_cleanup::replace_durable_cleanup_recorder(Some(cleanup_recorder));
+                    let cleanup_executor: Arc<dyn session_cleanup::DurableCleanupExecutor> =
+                        Arc::new(McpDurableCleanupExecutor::new(
+                            self.app_config.mcp_servers.clone(),
+                        ));
+                    let _ =
+                        session_cleanup::replace_durable_cleanup_executor(Some(cleanup_executor));
                     match store.reconcile_incomplete_runs().await {
-                        Ok(reconciled) if !reconciled.is_empty() => tracing::warn!(
-                            count = reconciled.len(),
-                            "reconciled managed runs left active by a previous process"
-                        ),
+                        Ok(reconciled) if !reconciled.is_empty() => {
+                            tracing::warn!(
+                                count = reconciled.len(),
+                                "reconciled managed runs left active by a previous process"
+                            );
+                            for run in &reconciled {
+                                append_source_takeover_update_for_replay_child(
+                                    store.as_ref(),
+                                    run,
+                                    None,
+                                )
+                                .await;
+                                append_ancestor_follow_replay_decisions_for_replay_child(
+                                    store.as_ref(),
+                                    run,
+                                )
+                                .await;
+                            }
+                        }
                         Ok(_) => {}
                         Err(e) => tracing::warn!(
                             "managed runtime started without reconciling incomplete runs: {e}"
                         ),
                     }
+                    match reclaim_terminal_managed_cleanup_resources(store.as_ref()).await {
+                        Ok(summary) => {
+                            log_terminal_managed_cleanup_recovery(
+                                store.as_ref(),
+                                &summary,
+                                "startup",
+                            )
+                            .await;
+                        }
+                        Err(e) => tracing::warn!(
+                            "managed runtime started without reclaiming persisted cleanup resources: {e}"
+                        ),
+                    }
+                    match maybe_auto_replay_interrupted_runs(
+                        Arc::clone(&shared),
+                        self.app_config.clone(),
+                        Arc::clone(&store),
+                        Arc::clone(&runs),
+                        worker_id.clone(),
+                        MANAGED_AUTO_REPLAY_BATCH_SIZE,
+                    )
+                    .await
+                    {
+                        Ok(summary) => log_managed_auto_replay_summary(&summary, "startup"),
+                        Err(e) => tracing::warn!(
+                            "managed runtime started without sweeping interrupted auto-replay candidates: {e}"
+                        ),
+                    }
+                    let recovery_shared = Arc::clone(&shared);
+                    let recovery_app_config = self.app_config.clone();
+                    let recovery_store = Arc::clone(&store);
+                    let recovery_runs = Arc::clone(&runs);
+                    let recovery_worker_id = worker_id.clone();
+                    managed_recovery_handle = Some(tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(Duration::from_secs(15));
+                        interval.tick().await;
+                        loop {
+                            interval.tick().await;
+                            match recovery_store.reconcile_incomplete_runs().await {
+                                Ok(reconciled) if !reconciled.is_empty() => {
+                                    tracing::warn!(
+                                        count = reconciled.len(),
+                                        "reconciled managed runs after ownership lease expiry"
+                                    );
+                                    for run in &reconciled {
+                                        append_source_takeover_update_for_replay_child(
+                                            recovery_store.as_ref(),
+                                            run,
+                                            None,
+                                        )
+                                        .await;
+                                        append_ancestor_follow_replay_decisions_for_replay_child(
+                                            recovery_store.as_ref(),
+                                            run,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(e) => tracing::warn!(
+                                    "managed recovery sweep failed while reconciling incomplete runs: {e}"
+                                ),
+                            }
+                            match reclaim_terminal_managed_cleanup_resources(
+                                recovery_store.as_ref(),
+                            )
+                            .await
+                            {
+                                Ok(summary) => {
+                                    log_terminal_managed_cleanup_recovery(
+                                        recovery_store.as_ref(),
+                                        &summary,
+                                        "periodic",
+                                    )
+                                    .await;
+                                }
+                                Err(e) => tracing::warn!(
+                                    "managed recovery sweep failed while reclaiming persisted cleanup resources: {e}"
+                                ),
+                            }
+                            match maybe_auto_replay_interrupted_runs(
+                                Arc::clone(&recovery_shared),
+                                recovery_app_config.clone(),
+                                Arc::clone(&recovery_store),
+                                Arc::clone(&recovery_runs),
+                                recovery_worker_id.clone(),
+                                MANAGED_AUTO_REPLAY_BATCH_SIZE,
+                            )
+                            .await
+                            {
+                                Ok(summary) => {
+                                    log_managed_auto_replay_summary(&summary, "periodic");
+                                }
+                                Err(e) => tracing::warn!(
+                                    "managed recovery sweep failed while auto-replaying interrupted runs: {e}"
+                                ),
+                            }
+                        }
+                    }));
 
                     adapter.set_managed_state(
                         Arc::clone(&shared),
                         self.app_config.clone(),
                         store,
-                        Arc::new(RunRegistry::new()),
+                        runs,
+                        worker_id,
                     )
                 }
                 Err(e) => tracing::warn!("managed runtime disabled — failed to open store: {e}"),
@@ -251,11 +598,522 @@ impl GatewayRunner {
 
         // 6. Shutdown
         cleanup_handle.abort();
+        if let Some(handle) = managed_recovery_handle {
+            handle.abort();
+        }
         for handle in adapter_handles {
             handle.abort();
         }
         router.shutdown();
         tracing::info!("gateway stopped");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::{Path, PathBuf},
+        sync::{Arc, LazyLock, Mutex},
+        time::Duration,
+    };
+
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use hermes_core::{
+        stream::StreamDelta,
+        tool::{
+            ApprovalRequest, BrowserToolConfig, FileToolConfig, TerminalToolConfig, Tool,
+            ToolConfig, ToolContext,
+        },
+    };
+    use hermes_managed::{
+        ManagedAgent, ManagedAgentVersion, ManagedRun, ManagedRunEventKind, ManagedRunStatus,
+    };
+    use hermes_tools::{browser::BrowserTool, process_registry::global_registry};
+    use tempfile::{NamedTempFile, TempDir};
+    use tokio::sync::mpsc;
+
+    use super::*;
+
+    static CLEANUP_EXECUTOR_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+    static CLEANUP_RECORDER_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    #[derive(Default)]
+    struct MockCleanupExecutor {
+        cleaned: Mutex<Vec<session_cleanup::DurableCleanupResource>>,
+    }
+
+    #[async_trait]
+    impl session_cleanup::DurableCleanupExecutor for MockCleanupExecutor {
+        async fn cleanup(
+            &self,
+            resource: &session_cleanup::DurableCleanupResource,
+        ) -> std::result::Result<bool, String> {
+            self.cleaned
+                .lock()
+                .expect("mock cleanup executor lock poisoned")
+                .push(resource.clone());
+            Ok(true)
+        }
+    }
+
+    struct CleanupExecutorGuard(Option<Arc<dyn session_cleanup::DurableCleanupExecutor>>);
+
+    impl CleanupExecutorGuard {
+        fn install(executor: Arc<dyn session_cleanup::DurableCleanupExecutor>) -> Self {
+            Self(session_cleanup::replace_durable_cleanup_executor(Some(
+                executor,
+            )))
+        }
+    }
+
+    impl Drop for CleanupExecutorGuard {
+        fn drop(&mut self) {
+            let _ = session_cleanup::replace_durable_cleanup_executor(self.0.take());
+        }
+    }
+
+    struct CleanupRecorderGuard(Option<Arc<dyn session_cleanup::DurableCleanupRecorder>>);
+
+    impl CleanupRecorderGuard {
+        fn install(recorder: Arc<dyn session_cleanup::DurableCleanupRecorder>) -> Self {
+            Self(session_cleanup::replace_durable_cleanup_recorder(Some(
+                recorder,
+            )))
+        }
+    }
+
+    impl Drop for CleanupRecorderGuard {
+        fn drop(&mut self) {
+            let _ = session_cleanup::replace_durable_cleanup_recorder(self.0.take());
+        }
+    }
+
+    fn temp_db() -> (TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        (dir, path)
+    }
+
+    fn pid_is_alive(pid: u32) -> bool {
+        let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if ret == 0 {
+            return true;
+        }
+        let err = std::io::Error::last_os_error();
+        err.raw_os_error() != Some(libc::ESRCH)
+    }
+
+    async fn wait_for_pid_file(path: &Path) -> u32 {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(path) {
+                    if let Ok(pid) = contents.trim().parse::<u32>() {
+                        return pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    fn make_browser_test_ctx(workspace: &Path, session_id: &str) -> ToolContext {
+        let (approval_tx, _) = mpsc::channel::<ApprovalRequest>(1);
+        let (delta_tx, _) = mpsc::channel::<StreamDelta>(1);
+        let browser_executable = std::env::var_os("CHROME").map(PathBuf::from);
+        ToolContext {
+            session_id: session_id.to_string(),
+            working_dir: workspace.to_path_buf(),
+            approval_tx,
+            delta_tx,
+            execution_observer: None,
+            tool_config: Arc::new(ToolConfig {
+                terminal: TerminalToolConfig::default(),
+                file: FileToolConfig::default(),
+                browser: BrowserToolConfig {
+                    sandbox: false,
+                    executable: browser_executable,
+                    ..BrowserToolConfig::default()
+                },
+                workspace_root: workspace.to_path_buf(),
+            }),
+            memory: None,
+            aux_provider: None,
+            skills: None,
+            delegation_depth: 0,
+            clarify_tx: None,
+        }
+    }
+
+    fn browser_env_unavailable(message: &str) -> bool {
+        message.contains("failed to detect browser executable")
+    }
+
+    async fn wait_for_browser_cleanup_resource(
+        store: &ManagedStore,
+        run_id: &str,
+    ) -> ManagedRunCleanupResource {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let resources = store.list_run_cleanup_resources(run_id).await.unwrap();
+                if let Some(resource) = resources.into_iter().next() {
+                    return resource;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("browser cleanup resource should be persisted")
+    }
+
+    #[tokio::test]
+    async fn reclaim_terminal_cleanup_resources_kills_process_groups_and_clears_manifest() {
+        let (_dir, path) = temp_db();
+        let store = ManagedStore::open_at(&path).await.unwrap();
+
+        let agent = ManagedAgent::new("cleanup-recovery");
+        store.create_agent(&agent).await.unwrap();
+        let version = ManagedAgentVersion::new(&agent.id, 1, "openai/gpt-4o-mini", "prompt");
+        store.create_agent_version(&version).await.unwrap();
+
+        let mut run = ManagedRun::new(&agent.id, 1, "openai/gpt-4o-mini");
+        run.status = ManagedRunStatus::Interrupted;
+        run.ended_at = Some(Utc::now());
+        store.create_run(&run).await.unwrap();
+
+        let registry = global_registry();
+        registry.remove_exited();
+        let pid_file = NamedTempFile::new().unwrap();
+        let command = format!("sleep 30 & echo $! > {} && wait", pid_file.path().display());
+        let process_id = registry.spawn(&command, Path::new("/tmp")).unwrap();
+        let process_group = registry.process_group_for(&process_id).unwrap();
+        let descendant_pid = wait_for_pid_file(pid_file.path()).await;
+        assert!(pid_is_alive(descendant_pid));
+
+        store
+            .upsert_run_cleanup_resource(
+                &run.id,
+                1,
+                ManagedRunCleanupResourceKind::ProcessGroup,
+                "shell worker",
+                &process_group.to_string(),
+            )
+            .await
+            .unwrap();
+
+        let summary = reclaim_terminal_managed_cleanup_resources(&store)
+            .await
+            .unwrap();
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.cleaned, 1);
+        assert!(summary.failures.is_empty());
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!pid_is_alive(descendant_pid));
+        assert!(!registry.is_running(&process_id));
+        assert!(
+            store
+                .list_run_cleanup_resources(&run.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaim_terminal_cleanup_resources_retains_manifest_on_failure() {
+        let (_dir, path) = temp_db();
+        let store = ManagedStore::open_at(&path).await.unwrap();
+
+        let agent = ManagedAgent::new("cleanup-recovery-failure");
+        store.create_agent(&agent).await.unwrap();
+        let version = ManagedAgentVersion::new(&agent.id, 1, "openai/gpt-4o-mini", "prompt");
+        store.create_agent_version(&version).await.unwrap();
+
+        let mut run = ManagedRun::new(&agent.id, 1, "openai/gpt-4o-mini");
+        run.status = ManagedRunStatus::Interrupted;
+        run.ended_at = Some(Utc::now());
+        store.create_run(&run).await.unwrap();
+
+        store
+            .upsert_run_cleanup_resource(
+                &run.id,
+                9,
+                ManagedRunCleanupResourceKind::ProcessGroup,
+                "broken shell worker",
+                "not-a-pgid",
+            )
+            .await
+            .unwrap();
+
+        let summary = reclaim_terminal_managed_cleanup_resources(&store)
+            .await
+            .unwrap();
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.cleaned, 0);
+        assert_eq!(summary.failures.len(), 1);
+        log_terminal_managed_cleanup_recovery(&store, &summary, "test").await;
+
+        let resources = store.list_run_cleanup_resources(&run.id).await.unwrap();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].entry_id, 9);
+        let events = store.list_run_events(&run.id, 32).await.unwrap();
+        let cleanup_failed = events
+            .iter()
+            .find(|event| event.kind == ManagedRunEventKind::RunCleanupFailed)
+            .expect("expected cleanup failure event");
+        assert_eq!(
+            cleanup_failed.metadata.as_ref().unwrap()["phase"],
+            "recovery_reclaim"
+        );
+        assert_eq!(cleanup_failed.metadata.as_ref().unwrap()["context"], "test");
+        assert_eq!(
+            cleanup_failed.metadata.as_ref().unwrap()["failures"][0]["stage"],
+            "cleanup_resource"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaim_terminal_cleanup_resources_removes_browser_session_dirs() {
+        let (_dir, path) = temp_db();
+        let store = ManagedStore::open_at(&path).await.unwrap();
+
+        let agent = ManagedAgent::new("cleanup-recovery-browser");
+        store.create_agent(&agent).await.unwrap();
+        let version = ManagedAgentVersion::new(&agent.id, 1, "openai/gpt-4o-mini", "prompt");
+        store.create_agent_version(&version).await.unwrap();
+
+        let mut run = ManagedRun::new(&agent.id, 1, "openai/gpt-4o-mini");
+        run.status = ManagedRunStatus::Interrupted;
+        run.ended_at = Some(Utc::now());
+        store.create_run(&run).await.unwrap();
+
+        let registry = global_registry();
+        registry.remove_exited();
+        let pid_file = NamedTempFile::new().unwrap();
+        let command = format!("sleep 30 & echo $! > {} && wait", pid_file.path().display());
+        let process_id = registry.spawn(&command, Path::new("/tmp")).unwrap();
+        let process_group = registry.process_group_for(&process_id).unwrap();
+        let descendant_pid = wait_for_pid_file(pid_file.path()).await;
+        assert!(pid_is_alive(descendant_pid));
+
+        let browser_dir = tempfile::tempdir().unwrap();
+        let user_data_dir = browser_dir.path().join("profile");
+        std::fs::create_dir_all(&user_data_dir).unwrap();
+        std::fs::write(user_data_dir.join("Preferences"), "{}").unwrap();
+
+        store
+            .upsert_run_cleanup_resource(
+                &run.id,
+                10,
+                ManagedRunCleanupResourceKind::BrowserSession,
+                "browser session state",
+                &format!(
+                    r#"{{"root_pid":null,"process_group":{},"user_data_dir":"{}"}}"#,
+                    process_group,
+                    user_data_dir.display()
+                ),
+            )
+            .await
+            .unwrap();
+
+        let summary = reclaim_terminal_managed_cleanup_resources(&store)
+            .await
+            .unwrap();
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.cleaned, 1);
+        assert!(summary.failures.is_empty());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!pid_is_alive(descendant_pid));
+        assert!(!registry.is_running(&process_id));
+        assert!(!user_data_dir.exists());
+        assert!(
+            store
+                .list_run_cleanup_resources(&run.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaim_terminal_cleanup_resources_reclaims_live_browser_session_manifests() {
+        let _lock = CLEANUP_RECORDER_TEST_LOCK.lock().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let (_dir, path) = temp_db();
+        let store = Arc::new(ManagedStore::open_at(&path).await.unwrap());
+        let _guard = CleanupRecorderGuard::install(store.clone());
+
+        let agent = ManagedAgent::new("cleanup-recovery-live-browser");
+        store.create_agent(&agent).await.unwrap();
+        let version = ManagedAgentVersion::new(&agent.id, 1, "openai/gpt-4o-mini", "prompt");
+        store.create_agent_version(&version).await.unwrap();
+
+        let mut run = ManagedRun::new(&agent.id, 1, "openai/gpt-4o-mini");
+        run.status = ManagedRunStatus::Interrupted;
+        run.ended_at = Some(Utc::now());
+        store.create_run(&run).await.unwrap();
+
+        let html_path = workspace.path().join("index.html");
+        std::fs::write(
+            &html_path,
+            "<html><body><h1>Live browser reclaim</h1></body></html>",
+        )
+        .unwrap();
+        let url = format!("file://{}", html_path.display());
+        let tool = BrowserTool::new();
+        let ctx = make_browser_test_ctx(workspace.path(), &run.id);
+        let result = tool
+            .execute(
+                serde_json::json!({ "action": "navigate", "url": url }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        if result.is_error && browser_env_unavailable(&result.content) {
+            eprintln!("skipping live browser runner test: {}", result.content);
+            return;
+        }
+        assert!(!result.is_error, "{}", result.content);
+
+        let resource = wait_for_browser_cleanup_resource(store.as_ref(), &run.id).await;
+        assert_eq!(resource.kind, ManagedRunCleanupResourceKind::BrowserSession);
+        let target: serde_json::Value = serde_json::from_str(&resource.target_value).unwrap();
+        let user_data_dir = PathBuf::from(target["user_data_dir"].as_str().unwrap());
+        assert!(user_data_dir.exists());
+
+        let summary = reclaim_terminal_managed_cleanup_resources(store.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.cleaned, 1);
+        assert!(summary.failures.is_empty());
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!user_data_dir.exists());
+        assert!(
+            store
+                .list_run_cleanup_resources(&run.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let _ = session_cleanup::cleanup_session(&run.id).await;
+    }
+
+    #[tokio::test]
+    async fn reclaim_terminal_cleanup_resources_delegates_mcp_resources_to_executor() {
+        let _lock = CLEANUP_EXECUTOR_TEST_LOCK.lock().await;
+        let (_dir, path) = temp_db();
+        let store = ManagedStore::open_at(&path).await.unwrap();
+        let executor = Arc::new(MockCleanupExecutor::default());
+        let _guard = CleanupExecutorGuard::install(executor.clone());
+
+        let agent = ManagedAgent::new("cleanup-recovery-mcp");
+        store.create_agent(&agent).await.unwrap();
+        let version = ManagedAgentVersion::new(&agent.id, 1, "openai/gpt-4o-mini", "prompt");
+        store.create_agent_version(&version).await.unwrap();
+
+        let mut run = ManagedRun::new(&agent.id, 1, "openai/gpt-4o-mini");
+        run.status = ManagedRunStatus::Interrupted;
+        run.ended_at = Some(Utc::now());
+        store.create_run(&run).await.unwrap();
+
+        store
+            .upsert_run_cleanup_resource(
+                &run.id,
+                3,
+                ManagedRunCleanupResourceKind::McpHttpResourceSubscription,
+                "mcp docs subscription",
+                r#"{"server":"docs","session_id":"sid_123","uri":"file:///tmp/doc.txt"}"#,
+            )
+            .await
+            .unwrap();
+
+        let summary = reclaim_terminal_managed_cleanup_resources(&store)
+            .await
+            .unwrap();
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.cleaned, 1);
+        assert!(summary.failures.is_empty());
+
+        let cleaned = executor
+            .cleaned
+            .lock()
+            .expect("mock cleanup executor lock poisoned")
+            .clone();
+        assert_eq!(cleaned.len(), 1);
+        assert_eq!(
+            cleaned[0].kind,
+            session_cleanup::DurableCleanupResourceKind::McpHttpResourceSubscription
+        );
+        assert!(
+            store
+                .list_run_cleanup_resources(&run.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaim_terminal_cleanup_resources_delegates_mcp_session_resources_to_executor() {
+        let _lock = CLEANUP_EXECUTOR_TEST_LOCK.lock().await;
+        let (_dir, path) = temp_db();
+        let store = ManagedStore::open_at(&path).await.unwrap();
+        let executor = Arc::new(MockCleanupExecutor::default());
+        let _guard = CleanupExecutorGuard::install(executor.clone());
+
+        let agent = ManagedAgent::new("cleanup-recovery-mcp-session");
+        store.create_agent(&agent).await.unwrap();
+        let version = ManagedAgentVersion::new(&agent.id, 1, "openai/gpt-4o-mini", "prompt");
+        store.create_agent_version(&version).await.unwrap();
+
+        let mut run = ManagedRun::new(&agent.id, 1, "openai/gpt-4o-mini");
+        run.status = ManagedRunStatus::Interrupted;
+        run.ended_at = Some(Utc::now());
+        store.create_run(&run).await.unwrap();
+
+        store
+            .upsert_run_cleanup_resource(
+                &run.id,
+                4,
+                ManagedRunCleanupResourceKind::McpHttpSession,
+                "mcp docs session",
+                r#"{"server":"docs","session_id":"sid_123","protocol_version":"2025-06-18"}"#,
+            )
+            .await
+            .unwrap();
+
+        let summary = reclaim_terminal_managed_cleanup_resources(&store)
+            .await
+            .unwrap();
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.cleaned, 1);
+        assert!(summary.failures.is_empty());
+
+        let cleaned = executor
+            .cleaned
+            .lock()
+            .expect("mock cleanup executor lock poisoned")
+            .clone();
+        assert_eq!(cleaned.len(), 1);
+        assert_eq!(
+            cleaned[0].kind,
+            session_cleanup::DurableCleanupResourceKind::McpHttpSession
+        );
+        assert!(
+            store
+                .list_run_cleanup_resources(&run.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

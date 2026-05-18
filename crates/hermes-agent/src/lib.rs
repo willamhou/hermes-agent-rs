@@ -8,4 +8,8 @@ pub mod loop_runner;
 pub mod parallel;
 pub mod token_counter;
 
-pub use loop_runner::{Agent, AgentConfig};
+pub use loop_runner::{
+    Agent, AgentConfig, ConversationCheckpointObserver, ConversationContinuationAction,
+    ConversationContinuationBoundary, ConversationContinuationBoundaryKind,
+    analyze_continuation_boundary,
+};

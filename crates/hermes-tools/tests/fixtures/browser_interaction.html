@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Browser Interaction Fixture</title>
+</head>
+<body>
+  <main>
+    <h1>Browser Fixture</h1>
+    <p id="status">Idle</p>
+    <label for="name-input">Name</label>
+    <input id="name-input" name="name" type="text" value="">
+    <button id="apply-button" type="button">Apply</button>
+    <button id="delayed-button" type="button">Delayed</button>
+    <p id="result"></p>
+    <div id="delayed-container"></div>
+  </main>
+  <script>
+    const status = document.getElementById("status");
+    const input = document.getElementById("name-input");
+    const result = document.getElementById("result");
+    const delayedContainer = document.getElementById("delayed-container");
+
+    document.getElementById("apply-button").addEventListener("click", () => {
+      result.textContent = `Hello, ${input.value || "anonymous"}!`;
+      status.textContent = "Applied";
+    });
+
+    document.getElementById("delayed-button").addEventListener("click", () => {
+      status.textContent = "Waiting";
+      delayedContainer.replaceChildren();
+      window.setTimeout(() => {
+        status.textContent = "Ready";
+        const marker = document.createElement("p");
+        marker.id = "delayed-result";
+        marker.textContent = "Ready marker";
+        delayedContainer.replaceChildren(marker);
+      }, 150);
+    });
+
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        result.textContent = `Submitted: ${input.value || "anonymous"}`;
+        status.textContent = "Submitted";
+      }
+    });
+  </script>
+</body>
+</html>

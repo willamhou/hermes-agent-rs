@@ -73,6 +73,7 @@ pub async fn run_oneshot(
         compression: CompressionConfig::default(),
         delegation_depth: 0,
         clarify_tx: None,
+        checkpoint_observer: None,
     };
 
     let mut agent = Agent::new(agent_config);

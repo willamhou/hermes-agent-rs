@@ -54,6 +54,25 @@ approval:
 #     headers:
 #       Authorization: "Bearer ${MCP_TOKEN}"
 
+# Managed-mode MCP admission policy.
+# This gates the currently admitted managed MCP slice:
+# allowlisted HTTP read-only bridge tools only. Dynamic MCP tools,
+# side-effect bridge tools, and stdio MCP remain blocked. The optional
+# `stdio` subsection is only a candidate policy/audit surface for future
+# admission; it does not enable managed stdio MCP by itself.
+# managed:
+#   mcp:
+#     enabled: false
+#     allowed_transports: [http]
+#     allowed_servers: ["remote-docs"]
+#     allow_side_effects: false
+#     stdio:
+#       allowed_servers: ["filesystem"]
+#       allowed_env_keys: ["WORKSPACE_ROOT"]
+#   recovery:
+#     auto_replay_interrupted: false
+#     max_auto_replays_per_root_run: 3
+
 # Gateway configuration (for `hermes gateway` command).
 # gateway:
 #   session_idle_timeout_secs: 1800

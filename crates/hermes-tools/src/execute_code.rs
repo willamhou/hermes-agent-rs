@@ -4,6 +4,11 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use crate::approval_key::approval_memory_key;
+use crate::process_handoff::{
+    CompletedProcessCapture, emit_process_completed, emit_process_failed, emit_process_started,
+    emit_process_timed_out,
+};
+use crate::process_registry::{configure_child_process_group, kill_process_group};
 use crate::session_cleanup;
 use hermes_core::{
     error::Result,
@@ -100,6 +105,7 @@ impl Tool for ExecuteCodeTool {
         cmd.current_dir(&ctx.working_dir);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        configure_child_process_group(&mut cmd);
 
         let child = match cmd.spawn() {
             Ok(child) => child,
@@ -110,18 +116,19 @@ impl Tool for ExecuteCodeTool {
         };
 
         let child_id = child.id();
-        let cleanup_registration = child_id
-            .and_then(|pid| session_cleanup::register_pid(&ctx.session_id, pid, "execute_code"));
+        let cleanup_registration = child_id.and_then(|pid| {
+            session_cleanup::register_process_group(&ctx.session_id, pid, "execute_code")
+        });
+        emit_process_started(ctx, self.name(), child_id, timeout_secs).await;
         let output =
             match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
                 .await
             {
                 Err(_) => {
                     if let Some(pid) = child_id {
-                        unsafe {
-                            libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                        }
+                        let _ = kill_process_group(pid);
                     }
+                    emit_process_timed_out(ctx, self.name(), child_id, timeout_secs).await;
                     if let Some(registration) = cleanup_registration.as_ref() {
                         let _ = session_cleanup::unregister(registration);
                     }
@@ -136,6 +143,13 @@ impl Tool for ExecuteCodeTool {
                     ));
                 }
                 Ok(Err(e)) => {
+                    emit_process_failed(
+                        ctx,
+                        self.name(),
+                        child_id,
+                        format!("process wait failed: {e}"),
+                    )
+                    .await;
                     if let Some(registration) = cleanup_registration.as_ref() {
                         let _ = session_cleanup::unregister(registration);
                     }
@@ -143,6 +157,25 @@ impl Tool for ExecuteCodeTool {
                     return Ok(ToolResult::error(format!("python execution failed: {e}")));
                 }
                 Ok(Ok(output)) => {
+                    emit_process_completed(
+                        ctx,
+                        self.name(),
+                        CompletedProcessCapture {
+                            process_group: child_id,
+                            exit_code: output.status.code(),
+                            stdout_chars: output.stdout.len(),
+                            stderr_chars: output.stderr.len(),
+                            stdout_preview: Some(truncate_output(
+                                &String::from_utf8_lossy(&output.stdout),
+                                2_000,
+                            )),
+                            stderr_preview: Some(truncate_output(
+                                &String::from_utf8_lossy(&output.stderr),
+                                2_000,
+                            )),
+                        },
+                    )
+                    .await;
                     if let Some(registration) = cleanup_registration.as_ref() {
                         let _ = session_cleanup::unregister(registration);
                     }
@@ -194,4 +227,194 @@ fn truncate_output(output: &str, max_chars: usize) -> String {
 
 inventory::submit! {
     crate::ToolRegistration { factory: || Box::new(ExecuteCodeTool) }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::{Path, PathBuf},
+        sync::{Arc, LazyLock},
+    };
+
+    use super::*;
+    use hermes_core::tool::{ToolConfig, ToolContext};
+    use tempfile::{NamedTempFile, TempDir};
+    use tokio::sync::mpsc;
+    use tokio::time::Duration;
+
+    static ENV_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var(name).ok();
+            unsafe {
+                std::env::set_var(name, value);
+            }
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var(self.name, value) },
+                None => unsafe { std::env::remove_var(self.name) },
+            }
+        }
+    }
+
+    fn make_ctx(
+        working_dir: PathBuf,
+    ) -> (
+        ToolContext,
+        mpsc::Receiver<hermes_core::tool::ApprovalRequest>,
+        mpsc::Receiver<hermes_core::stream::StreamDelta>,
+    ) {
+        let (approval_tx, approval_rx) = mpsc::channel(8);
+        let (delta_tx, delta_rx) = mpsc::channel(8);
+        let config = ToolConfig {
+            workspace_root: working_dir.clone(),
+            ..ToolConfig::default()
+        };
+        let ctx = ToolContext {
+            session_id: "execute-code-test-session".to_string(),
+            working_dir,
+            approval_tx,
+            delta_tx,
+            execution_observer: None,
+            tool_config: Arc::new(config),
+            memory: None,
+            aux_provider: None,
+            skills: None,
+            delegation_depth: 0,
+            clarify_tx: None,
+        };
+        (ctx, approval_rx, delta_rx)
+    }
+
+    fn pid_is_alive(pid: u32) -> bool {
+        let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if ret == 0 {
+            return true;
+        }
+        let err = std::io::Error::last_os_error();
+        err.raw_os_error() != Some(libc::ESRCH)
+    }
+
+    async fn wait_for_pid_file(path: &Path) -> u32 {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(path) {
+                    if let Ok(pid) = contents.trim().parse::<u32>() {
+                        return pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn execute_code_timeout_kills_process_group_descendants() {
+        let _guard = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::set("HERMES_ENABLE_EXECUTE_CODE", "1");
+        let tmp = TempDir::new().unwrap();
+        let pid_file = NamedTempFile::new().unwrap();
+        let (ctx, mut approval_rx, _delta_rx) = make_ctx(tmp.path().to_path_buf());
+        let code = format!(
+            r#"
+import pathlib
+import subprocess
+import time
+
+pid_file = pathlib.Path(r"{pid_file}")
+child = subprocess.Popen(["sleep", "30"])
+pid_file.write_text(str(child.pid))
+time.sleep(30)
+"#,
+            pid_file = pid_file.path().display(),
+        );
+
+        let handle = tokio::spawn(async move {
+            let tool = ExecuteCodeTool;
+            tool.execute(json!({"code": code, "timeout": 1}), &ctx)
+                .await
+        });
+
+        let request = approval_rx.recv().await.expect("approval request");
+        let _ = request.response_tx.send(ApprovalDecision::Allow);
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(!result.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(parsed["exit_code"], 124);
+        assert_eq!(parsed["stderr"], "python execution timed out");
+
+        let descendant_pid = wait_for_pid_file(pid_file.path()).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !pid_is_alive(descendant_pid),
+            "descendant pid {descendant_pid} should be terminated with the python process group"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_code_emits_process_handoff_events() {
+        let _guard = ENV_LOCK.lock().await;
+        let _env_guard = EnvVarGuard::set("HERMES_ENABLE_EXECUTE_CODE", "1");
+        let tmp = TempDir::new().unwrap();
+        let (ctx, mut approval_rx, mut delta_rx) = make_ctx(tmp.path().to_path_buf());
+
+        let handle = tokio::spawn(async move {
+            let tool = ExecuteCodeTool;
+            tool.execute(json!({"code": "print('ok')", "timeout": 5}), &ctx)
+                .await
+        });
+
+        let request = approval_rx.recv().await.expect("approval request");
+        let _ = request.response_tx.send(ApprovalDecision::Allow);
+
+        let started = delta_rx.recv().await.expect("process started event");
+        match started {
+            hermes_core::stream::StreamDelta::ToolEvent {
+                kind,
+                tool,
+                metadata: Some(metadata),
+                ..
+            } => {
+                assert_eq!(kind, "tool.process_started");
+                assert_eq!(tool, "execute_code");
+                assert_eq!(metadata["state"], "started");
+            }
+            other => panic!("unexpected delta: {other:?}"),
+        }
+
+        let completed = delta_rx.recv().await.expect("process completed event");
+        match completed {
+            hermes_core::stream::StreamDelta::ToolEvent {
+                kind,
+                tool,
+                metadata: Some(metadata),
+                ..
+            } => {
+                assert_eq!(kind, "tool.process_completed");
+                assert_eq!(tool, "execute_code");
+                assert_eq!(metadata["state"], "completed");
+                assert_eq!(metadata["exit_code"], 0);
+                assert_eq!(metadata["stdout_preview"], "ok\n");
+            }
+            other => panic!("unexpected delta: {other:?}"),
+        }
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(!result.is_error);
+    }
 }

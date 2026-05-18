@@ -20,6 +20,12 @@ reqwest.workspace = true
 bytes.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
+libc.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tokio-rusqlite.workspace = true
+rusqlite.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+axum.workspace = true

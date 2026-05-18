@@ -18,6 +18,8 @@ pub struct RunHandle {
     agent_id: String,
     agent_version: u32,
     model: String,
+    owner_worker_id: Option<String>,
+    owner_claim_token: Option<String>,
     started_at: DateTime<Utc>,
     timeout_secs: u32,
     state: Mutex<RunState>,
@@ -30,6 +32,7 @@ struct RunState {
     cancel_requested_at: Option<DateTime<Utc>>,
     last_error: Option<String>,
     task: Option<JoinHandle<()>>,
+    heartbeat_task: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +41,8 @@ pub struct RunStatusSnapshot {
     pub agent_id: String,
     pub agent_version: u32,
     pub model: String,
+    pub owner_worker_id: Option<String>,
+    pub owner_claim_token: Option<String>,
     pub status: ManagedRunStatus,
     pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -60,7 +65,45 @@ impl RunRegistry {
         timeout_secs: u32,
         task: JoinHandle<()>,
     ) -> Result<Arc<RunHandle>> {
-        let handle = Arc::new(RunHandle::new(run, timeout_secs, task));
+        self.register_inner(run, timeout_secs, task, None, None, None)
+    }
+
+    pub fn register_owned(
+        &self,
+        run: &ManagedRun,
+        timeout_secs: u32,
+        task: JoinHandle<()>,
+        heartbeat_task: JoinHandle<()>,
+        owner_worker_id: String,
+        owner_claim_token: String,
+    ) -> Result<Arc<RunHandle>> {
+        self.register_inner(
+            run,
+            timeout_secs,
+            task,
+            Some(heartbeat_task),
+            Some(owner_worker_id),
+            Some(owner_claim_token),
+        )
+    }
+
+    fn register_inner(
+        &self,
+        run: &ManagedRun,
+        timeout_secs: u32,
+        task: JoinHandle<()>,
+        heartbeat_task: Option<JoinHandle<()>>,
+        owner_worker_id: Option<String>,
+        owner_claim_token: Option<String>,
+    ) -> Result<Arc<RunHandle>> {
+        let handle = Arc::new(RunHandle::new(
+            run,
+            timeout_secs,
+            task,
+            heartbeat_task,
+            owner_worker_id,
+            owner_claim_token,
+        ));
         let mut guard = self.runs.write().expect("run registry write lock poisoned");
         if guard.contains_key(&run.id) {
             return Err(HermesError::Config(format!(
@@ -129,7 +172,10 @@ impl RunRegistry {
             .write()
             .expect("run registry write lock poisoned")
             .remove(run_id)
-            .map(|handle| handle.snapshot())
+            .map(|handle| {
+                handle.abort_owned_tasks();
+                handle.snapshot()
+            })
     }
 
     pub fn len(&self) -> usize {
@@ -151,12 +197,21 @@ impl Default for RunRegistry {
 }
 
 impl RunHandle {
-    fn new(run: &ManagedRun, timeout_secs: u32, task: JoinHandle<()>) -> Self {
+    fn new(
+        run: &ManagedRun,
+        timeout_secs: u32,
+        task: JoinHandle<()>,
+        heartbeat_task: Option<JoinHandle<()>>,
+        owner_worker_id: Option<String>,
+        owner_claim_token: Option<String>,
+    ) -> Self {
         Self {
             run_id: run.id.clone(),
             agent_id: run.agent_id.clone(),
             agent_version: run.agent_version,
             model: run.model.clone(),
+            owner_worker_id,
+            owner_claim_token,
             started_at: run.started_at,
             timeout_secs,
             state: Mutex::new(RunState {
@@ -166,6 +221,7 @@ impl RunHandle {
                 cancel_requested_at: run.cancel_requested_at,
                 last_error: run.last_error.clone(),
                 task: Some(task),
+                heartbeat_task,
             }),
         }
     }
@@ -177,6 +233,8 @@ impl RunHandle {
             agent_id: self.agent_id.clone(),
             agent_version: self.agent_version,
             model: self.model.clone(),
+            owner_worker_id: self.owner_worker_id.clone(),
+            owner_claim_token: self.owner_claim_token.clone(),
             status: state.status.clone(),
             started_at: self.started_at,
             updated_at: state.updated_at,
@@ -184,6 +242,16 @@ impl RunHandle {
             cancel_requested_at: state.cancel_requested_at,
             last_error: state.last_error.clone(),
             timeout_secs: self.timeout_secs,
+        }
+    }
+
+    fn abort_owned_tasks(&self) {
+        let state = self.state.lock().expect("run handle lock poisoned");
+        if let Some(task) = state.task.as_ref() {
+            task.abort();
+        }
+        if let Some(heartbeat_task) = state.heartbeat_task.as_ref() {
+            heartbeat_task.abort();
         }
     }
 
@@ -201,6 +269,9 @@ impl RunHandle {
         let mut state = self.state.lock().expect("run handle lock poisoned");
         if let Some(task) = state.task.as_ref() {
             task.abort();
+        }
+        if let Some(heartbeat_task) = state.heartbeat_task.as_ref() {
+            heartbeat_task.abort();
         }
         if !state.status.is_terminal() {
             state.status = status;
@@ -231,6 +302,9 @@ impl RunHandle {
         state.last_error = last_error;
         if status.is_terminal() {
             state.ended_at = Some(now);
+            if let Some(heartbeat_task) = state.heartbeat_task.as_ref() {
+                heartbeat_task.abort();
+            }
         }
         drop(state);
         self.snapshot()

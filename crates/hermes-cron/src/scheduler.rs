@@ -225,6 +225,7 @@ impl CronScheduler {
             compression: hermes_agent::compressor::CompressionConfig::default(),
             delegation_depth: 0,
             clarify_tx: None,
+            checkpoint_observer: None,
         });
 
         let (delta_tx, _) = tokio::sync::mpsc::channel(64);

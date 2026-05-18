@@ -6,6 +6,11 @@ use regex::Regex;
 use serde_json::json;
 
 use crate::approval_key::approval_memory_key;
+use crate::process_handoff::{
+    CompletedProcessCapture, emit_process_completed, emit_process_failed, emit_process_started,
+    emit_process_timed_out,
+};
+use crate::process_registry::{configure_child_process_group, kill_process_group};
 use crate::session_cleanup;
 use hermes_core::{
     error::Result,
@@ -228,6 +233,8 @@ impl Tool for TerminalTool {
             let registry = crate::process_registry::global_registry();
             return match registry.spawn(&command, &workdir) {
                 Ok(id) => {
+                    emit_process_started(ctx, self.name(), registry.process_group_for(&id), 0)
+                        .await;
                     let _ = session_cleanup::register_background_process(
                         &ctx.session_id,
                         id.clone(),
@@ -251,6 +258,7 @@ impl Tool for TerminalTool {
         cmd.current_dir(&workdir);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        configure_child_process_group(&mut cmd);
 
         let child = match cmd.spawn() {
             Ok(c) => c,
@@ -264,18 +272,21 @@ impl Tool for TerminalTool {
         // Capture the child id before consuming the child with wait_with_output
         let child_id = child.id();
         let cleanup_registration = child_id.and_then(|pid| {
-            session_cleanup::register_pid(&ctx.session_id, pid, format!("terminal: {command}"))
+            session_cleanup::register_process_group(
+                &ctx.session_id,
+                pid,
+                format!("terminal: {command}"),
+            )
         });
+        emit_process_started(ctx, self.name(), child_id, timeout_secs).await;
 
         match tokio::time::timeout(timeout, child.wait_with_output()).await {
             Err(_elapsed) => {
-                // Timed out — kill using the stored pid
+                // Timed out — kill the shell's process group to reclaim descendants too.
                 if let Some(pid) = child_id {
-                    // SAFETY: sending SIGKILL to a known child pid
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                    }
+                    let _ = kill_process_group(pid);
                 }
+                emit_process_timed_out(ctx, self.name(), child_id, timeout_secs).await;
                 if let Some(registration) = cleanup_registration.as_ref() {
                     let _ = session_cleanup::unregister(registration);
                 }
@@ -287,12 +298,38 @@ impl Tool for TerminalTool {
                 Ok(ToolResult::ok(output_json.to_string()))
             }
             Ok(Err(e)) => {
+                emit_process_failed(
+                    ctx,
+                    self.name(),
+                    child_id,
+                    format!("process wait failed: {e}"),
+                )
+                .await;
                 if let Some(registration) = cleanup_registration.as_ref() {
                     let _ = session_cleanup::unregister(registration);
                 }
                 Ok(ToolResult::error(format!("command execution failed: {e}")))
             }
             Ok(Ok(output)) => {
+                emit_process_completed(
+                    ctx,
+                    self.name(),
+                    CompletedProcessCapture {
+                        process_group: child_id,
+                        exit_code: output.status.code(),
+                        stdout_chars: output.stdout.len(),
+                        stderr_chars: output.stderr.len(),
+                        stdout_preview: Some(truncate_output(
+                            &String::from_utf8_lossy(&output.stdout),
+                            2_000,
+                        )),
+                        stderr_preview: Some(truncate_output(
+                            &String::from_utf8_lossy(&output.stderr),
+                            2_000,
+                        )),
+                    },
+                )
+                .await;
                 if let Some(registration) = cleanup_registration.as_ref() {
                     let _ = session_cleanup::unregister(registration);
                 }
@@ -330,6 +367,9 @@ inventory::submit! {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::NamedTempFile;
+    use tokio::time::Duration;
+
     use super::*;
     use hermes_core::tool::ToolConfig;
     use std::sync::Arc;
@@ -504,6 +544,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_terminal_emits_process_handoff_events() {
+        let (ctx, _approval_rx, mut delta_rx) = make_ctx();
+        let tool = TerminalTool;
+        let args = serde_json::json!({"command": "echo hello"});
+        let result = tool.execute(args, &ctx).await.unwrap();
+
+        let started = delta_rx.recv().await.expect("process started event");
+        match started {
+            hermes_core::stream::StreamDelta::ToolEvent {
+                kind,
+                tool,
+                metadata: Some(metadata),
+                ..
+            } => {
+                assert_eq!(kind, "tool.process_started");
+                assert_eq!(tool, "terminal");
+                assert_eq!(metadata["state"], "started");
+            }
+            other => panic!("unexpected delta: {other:?}"),
+        }
+
+        let completed = delta_rx.recv().await.expect("process completed event");
+        match completed {
+            hermes_core::stream::StreamDelta::ToolEvent {
+                kind,
+                tool,
+                metadata: Some(metadata),
+                ..
+            } => {
+                assert_eq!(kind, "tool.process_completed");
+                assert_eq!(tool, "terminal");
+                assert_eq!(metadata["state"], "completed");
+                assert_eq!(metadata["exit_code"], 0);
+                assert_eq!(metadata["stdout_preview"], "hello\n");
+            }
+            other => panic!("unexpected delta: {other:?}"),
+        }
+
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
     async fn test_terminal_exit_code() {
         let (ctx, _approval_rx, _delta_rx) = make_ctx();
         let tool = TerminalTool;
@@ -526,5 +608,50 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&result.content).unwrap();
         assert_eq!(parsed["exit_code"], 124);
         assert_eq!(parsed["error"], "command timed out");
+    }
+
+    fn pid_is_alive(pid: u32) -> bool {
+        let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if ret == 0 {
+            return true;
+        }
+        let err = std::io::Error::last_os_error();
+        err.raw_os_error() != Some(libc::ESRCH)
+    }
+
+    async fn wait_for_pid_file(path: &std::path::Path) -> u32 {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(path) {
+                    if let Ok(pid) = contents.trim().parse::<u32>() {
+                        return pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_terminal_timeout_kills_process_group_descendants() {
+        let (ctx, _approval_rx, _delta_rx) = make_ctx();
+        let tool = TerminalTool;
+        let pid_file = NamedTempFile::new().unwrap();
+        let command = format!("sleep 30 & echo $! > {} && wait", pid_file.path().display());
+        let args = serde_json::json!({"command": command, "timeout": 1});
+
+        let result = tool.execute(args, &ctx).await.unwrap();
+
+        assert!(!result.is_error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(parsed["exit_code"], 124);
+        let descendant_pid = wait_for_pid_file(pid_file.path()).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !pid_is_alive(descendant_pid),
+            "descendant pid {descendant_pid} should be terminated with the shell process group"
+        );
     }
 }

@@ -4,6 +4,7 @@ mod agents;
 mod approval;
 mod commands;
 mod handlers;
+mod mcp;
 mod oneshot;
 mod render;
 mod repl;
@@ -46,6 +47,9 @@ struct Cli {
 enum Commands {
     /// Start the gateway server (Telegram, API)
     Gateway,
+    /// MCP runtime inspection commands
+    #[command(subcommand)]
+    Mcp(mcp::McpAction),
     /// Managed agent control-plane commands
     #[command(subcommand)]
     Agents(agents::AgentsAction),
@@ -79,6 +83,10 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(Commands::Gateway) = cli.command {
         return run_gateway().await;
+    }
+
+    if let Some(Commands::Mcp(action)) = cli.command {
+        return mcp::run_mcp(action).await;
     }
 
     if let Some(Commands::Agents(action)) = cli.command {
