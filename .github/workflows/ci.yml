@@ -64,3 +64,45 @@ jobs:
         run: |
           cargo test -p hermes-tools browser::tests -- --nocapture
           cargo test -p hermes-gateway reclaim_terminal_cleanup_resources_reclaims_live_browser_session_manifests -- --nocapture
+
+  petfairasia-export:
+    if: github.head_ref == 'tmp/petfairasia-2026-exhibitors-20260823'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Check out temporary branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch and decode temporary scraper
+        shell: bash
+        run: |
+          curl -fsSL 'https://raw.githubusercontent.com/willamhou/awesome-ai-agents-2026/tmp/petfairasia-2026-exhibitors-20260823/tmp_tools/petfairasia_scrape.py.gz.b64' \
+            | base64 -d | gzip -d > /tmp/petfairasia_scrape.py
+          python -m py_compile /tmp/petfairasia_scrape.py
+
+      - name: Install browser runtime
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'playwright==1.55.0'
+          python -m playwright install --with-deps chromium
+
+      - name: Export official exhibitor directory
+        shell: bash
+        run: python /tmp/petfairasia_scrape.py
+
+      - name: Upload export and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: petfairasia-2026-exhibitors
+          path: petfairasia_output
+          if-no-files-found: warn
+          retention-days: 2
