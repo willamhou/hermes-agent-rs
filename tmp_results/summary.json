@@ -1,0 +1,12 @@
+{
+  "fetched_at": "2026-08-23T13:35:35.989437+00:00",
+  "showroom_url": "https://online.petfairasia.com/en/showroom-2026",
+  "api_url": "https://online.petfairasia.com/zh-cn/como_api/institutions/get_list?page=1",
+  "api_method": "GET",
+  "raw_count": 2290,
+  "unique_count": 2289,
+  "company_nonempty_count": 2289,
+  "booth_nonempty_count": 2289,
+  "navigation_errors": [],
+  "candidate_errors": []
+}
