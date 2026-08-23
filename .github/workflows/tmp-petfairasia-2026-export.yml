@@ -1,0 +1,70 @@
+name: Temporary Pet Fair Asia 2026 Export
+
+on:
+  push:
+    branches:
+      - tmp/petfairasia-2026-exhibitors-20260823
+    paths-ignore:
+      - tmp_results/**
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out temporary branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch and decode temporary scraper
+        shell: bash
+        run: |
+          curl -fsSL 'https://raw.githubusercontent.com/willamhou/awesome-ai-agents-2026/tmp/petfairasia-2026-exhibitors-20260823/tmp_tools/petfairasia_scrape.py.gz.b64' \
+            | base64 -d | gzip -d > /tmp/petfairasia_scrape.py
+          python -m py_compile /tmp/petfairasia_scrape.py
+
+      - name: Install browser runtime
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'playwright==1.55.0'
+          python -m playwright install --with-deps chromium
+
+      - name: Export official exhibitor directory
+        shell: bash
+        run: python /tmp/petfairasia_scrape.py
+
+      - name: Publish export to temporary branch
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -d petfairasia_output ]; then
+            exit 0
+          fi
+          mkdir -p tmp_results
+          rm -rf tmp_results/*
+          cp -a petfairasia_output/. tmp_results/
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tmp_results
+          if ! git diff --cached --quiet; then
+            git commit -m 'Store temporary Pet Fair Asia 2026 export [skip ci]'
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Upload export and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: petfairasia-2026-exhibitors
+          path: petfairasia_output
+          if-no-files-found: warn
+          retention-days: 2
