@@ -1,0 +1,31 @@
+name: Temporary Pet Fair Asia Floorplan Discovery
+
+on:
+  pull_request:
+    paths:
+      - tmp_tools/pfa_floorplan_discovery.py
+      - .github/workflows/tmp-pfa-floorplan-discovery.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover-floorplans:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install requests beautifulsoup4
+      - name: Crawl official Pet Fair Asia pages and download floorplan images
+        run: python tmp_tools/pfa_floorplan_discovery.py
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pfa-2026-floorplans
+          path: pfa_floorplan_discovery
+          if-no-files-found: warn
+          retention-days: 2
