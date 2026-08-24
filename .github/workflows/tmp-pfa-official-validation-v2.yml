@@ -3,7 +3,7 @@ name: Temporary Pet Fair Asia Official Validation V2
 on:
   pull_request:
     paths:
-      - tmp_tools/pfa_official_page_enrichment_v2.py.gz.b64
+      - tmp_tools/pfa_v2_chunks/**
       - .github/workflows/tmp-pfa-official-validation-v2.yml
   workflow_dispatch:
 
@@ -24,7 +24,13 @@ jobs:
       - name: Decode V2 validator
         shell: bash
         run: |
-          base64 -d tmp_tools/pfa_official_page_enrichment_v2.py.gz.b64 | gzip -d > /tmp/pfa_v2.py
+          cat \
+            tmp_tools/pfa_v2_chunks/00 \
+            tmp_tools/pfa_v2_chunks/01 \
+            tmp_tools/pfa_v2_chunks/02 \
+            tmp_tools/pfa_v2_chunks/03 \
+            tmp_tools/pfa_v2_chunks/04 \
+            | base64 -d | gzip -d > /tmp/pfa_v2.py
           python -m py_compile /tmp/pfa_v2.py
       - name: Download bilingual validation seed
         env:
