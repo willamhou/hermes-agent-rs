@@ -64,3 +64,30 @@ jobs:
         run: |
           cargo test -p hermes-tools browser::tests -- --nocapture
           cargo test -p hermes-gateway reclaim_terminal_cleanup_resources_reclaims_live_browser_session_manifests -- --nocapture
+
+  pfa-detail-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out temporary branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install probe dependencies
+        run: python -m pip install requests beautifulsoup4
+
+      - name: Probe official exhibitor detail pages
+        run: python tmp_tools/pfa_detail_probe.py
+
+      - name: Upload probe results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pfa-detail-probe
+          path: pfa_detail_probe
+          if-no-files-found: warn
+          retention-days: 2
