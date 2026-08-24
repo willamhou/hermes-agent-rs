@@ -69,9 +69,9 @@ jobs:
           cargo test -p hermes-tools browser::tests -- --nocapture
           cargo test -p hermes-gateway reclaim_terminal_cleanup_resources_reclaims_live_browser_session_manifests -- --nocapture
 
-  pfa-related-brands-probe:
+  pfa-full-brand-enrichment:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 35
     steps:
       - name: Check out temporary branch
         uses: actions/checkout@v4
@@ -81,17 +81,22 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install probe dependencies
+      - name: Download pet-supplies detail artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download 32687177343 -R willamhou/hermes-agent-rs -n pfa-pet-supplies-with-brands -D pet_seed
+
+      - name: Install enrichment dependencies
         run: python -m pip install requests beautifulsoup4
 
-      - name: Probe official related-brand pages
-        run: python tmp_tools/pfa_related_brands_probe.py
+      - name: Enrich every company from official Related brands pages
+        run: python tmp_tools/pfa_enrich_full_brands.py
 
-      - name: Upload probe results
+      - name: Upload final pet-supplies CSV
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pfa-related-brands-probe
-          path: pfa_related_brands_probe
+          name: pfa-pet-supplies-full-brands
+          path: pfa_pet_supplies_full_brands
           if-no-files-found: warn
           retention-days: 2
