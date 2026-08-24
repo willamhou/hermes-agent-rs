@@ -1,0 +1,30 @@
+name: Temporary Pet Fair Asia Targeted Floorplan Scrape
+
+on:
+  pull_request:
+    paths:
+      - tmp_tools/pfa_floorplan_target.py
+      - .github/workflows/tmp-pfa-floorplan-target.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  target-floorplans:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install requests beautifulsoup4
+      - run: python tmp_tools/pfa_floorplan_target.py
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pfa-2026-target-floorplans
+          path: pfa_floorplan_target
+          if-no-files-found: warn
+          retention-days: 2
