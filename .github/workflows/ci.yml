@@ -69,9 +69,9 @@ jobs:
           cargo test -p hermes-tools browser::tests -- --nocapture
           cargo test -p hermes-gateway reclaim_terminal_cleanup_resources_reclaims_live_browser_session_manifests -- --nocapture
 
-  pfa-pet-supplies-export:
+  pfa-related-brands-probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 10
     steps:
       - name: Check out temporary branch
         uses: actions/checkout@v4
@@ -81,22 +81,17 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Download official exhibitor seed artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh run download 32642794869 -R willamhou/hermes-agent-rs -n petfairasia-2026-exhibitors -D seed_artifact
-
-      - name: Install exporter dependencies
+      - name: Install probe dependencies
         run: python -m pip install requests beautifulsoup4
 
-      - name: Export pet-supplies exhibitors and official brands
-        run: python tmp_tools/pfa_pet_supplies_export.py
+      - name: Probe official related-brand pages
+        run: python tmp_tools/pfa_related_brands_probe.py
 
-      - name: Upload CSV and diagnostics
+      - name: Upload probe results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pfa-pet-supplies-with-brands
-          path: pfa_pet_supplies_output
+          name: pfa-related-brands-probe
+          path: pfa_related_brands_probe
           if-no-files-found: warn
           retention-days: 2
