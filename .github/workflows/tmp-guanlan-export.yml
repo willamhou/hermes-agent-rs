@@ -1,0 +1,32 @@
+name: Temporary Guanlan Horizon Export
+
+on:
+  pull_request:
+    paths:
+      - tmp_tools/guanlan_export.py
+      - .github/workflows/tmp-guanlan-export.yml
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install requests beautifulsoup4
+      - name: Discover and resolve Guanlan Horizon articles
+        run: python tmp_tools/guanlan_export.py
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guanlan-horizon-export
+          path: guanlan_export
+          if-no-files-found: warn
+          retention-days: 2
