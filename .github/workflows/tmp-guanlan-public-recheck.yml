@@ -1,0 +1,115 @@
+name: Temporary Guanlan Public Recheck
+on:
+  push:
+    branches: ['tmp/guanlan-horizon-links-20260829']
+    paths: ['.github/workflows/tmp-guanlan-public-recheck.yml']
+permissions:
+  contents: read
+jobs:
+  public-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install requests beautifulsoup4
+      - name: Inspect public archives and actual article links
+        shell: python
+        run: |
+          import requests,json,re,html,time,concurrent.futures
+          from pathlib import Path
+          from urllib.parse import urlencode,urljoin,urlparse,unquote
+          from bs4 import BeautifulSoup
+          O=Path('guanlan_public_recheck');O.mkdir(exist_ok=True)
+          B='Mzk5MDA5NjY1OA=='
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36'
+          S=requests.Session();S.headers.update({'User-Agent':UA,'Accept-Language':'zh-CN,zh;q=0.9'})
+          logs=[];articles=[];searches=[]
+          def read(url,name,session=None):
+              ss=session or S
+              try:
+                  r=ss.get(url,timeout=(12,35),allow_redirects=True)
+                  (O/(name+'.html')).write_bytes(r.content)
+                  t=r.text;p=BeautifulSoup(t,'html.parser')
+                  title=p.title.get_text(' ',strip=True) if p.title else ''
+                  body=p.get_text(' ',strip=True)
+                  row={'name':name,'url':url,'final_url':r.url,'status':r.status_code,'bytes':len(r.content),'title':title,'text':body[:15000]}
+                  row['links']=[{'text':a.get_text(' ',strip=True)[:180],'href':urljoin(r.url,html.unescape(a['href']))} for a in p.select('a[href]') if not a['href'].startswith('javascript:')][:250]
+                  row['blocked']=r.status_code in (403,429) or any(x in r.url for x in ['antispider','wappoc_appmsgcaptcha']) or (len(t)<40000 and any(x in body for x in ['请输入验证码','访问过于频繁','请在微信客户端打开']))
+                  logs.append(row);print(name,r.status_code,len(t),title,'blocked=',row['blocked'],flush=True)
+                  return r,t,p,row
+              except Exception as e:
+                  logs.append({'name':name,'url':url,'error':str(e)});print(name,str(e),flush=True)
+                  return None
+          # Each archive is checked only once, with no credential or CAPTCHA bypass.
+          for name,url in [
+              ('freewechat_profile','https://freewechat.com/profile/'+B),
+              ('freewechat_known','https://freewechat.com/a/'+B+'/2247486661/1'),
+              ('smzdm_source','https://post.smzdm.com/p/arzw6pgx/'),
+              ('public_albums','https://mp.weixin.qq.com/mp/appmsgalbum?'+urlencode({'__biz':B,'action':'list','scene':104})),
+              ('sogou_account','https://weixin.sogou.com/weixin?'+urlencode({'type':1,'query':'观澜Horizon','ie':'utf8'}))
+          ]:
+              read(url,name);time.sleep(2)
+          specs=[
+              {'query':'"观澜Horizon"','page':1,'sort':1},
+              {'query':'"观澜Horizon"','page':1,'tsn':5,'ft':'2026-04-01','et':'2026-07-31'},
+              {'query':'"观澜Horizon"','page':1,'tsn':5,'ft':'2025-01-01','et':'2026-02-22'},
+              {'query':'"观澜Horizon"','page':1,'tsn':5,'ft':'2026-06-01','et':'2026-06-30'},
+              {'query':'"观澜Horizon" 合集','page':1},
+              {'query':'"gh_530fbfb1dbd0"','page':1},
+          ]
+          seen=set()
+          for j,spec in enumerate(specs):
+              url='https://weixin.sogou.com/weixin?'+urlencode({'type':2,'ie':'utf8',**spec})
+              ans=read(url,'search_'+str(j));time.sleep(3)
+              if not ans:continue
+              r,t,p,info=ans
+              if info['blocked']:break
+              for li in p.select('ul.news-list li'):
+                  a=li.select_one('h3 a[href]');author=li.select_one('span.all-time-y2')
+                  if not a or not author:continue
+                  author=author.get_text(' ',strip=True).replace('\u200b','')
+                  title=a.get_text(' ',strip=True)
+                  d=li.get('d','') or title
+                  row={'title':title,'author':author,'href':urljoin(r.url,a['href']),'doc':d,'search':url,'text':li.get_text(' ',strip=True)}
+                  searches.append(row)
+                  if author=='观澜Horizon' and d not in seen:
+                      seen.add(d);articles.append(row)
+          # Resolve a bounded set of existing search results, never manufacture article IDs.
+          fetched=0
+          for row in articles[:12]:
+              ans=read(row['href'],'redirect_'+str(fetched));time.sleep(2)
+              if not ans:continue
+              r,t,p,info=ans
+              if info['blocked']:break
+              frag=re.findall(r'url\s*\+=\s*[\'\"]([^\'\"]*)[\'\"]\s*;',r.content.decode('gbk',errors='ignore'))
+              u=''.join(frag).replace('@','')
+              if not u.startswith('https://mp.weixin.qq.com/'):
+                  row['error']='No WeChat URL in public redirect';continue
+              row['actual_wechat_url']=u
+              ans2=read(u,'article_'+str(fetched));fetched+=1;time.sleep(2)
+              if not ans2:continue
+              rr,tt,pp,ii=ans2
+              row['fetch']=ii
+              if ii['blocked']:break
+              for key,pat in {'biz':r'var\s+biz\s*=\s*[\'\"]([^\'\"]+)', 'nickname':r'var\s+nickname\s*=\s*(?:htmlDecode\()?\s*[\'\"]([^\'\"]+)', 'mid':r'var\s+mid\s*=\s*[\'\"]?(\d+)', 'idx':r'var\s+idx\s*=\s*[\'\"]?(\d+)', 'sn':r'var\s+sn\s*=\s*[\'\"]([^\'\"]*)', 'user_name':r'var\s+user_name\s*=\s*[\'\"]([^\'\"]+)'}.items():
+                  m=re.search(pat,tt);row[key]=m.group(1) if m else ''
+              row['album_lines']=re.findall(r'.{0,80}(?:album_id|albumInfo|appmsgalbuminfo|tag_info|msg_link|short_url).{0,250}',tt)
+              c=pp.select_one('#js_content')
+              row['content_links']=[]
+              if c:
+                  for a in c.find_all(True):
+                      for attr in ['href','data-link','data-url','data-href','data-sn']:
+                          if a.get(attr):row['content_links'].append({'text':a.get_text(' ',strip=True)[:100],attr:a.get(attr)})
+          (O/'summary.json').write_text(json.dumps({'logs':logs,'searches':searches,'articles':articles},ensure_ascii=False,indent=2),encoding='utf8')
+          print('SUMMARY',len(logs),'requests',len(searches),'indexed hits',len(articles),'target articles',flush=True)
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: guanlan-public-recheck
+          path: guanlan_public_recheck
+          retention-days: 2
